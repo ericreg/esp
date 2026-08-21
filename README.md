@@ -3,15 +3,35 @@
 `esp` is a tiny iroh-backed TCP proxy aimed at one thing first: SSH between
 machines without manually exposing port 22.
 
-This is an MVP. It is an SSH transport helper, not a general VPN manager.
+It is an SSH transport helper, not a general VPN manager.
+
+## Installation
+
+From this checkout:
+
+```sh
+cargo install --path . --force
+```
+
+This installs `esp` into Cargo's bin directory, usually `~/.cargo/bin`. Make
+sure that directory is on your `PATH`:
+
+```sh
+esp --help
+```
+
+You can also install from git:
+
+```sh
+cargo install --git https://github.com/ericreg/esp.git --force
+```
 
 ## Flow
 
 On the first machine:
 
 ```sh
-cargo run -- init
-cargo build
+esp init
 ```
 
 This creates `~/.esp.yml`, detects this host's name, generates a unique
@@ -19,28 +39,27 @@ connection id, saves an invite code in that config, and prints it. Keep the
 daemon running on that machine:
 
 ```sh
-RUST_LOG=info ./target/debug/esp
+RUST_LOG=info esp
 ```
 
 By default, the daemon only allows peers to proxy to local SSH on port `22`.
 Allow additional localhost ports explicitly:
 
 ```sh
-RUST_LOG=info ./target/debug/esp daemon --ports 22,8000
+RUST_LOG=info esp daemon --ports 22,8000
 ```
 
 On the second machine:
 
 ```sh
-cargo run -- join <invite-code>
-cargo build
-RUST_LOG=info ./target/debug/esp
+esp join <invite-code>
+RUST_LOG=info esp
 ```
 
 To add a third machine, print a new invite on the first machine:
 
 ```sh
-./target/debug/esp invite
+esp invite
 ```
 
 Join with that new code on the third machine. Each host shares its detected name
@@ -51,26 +70,26 @@ be disambiguated by id.
 Once daemons are connected, SSH through esp to any learned peer:
 
 ```sh
-ssh -o ProxyCommand='./target/debug/esp proxy %h %p' user@amd
-ssh -o ProxyCommand='./target/debug/esp proxy %h %p' user@A1B2C3
+ssh -o ProxyCommand='esp proxy %h %p' user@host
+ssh -o ProxyCommand='esp proxy %h %p' user@A1B2C3
 ```
 
 Or add an SSH config entry:
 
 ```sshconfig
-Host amd
-    HostName amd
-    User eric
+Host host
+    HostName host
+    User user
     ProxyCommand esp proxy %h %p
 ```
 
 Then connect normally:
 
 ```sh
-ssh amd
+ssh host
 ```
 
-If multiple peers are named `amd`, esp exits and prints the matching connection
+If multiple peers are named `host`, esp exits and prints the matching connection
 ids. Rename one of them with `esp rename NAME` or use the id directly.
 
 The remote daemon connects to `127.0.0.1:%p` on its own machine, so Linux
@@ -86,6 +105,40 @@ esp rename NAME       # rename this host
 esp invite            # create and print another invite from the creator config
 esp status            # show local node and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
+```
+
+## Linux systemd
+
+Example user service at `~/.config/systemd/user/esp.service`:
+
+```ini
+[Unit]
+Description=esp SSH transport proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/esp daemon --ports 22
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+```
+
+Enable and start it:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now esp.service
+systemctl --user status esp.service
+```
+
+To keep user services running after logout:
+
+```sh
+sudo loginctl enable-linger "$USER"
 ```
 
 ## Leaving
