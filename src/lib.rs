@@ -6,7 +6,6 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use iroh::{
     Endpoint, EndpointId, RelayMode, SecretKey,
-    address_lookup::AddrFilter,
     endpoint::{Connection, VarInt, presets},
 };
 use serde::{Deserialize, Serialize};
@@ -296,10 +295,8 @@ async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
     let cfg = Config::load(&path)?;
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
-        .clear_ip_transports()
         .secret_key(secret_key)
         .alpns(vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()])
-        .addr_filter(AddrFilter::relay_only())
         .relay_mode(RelayMode::Default)
         .bind()
         .await
@@ -319,9 +316,7 @@ async fn sync_joined_peer_once(path: &PathBuf, inviter: &Peer) -> Result<()> {
     let cfg = Config::load(path)?;
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
-        .clear_ip_transports()
         .secret_key(secret_key)
-        .addr_filter(AddrFilter::relay_only())
         .relay_mode(RelayMode::Default)
         .bind()
         .await
@@ -614,9 +609,7 @@ async fn proxy(target: String, port: u16) -> Result<()> {
     let peer = cfg.resolve_peer(&target)?.clone();
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
-        .clear_ip_transports()
         .secret_key(secret_key)
-        .addr_filter(AddrFilter::relay_only())
         .relay_mode(RelayMode::Default)
         .bind()
         .await

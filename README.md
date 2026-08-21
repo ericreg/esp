@@ -169,7 +169,8 @@ local TCP connection.
 
 ## Notes
 
-- SSH bytes are carried over iroh QUIC streams.
+- SSH bytes are carried over iroh QUIC streams. esp lets iroh try direct
+  connections first and use relays when a direct path is unavailable.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
 - The creator accepts invited peers by checking the random network id and issued
