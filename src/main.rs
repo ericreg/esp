@@ -186,6 +186,7 @@ async fn daemon() -> Result<()> {
 
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
+        .clear_ip_transports()
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
         .addr_filter(AddrFilter::relay_only())
@@ -389,7 +390,7 @@ async fn pump_tun_to_peer(
             debug!(dst = %ipv4.dst, peer_ip = %peer.ip, "dropping packet for non-peer destination");
             continue;
         }
-        debug!(packet = %ipv4, len = packet.len(), "sending packet to peer");
+        log_tunnel_packet(&ipv4, packet.len(), "sending packet to peer");
         if packet.len() > max_datagram {
             warn!(
                 len = packet.len(),
@@ -424,8 +425,16 @@ async fn pump_peer_to_tun(
             );
             continue;
         }
-        debug!(packet = %ipv4, len = packet.len(), "writing peer packet to TUN");
+        log_tunnel_packet(&ipv4, packet.len(), "writing peer packet to TUN");
         tun.send(&packet).await?;
+    }
+}
+
+fn log_tunnel_packet(packet: &Ipv4Packet, len: usize, message: &'static str) {
+    if packet.is_ssh_or_icmp() {
+        info!(packet = %packet, len, message);
+    } else {
+        debug!(packet = %packet, len, message);
     }
 }
 
@@ -637,6 +646,11 @@ impl Ipv4Packet {
             text.push('0');
         }
         Some(text)
+    }
+
+    fn is_ssh_or_icmp(&self) -> bool {
+        self.protocol == 1
+            || (self.protocol == 6 && (self.src_port == Some(22) || self.dst_port == Some(22)))
     }
 }
 
