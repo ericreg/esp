@@ -381,8 +381,9 @@ async fn pump_tun_to_peer(
     let mut buf = vec![0u8; usize::from(mtu) + 64];
     loop {
         let n = tun.recv(&mut buf).await?;
-        let packet = &buf[..n];
-        let Some(ipv4) = Ipv4Packet::parse(packet) else {
+        let mut packet = buf[..n].to_vec();
+        normalize_ipv4_checksums(&mut packet);
+        let Some(ipv4) = Ipv4Packet::parse(&packet) else {
             debug!("dropping non-IPv4 packet from TUN");
             continue;
         };
@@ -398,8 +399,7 @@ async fn pump_tun_to_peer(
             );
             continue;
         }
-        conn.send_datagram_wait(Bytes::copy_from_slice(packet))
-            .await?;
+        conn.send_datagram_wait(Bytes::from(packet)).await?;
     }
 }
 
@@ -410,7 +410,8 @@ async fn pump_peer_to_tun(
     peer: Peer,
 ) -> Result<()> {
     loop {
-        let packet = conn.read_datagram().await?;
+        let mut packet = conn.read_datagram().await?.to_vec();
+        normalize_ipv4_checksums(&mut packet);
         let Some(ipv4) = Ipv4Packet::parse(&packet) else {
             debug!("dropping non-IPv4 packet from peer");
             continue;
@@ -436,6 +437,103 @@ fn log_tunnel_packet(packet: &Ipv4Packet, len: usize, message: &'static str) {
     } else {
         debug!(packet = %packet, len, message);
     }
+}
+
+fn normalize_ipv4_checksums(packet: &mut [u8]) {
+    let Some((ihl, total_len, protocol)) = ipv4_lengths(packet) else {
+        return;
+    };
+
+    packet[10] = 0;
+    packet[11] = 0;
+    let ip_checksum = internet_checksum(&packet[..ihl]);
+    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    match protocol {
+        1 if total_len >= ihl + 4 => {
+            packet[ihl + 2] = 0;
+            packet[ihl + 3] = 0;
+            let checksum = internet_checksum(&packet[ihl..total_len]);
+            packet[ihl + 2..ihl + 4].copy_from_slice(&checksum.to_be_bytes());
+        }
+        6 if total_len >= ihl + 20 => {
+            packet[ihl + 16] = 0;
+            packet[ihl + 17] = 0;
+            let checksum = transport_checksum(packet, ihl, total_len, protocol);
+            packet[ihl + 16..ihl + 18].copy_from_slice(&checksum.to_be_bytes());
+        }
+        17 if total_len >= ihl + 8 => {
+            packet[ihl + 6] = 0;
+            packet[ihl + 7] = 0;
+            let checksum = transport_checksum(packet, ihl, total_len, protocol);
+            packet[ihl + 6..ihl + 8].copy_from_slice(&checksum.to_be_bytes());
+        }
+        _ => {}
+    }
+}
+
+fn ipv4_lengths(packet: &[u8]) -> Option<(usize, usize, u8)> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if ihl < 20 || total_len < ihl || packet.len() < total_len {
+        return None;
+    }
+    Some((ihl, total_len, packet[9]))
+}
+
+fn transport_checksum(packet: &[u8], ihl: usize, total_len: usize, protocol: u8) -> u16 {
+    let mut pseudo_header = [0u8; 12];
+    pseudo_header[..4].copy_from_slice(&packet[12..16]);
+    pseudo_header[4..8].copy_from_slice(&packet[16..20]);
+    pseudo_header[9] = protocol;
+    pseudo_header[10..12].copy_from_slice(&((total_len - ihl) as u16).to_be_bytes());
+    internet_checksum_parts([&pseudo_header, &packet[ihl..total_len]])
+}
+
+fn internet_checksum(data: &[u8]) -> u16 {
+    internet_checksum_parts([data])
+}
+
+fn internet_checksum_parts<'a>(parts: impl IntoIterator<Item = &'a [u8]>) -> u16 {
+    let mut sum = 0u32;
+    let mut odd = None;
+
+    for part in parts {
+        let mut chunks = part.chunks_exact(2);
+        if let Some(high) = odd.take() {
+            if let Some(first) = chunks.next() {
+                sum += u16::from_be_bytes([high, first[0]]) as u32;
+                if first.len() == 2 {
+                    odd = Some(first[1]);
+                }
+            } else if let Some(&byte) = part.first() {
+                sum += u16::from_be_bytes([high, byte]) as u32;
+                continue;
+            } else {
+                odd = Some(high);
+                continue;
+            }
+        }
+
+        for chunk in chunks.by_ref() {
+            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+        }
+        if let Some(&byte) = chunks.remainder().first() {
+            odd = Some(byte);
+        }
+    }
+
+    if let Some(byte) = odd {
+        sum += u16::from_be_bytes([byte, 0]) as u32;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 fn create_tun(cfg: &Config) -> Result<AsyncDevice> {
@@ -706,5 +804,23 @@ mod tests {
         assert_eq!(parsed.src, Ipv4Addr::new(100, 88, 0, 1));
         assert_eq!(parsed.dst, Ipv4Addr::new(100, 88, 0, 2));
         assert_eq!(parsed.protocol, 6);
+    }
+
+    #[test]
+    fn normalizes_ipv4_and_tcp_checksums() {
+        let mut packet = vec![
+            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6, 0, 0, 100, 88, 0, 1, 100, 88, 0, 2, 0xdf, 0x84, 0,
+            22, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0,
+        ];
+
+        normalize_ipv4_checksums(&mut packet);
+
+        assert_eq!(internet_checksum(&packet[..20]), 0);
+        let mut pseudo_header = [0u8; 12];
+        pseudo_header[..4].copy_from_slice(&packet[12..16]);
+        pseudo_header[4..8].copy_from_slice(&packet[16..20]);
+        pseudo_header[9] = 6;
+        pseudo_header[10..12].copy_from_slice(&20u16.to_be_bytes());
+        assert_eq!(internet_checksum_parts([&pseudo_header, &packet[20..]]), 0);
     }
 }
