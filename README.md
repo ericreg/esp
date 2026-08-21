@@ -75,8 +75,8 @@ be disambiguated by id.
 Once daemons are connected, SSH through esp to any learned peer:
 
 ```sh
-ssh -o ProxyCommand='esp proxy %h %p' user@host
-ssh -o ProxyCommand='esp proxy %h %p' user@A1B2C3
+ssh -o ProxyCommand='esp proxy %n %p' user@host
+ssh -o ProxyCommand='esp proxy %n %p' user@A1B2C3
 ```
 
 Or add an SSH config entry:
@@ -85,7 +85,7 @@ Or add an SSH config entry:
 Host host
     HostName host
     User user
-    ProxyCommand esp proxy %h %p
+    ProxyCommand esp proxy %n %p
 ```
 
 Then connect normally:
