@@ -1,9 +1,8 @@
-use std::{net::Ipv4Addr, path::PathBuf};
+use std::path::PathBuf;
 
 use esp::{
-    Config, DEFAULT_ALLOWED_PORT, DEFAULT_CIDR, DEFAULT_CREATOR_IP, DEFAULT_MTU, Invite,
-    MAX_SHARED_PEERS, Peer, encode_secret_key, ensure_port_allowed, is_valid_connection_id,
-    remember_advertised_peers,
+    Config, DEFAULT_ALLOWED_PORT, Invite, MAX_SHARED_PEERS, Peer, encode_secret_key,
+    ensure_port_allowed, is_valid_connection_id, remember_advertised_peers,
 };
 use iroh::SecretKey;
 
@@ -13,34 +12,32 @@ fn invite_round_trips() {
     let invite = Invite {
         version: 1,
         network_id: "net".to_string(),
-        cidr: DEFAULT_CIDR.to_string(),
-        mtu: DEFAULT_MTU,
+        invite_id: "invite1".to_string(),
+        invite_secret: "secret1".to_string(),
         inviter_node_id: key.public(),
-        inviter_ip: DEFAULT_CREATOR_IP,
         inviter_name: "creator".to_string(),
         inviter_connection_id: "ABC123".to_string(),
-        assigned_ip: Ipv4Addr::new(100, 88, 0, 2),
     };
 
     let code = invite.encode().unwrap();
     let decoded = Invite::decode(&code).unwrap();
     assert_eq!(decoded.network_id, invite.network_id);
+    assert_eq!(decoded.invite_id, invite.invite_id);
+    assert_eq!(decoded.invite_secret, invite.invite_secret);
     assert_eq!(decoded.inviter_node_id, invite.inviter_node_id);
     assert_eq!(decoded.inviter_name, invite.inviter_name);
     assert_eq!(decoded.inviter_connection_id, invite.inviter_connection_id);
-    assert_eq!(decoded.assigned_ip, invite.assigned_ip);
 }
 
 #[test]
-fn creator_issues_unique_invite_ips() {
+fn creator_issues_unique_invites_without_saving_codes() {
     let secret_key = SecretKey::generate();
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
-        cidr: DEFAULT_CIDR.to_string(),
-        mtu: DEFAULT_MTU,
-        my_ip: DEFAULT_CREATOR_IP,
         secret_key: encode_secret_key(&secret_key),
+        creator_node_id: Some(secret_key.public()),
+        invite_proof: None,
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
@@ -50,11 +47,13 @@ fn creator_issues_unique_invite_ips() {
     let first = cfg.issue_invite().unwrap();
     let second = cfg.issue_invite().unwrap();
 
-    assert_eq!(first.assigned_ip, Ipv4Addr::new(100, 88, 0, 2));
-    assert_eq!(second.assigned_ip, Ipv4Addr::new(100, 88, 0, 3));
+    assert_ne!(first.invite_id, second.invite_id);
+    assert_eq!(cfg.invites.len(), 2);
+    assert_eq!(cfg.invites[0].invite_id, first.invite_id);
+    assert_ne!(cfg.invites[0].secret_hash, first.code);
     assert_eq!(
-        Invite::decode(&second.code).unwrap().assigned_ip,
-        second.assigned_ip
+        Invite::decode(&second.code).unwrap().invite_id,
+        second.invite_id
     );
 }
 
@@ -66,23 +65,20 @@ fn resolving_duplicate_names_requires_connection_id() {
     let cfg = Config {
         version: 1,
         network_id: "net".to_string(),
-        cidr: DEFAULT_CIDR.to_string(),
-        mtu: DEFAULT_MTU,
-        my_ip: DEFAULT_CREATOR_IP,
         secret_key: encode_secret_key(&secret_key),
+        creator_node_id: Some(secret_key.public()),
+        invite_proof: None,
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
         peers: vec![
             Peer {
                 node_id: first_peer_key.public(),
-                ip: Ipv4Addr::new(100, 88, 0, 2),
                 name: "amd".to_string(),
                 connection_id: "DEF456".to_string(),
             },
             Peer {
                 node_id: second_peer_key.public(),
-                ip: Ipv4Addr::new(100, 88, 0, 3),
                 name: "amd".to_string(),
                 connection_id: "FED654".to_string(),
             },
@@ -106,16 +102,14 @@ fn connection_ids_are_case_sensitive_base62() {
     let cfg = Config {
         version: 1,
         network_id: "net".to_string(),
-        cidr: DEFAULT_CIDR.to_string(),
-        mtu: DEFAULT_MTU,
-        my_ip: DEFAULT_CREATOR_IP,
         secret_key: encode_secret_key(&secret_key),
+        creator_node_id: Some(secret_key.public()),
+        invite_proof: None,
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
         peers: vec![Peer {
             node_id: peer_key.public(),
-            ip: Ipv4Addr::new(100, 88, 0, 2),
             name: "amd".to_string(),
             connection_id: "aBc123".to_string(),
         }],
@@ -132,10 +126,9 @@ fn advertised_peer_lists_are_bounded() {
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
-        cidr: DEFAULT_CIDR.to_string(),
-        mtu: DEFAULT_MTU,
-        my_ip: DEFAULT_CREATOR_IP,
         secret_key: encode_secret_key(&secret_key),
+        creator_node_id: Some(secret_key.public()),
+        invite_proof: None,
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
@@ -143,14 +136,12 @@ fn advertised_peer_lists_are_bounded() {
     };
     let remote = Peer {
         node_id: remote_key.public(),
-        ip: Ipv4Addr::new(100, 88, 0, 2),
         name: "remote".to_string(),
         connection_id: "DEF456".to_string(),
     };
     let advertised = (0..=MAX_SHARED_PEERS)
         .map(|idx| Peer {
             node_id: SecretKey::generate().public(),
-            ip: Ipv4Addr::new(100, 88, 0, 10 + idx as u8),
             name: format!("peer-{idx}"),
             connection_id: format!("{idx:06}"),
         })

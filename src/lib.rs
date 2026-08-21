@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -10,6 +10,7 @@ use iroh::{
     endpoint::{Connection, VarInt, presets},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::TcpStream,
@@ -21,9 +22,6 @@ use uuid::Uuid;
 const CONTROL_ALPN: &[u8] = b"esp/control/0";
 const TCP_ALPN: &[u8] = b"esp/tcp/0";
 const CONFIG_FILE: &str = ".esp.yml";
-pub const DEFAULT_CIDR: &str = "100.88.0.0/24";
-pub const DEFAULT_CREATOR_IP: Ipv4Addr = Ipv4Addr::new(100, 88, 0, 1);
-pub const DEFAULT_MTU: u16 = 1000;
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
 const MAX_PROXY_REQUEST_LEN: usize = 1024;
 pub const MAX_SHARED_PEERS: usize = 100;
@@ -40,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create ~/.esp.yml if needed and print an invite code.
+    /// Create ~/.esp.yml if needed.
     Init,
     /// Join an esp network from an invite code.
     Join {
@@ -72,24 +70,24 @@ enum Command {
 pub struct Config {
     pub version: u8,
     pub network_id: String,
-    pub cidr: String,
-    pub mtu: u16,
-    pub my_ip: Ipv4Addr,
     pub secret_key: String,
+    #[serde(default)]
+    pub creator_node_id: Option<EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_proof: Option<InviteProof>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub connection_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invites: Vec<IssuedInvite>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<Peer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub node_id: EndpointId,
-    pub ip: Ipv4Addr,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -98,7 +96,13 @@ pub struct Peer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssuedInvite {
-    pub assigned_ip: Ipv4Addr,
+    pub invite_id: String,
+    pub secret_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InviteCode {
+    pub invite_id: String,
     pub code: String,
 }
 
@@ -106,25 +110,30 @@ pub struct IssuedInvite {
 pub struct Invite {
     pub version: u8,
     pub network_id: String,
-    pub cidr: String,
-    pub mtu: u16,
+    pub invite_id: String,
+    pub invite_secret: String,
     pub inviter_node_id: EndpointId,
-    pub inviter_ip: Ipv4Addr,
     #[serde(default)]
     pub inviter_name: String,
     #[serde(default)]
     pub inviter_connection_id: String,
-    pub assigned_ip: Ipv4Addr,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteProof {
+    pub invite_id: String,
+    pub invite_secret: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Hello {
     network_id: String,
-    ip: Ipv4Addr,
     #[serde(default)]
     name: String,
     #[serde(default)]
     connection_id: String,
+    #[serde(default)]
+    invite_proof: Option<InviteProof>,
     #[serde(default)]
     peers: Vec<Peer>,
 }
@@ -132,11 +141,12 @@ struct Hello {
 #[derive(Debug, Serialize, Deserialize)]
 struct TcpProxyRequest {
     network_id: String,
-    requester_ip: Ipv4Addr,
     #[serde(default)]
     requester_name: String,
     #[serde(default)]
     requester_connection_id: String,
+    #[serde(default)]
+    invite_proof: Option<InviteProof>,
     #[serde(default)]
     peers: Vec<Peer>,
     port: u16,
@@ -171,10 +181,9 @@ async fn init() -> Result<()> {
         let cfg = Config {
             version: 1,
             network_id: Uuid::new_v4().to_string(),
-            cidr: DEFAULT_CIDR.to_string(),
-            mtu: DEFAULT_MTU,
-            my_ip: DEFAULT_CREATOR_IP,
             secret_key: encode_secret_key(&secret_key),
+            creator_node_id: Some(secret_key.public()),
+            invite_proof: None,
             name: default_connection_name(),
             connection_id: generate_connection_id(),
             invites: Vec::new(),
@@ -184,16 +193,13 @@ async fn init() -> Result<()> {
         cfg
     };
     cfg.ensure_local_identity();
-    let invite = cfg.saved_or_issue_invite()?;
     cfg.save(&path)?;
 
     println!("esp config: {}", path.display());
     println!("name: {}", cfg.name);
     println!("connection id: {}", cfg.connection_id);
     println!("node id: {}", cfg.secret_key()?.public());
-    println!("compat ip: {}", cfg.my_ip);
-    println!("invite compat ip: {}", invite.assigned_ip);
-    println!("invite: {}", invite.code);
+    println!("run `esp invite` to create an invite");
     Ok(())
 }
 
@@ -216,16 +222,17 @@ async fn join(invite_code: &str) -> Result<()> {
     let cfg = Config {
         version: 1,
         network_id: invite.network_id,
-        cidr: invite.cidr,
-        mtu: invite.mtu,
-        my_ip: invite.assigned_ip,
         secret_key: encode_secret_key(&secret_key),
+        creator_node_id: Some(invite.inviter_node_id),
+        invite_proof: Some(InviteProof {
+            invite_id: invite.invite_id,
+            invite_secret: invite.invite_secret,
+        }),
         name: default_connection_name(),
         connection_id,
         invites: Vec::new(),
         peers: vec![Peer {
             node_id: invite.inviter_node_id,
-            ip: invite.inviter_ip,
             name: invite.inviter_name,
             connection_id: invite.inviter_connection_id,
         }],
@@ -272,12 +279,8 @@ fn status() -> Result<()> {
     println!("name: {}", cfg.name);
     println!("connection id: {}", cfg.connection_id);
     println!("node id: {}", cfg.secret_key()?.public());
-    println!("compat ip: {}", cfg.my_ip);
     for invite in &cfg.invites {
-        println!(
-            "issued invite compat ip: {} {}",
-            invite.assigned_ip, invite.code
-        );
+        println!("issued invite: {}", invite.invite_id);
     }
     for peer in &cfg.peers {
         println!("peer: {} {}", peer.display_name(), peer.node_id);
@@ -395,7 +398,13 @@ async fn sync_control_connection(
     let mut cfg = Config::load(path)?;
     let remote = exchange_hello(conn, &cfg).await?;
     let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, expected_peer)?;
-    remember_control_peer(path, &mut cfg, peer.clone(), expected_peer.is_some())?;
+    remember_control_peer(
+        path,
+        &mut cfg,
+        peer.clone(),
+        expected_peer.is_some(),
+        remote.invite_proof.as_ref(),
+    )?;
     remember_advertised_peers(path, &mut cfg, &peer, remote.peers)?;
     Ok(())
 }
@@ -424,9 +433,9 @@ async fn exchange_hello(conn: &Connection, cfg: &Config) -> Result<Hello> {
 async fn send_hello(conn: &Connection, cfg: &Config) -> Result<()> {
     let hello = Hello {
         network_id: cfg.network_id.clone(),
-        ip: cfg.my_ip,
         name: cfg.name.clone(),
         connection_id: cfg.connection_id.clone(),
+        invite_proof: cfg.invite_proof.clone(),
         peers: cfg.peers.clone(),
     };
     let data = serde_yaml::to_string(&hello)?.into_bytes();
@@ -445,9 +454,6 @@ fn validate_peer_report(
     if remote.network_id != cfg.network_id {
         bail!("peer joined a different esp network");
     }
-    if remote.ip == cfg.my_ip || !cidr_contains(&cfg.cidr, remote.ip)? {
-        bail!("peer reported invalid compatibility ip {}", remote.ip);
-    }
     if !is_valid_connection_id(&remote.connection_id) {
         bail!("peer reported invalid connection id");
     }
@@ -463,19 +469,14 @@ fn validate_peer_report(
                 peer.connection_id
             );
         }
-        if !peer.has_identity() && remote.ip != peer.ip {
-            bail!("peer reported ip {}, expected {}", remote.ip, peer.ip);
-        }
         return Ok(Peer {
             node_id,
-            ip: remote.ip,
             name: remote_name,
             connection_id: remote.connection_id.clone(),
         });
     }
     Ok(Peer {
         node_id,
-        ip: remote.ip,
         name: remote_name,
         connection_id: remote.connection_id.clone(),
     })
@@ -486,19 +487,20 @@ fn remember_control_peer(
     cfg: &mut Config,
     peer: Peer,
     was_expected: bool,
+    invite_proof: Option<&InviteProof>,
 ) -> Result<()> {
-    if was_expected || cfg.peer_by_id(peer.node_id).is_some() || cfg.peer_by_ip(peer.ip).is_some() {
+    if was_expected || cfg.peer_by_id(peer.node_id).is_some() {
         if insert_peer(cfg, peer)? {
             cfg.save(path)?;
         }
         return Ok(());
     }
 
-    if !cfg.can_accept_invited_peer(&peer) {
-        bail!("rejecting unknown peer {} {}", peer.ip, peer.node_id);
+    if !cfg.can_accept_invited_peer(invite_proof) {
+        bail!("rejecting unknown peer {}", peer.node_id);
     }
 
-    info!(peer = %peer.node_id, peer_ip = %peer.ip, "remembering invited peer");
+    info!(peer = %peer.node_id, "remembering invited peer");
     insert_peer(cfg, peer)?;
     cfg.save(path)
 }
@@ -519,7 +521,7 @@ pub fn remember_advertised_peers(
 
     let mut changed = false;
     for peer in advertised_peers {
-        if peer.node_id == remote_peer.node_id && peer.ip == remote_peer.ip {
+        if peer.node_id == remote_peer.node_id {
             continue;
         }
         if insert_peer(cfg, peer)? {
@@ -532,7 +534,15 @@ pub fn remember_advertised_peers(
     Ok(())
 }
 
-fn remember_proxy_peer(path: &PathBuf, cfg: &mut Config, peer: Peer) -> Result<()> {
+fn remember_proxy_peer(
+    path: &PathBuf,
+    cfg: &mut Config,
+    peer: Peer,
+    invite_proof: Option<&InviteProof>,
+) -> Result<()> {
+    if cfg.peer_by_id(peer.node_id).is_none() && !cfg.can_accept_invited_peer(invite_proof) {
+        bail!("rejecting unknown peer {}", peer.node_id);
+    }
     if insert_peer(cfg, peer)? {
         cfg.save(path)?;
     }
@@ -560,9 +570,6 @@ fn insert_peer(cfg: &mut Config, peer: Peer) -> Result<bool> {
             peer.node_id
         );
     }
-    if peer.ip == cfg.my_ip || !cidr_contains(&cfg.cidr, peer.ip)? {
-        bail!("peer has invalid compatibility ip {}", peer.ip);
-    }
     if let Some(existing) = cfg.peer_by_id(peer.node_id) {
         if existing.has_identity() && existing.connection_id != peer.connection_id {
             bail!(
@@ -572,23 +579,12 @@ fn insert_peer(cfg: &mut Config, peer: Peer) -> Result<bool> {
                 peer.connection_id
             );
         }
-        if existing.ip != peer.ip {
-            debug!(
-                peer = %peer.node_id,
-                old_ip = %existing.ip,
-                new_ip = %peer.ip,
-                "updating peer compatibility ip"
-            );
-        }
         let existing = cfg
             .peers
             .iter_mut()
             .find(|existing| existing.node_id == peer.node_id)
             .expect("peer_by_id found this peer");
-        let changed = existing.ip != peer.ip
-            || existing.name != peer.name
-            || existing.connection_id != peer.connection_id;
-        existing.ip = peer.ip;
+        let changed = existing.name != peer.name || existing.connection_id != peer.connection_id;
         existing.name = peer.name;
         existing.connection_id = peer.connection_id;
         return Ok(changed);
@@ -601,18 +597,6 @@ fn insert_peer(cfg: &mut Config, peer: Peer) -> Result<bool> {
             peer.node_id
         );
     }
-    if let Some(existing) = cfg.peer_by_ip(peer.ip) {
-        if existing.has_identity() {
-            bail!(
-                "compatibility ip {} belongs to {}, not {}",
-                peer.ip,
-                existing.node_id,
-                peer.node_id
-            );
-        }
-        return Ok(false);
-    }
-
     info!(
         peer = %peer.node_id,
         peer_id = %peer.connection_id,
@@ -648,9 +632,9 @@ async fn proxy(target: String, port: u16) -> Result<()> {
         .context("failed to open TCP proxy stream")?;
     let request = TcpProxyRequest {
         network_id: cfg.network_id.clone(),
-        requester_ip: cfg.my_ip,
         requester_name: cfg.name.clone(),
         requester_connection_id: cfg.connection_id,
+        invite_proof: cfg.invite_proof.clone(),
         peers: cfg.peers.clone(),
         port,
     };
@@ -704,17 +688,23 @@ async fn handle_tcp_proxy_connection(
     let expected = cfg.peer_by_id(conn.remote_id()).cloned();
     let reported = Hello {
         network_id: request.network_id,
-        ip: request.requester_ip,
         name: request.requester_name,
         connection_id: request.requester_connection_id,
+        invite_proof: request.invite_proof,
         peers: Vec::new(),
     };
     let peer = validate_peer_report(&cfg, conn.remote_id(), &reported, expected.as_ref())?;
-    remember_proxy_peer(&path, &mut cfg, peer.clone())?;
+    remember_proxy_peer(
+        &path,
+        &mut cfg,
+        peer.clone(),
+        reported.invite_proof.as_ref(),
+    )?;
     remember_advertised_peers(&path, &mut cfg, &peer, request.peers)?;
     info!(
         peer = %peer.node_id,
-        peer_ip = %peer.ip,
+        peer_name = %peer.name,
+        peer_id = %peer.connection_id,
         port = request.port,
         "opening localhost TCP proxy"
     );
@@ -800,52 +790,6 @@ async fn write_proxy_request(
     Ok(())
 }
 
-fn cidr_prefix(cidr: &str) -> Result<u8> {
-    let (_, prefix) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow!("CIDR must contain a / prefix"))?;
-    let prefix: u8 = prefix.parse().context("invalid CIDR prefix")?;
-    if prefix > 32 {
-        bail!("IPv4 prefix must be <= 32");
-    }
-    Ok(prefix)
-}
-
-fn cidr_contains(cidr: &str, ip: Ipv4Addr) -> Result<bool> {
-    let (base, _) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow!("CIDR must contain a / prefix"))?;
-    let base: Ipv4Addr = base.parse().context("invalid CIDR address")?;
-    let prefix = cidr_prefix(cidr)?;
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    Ok((u32::from(base) & mask) == (u32::from(ip) & mask))
-}
-
-fn cidr_host_bounds(cidr: &str) -> Result<(u32, u32)> {
-    let (base, _) = cidr
-        .split_once('/')
-        .ok_or_else(|| anyhow!("CIDR must contain a / prefix"))?;
-    let base: Ipv4Addr = base.parse().context("invalid CIDR address")?;
-    let prefix = cidr_prefix(cidr)?;
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    let network = u32::from(base) & mask;
-    let broadcast = network | !mask;
-    let (first, last) = if prefix <= 30 {
-        (network + 1, broadcast - 1)
-    } else {
-        (network, broadcast)
-    };
-    Ok((first, last))
-}
-
 fn config_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(CONFIG_FILE))
@@ -857,7 +801,17 @@ impl Config {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut cfg: Self = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
-        if cfg.ensure_local_identity() {
+        let mut changed = cfg.ensure_local_identity();
+        if cfg.creator_node_id.is_none() {
+            cfg.creator_node_id = Some(
+                cfg.peers
+                    .first()
+                    .map(|peer| peer.node_id)
+                    .unwrap_or(cfg.secret_key()?.public()),
+            );
+            changed = true;
+        }
+        if changed {
             cfg.save(path)?;
         }
         Ok(cfg)
@@ -874,10 +828,6 @@ impl Config {
 
     fn peer_by_id(&self, id: EndpointId) -> Option<&Peer> {
         self.peers.iter().find(|peer| peer.node_id == id)
-    }
-
-    fn peer_by_ip(&self, ip: Ipv4Addr) -> Option<&Peer> {
-        self.peers.iter().find(|peer| peer.ip == ip)
     }
 
     fn peer_by_connection_id(&self, connection_id: &str) -> Option<&Peer> {
@@ -927,60 +877,41 @@ impl Config {
         changed
     }
 
-    fn saved_or_issue_invite(&mut self) -> Result<IssuedInvite> {
-        if let Some(invite) = self.invites.last() {
-            return Ok(invite.clone());
-        }
-        self.issue_invite()
-    }
-
-    pub fn issue_invite(&mut self) -> Result<IssuedInvite> {
-        if self.my_ip != DEFAULT_CREATOR_IP {
+    pub fn issue_invite(&mut self) -> Result<InviteCode> {
+        let secret_key = self.secret_key()?;
+        if self.creator_node_id != Some(secret_key.public()) {
             bail!("only the network creator can issue invites in this MVP");
         }
-        let secret_key = self.secret_key()?;
-        let assigned_ip = self.next_available_invite_ip()?;
+        let invite_id = generate_connection_id();
+        let invite_secret = generate_invite_secret();
         let invite = Invite {
             version: 1,
             network_id: self.network_id.clone(),
-            cidr: self.cidr.clone(),
-            mtu: self.mtu,
+            invite_id: invite_id.clone(),
+            invite_secret: invite_secret.clone(),
             inviter_node_id: secret_key.public(),
-            inviter_ip: self.my_ip,
             inviter_name: self.name.clone(),
             inviter_connection_id: self.connection_id.clone(),
-            assigned_ip,
         };
-        let issued = IssuedInvite {
-            assigned_ip,
+        let issued = InviteCode {
+            invite_id: invite_id.clone(),
             code: invite.encode()?,
         };
-        self.invites.push(issued.clone());
+        self.invites.push(IssuedInvite {
+            invite_id,
+            secret_hash: hash_invite_secret(&invite_secret),
+        });
         Ok(issued)
     }
 
-    fn next_available_invite_ip(&self) -> Result<Ipv4Addr> {
-        let mut used = HashSet::new();
-        used.insert(self.my_ip);
-        used.extend(self.peers.iter().map(|peer| peer.ip));
-        used.extend(self.invites.iter().map(|invite| invite.assigned_ip));
-
-        let (first, last) = cidr_host_bounds(&self.cidr)?;
-        for raw in first..=last {
-            let ip = Ipv4Addr::from(raw);
-            if !used.contains(&ip) {
-                return Ok(ip);
-            }
-        }
-        bail!("no unused compatibility IPs are available in {}", self.cidr)
-    }
-
-    fn can_accept_invited_peer(&self, peer: &Peer) -> bool {
-        self.my_ip == DEFAULT_CREATOR_IP
-            && self
-                .invites
-                .iter()
-                .any(|invite| invite.assigned_ip == peer.ip)
+    fn can_accept_invited_peer(&self, proof: Option<&InviteProof>) -> bool {
+        let Some(proof) = proof else {
+            return false;
+        };
+        let secret_hash = hash_invite_secret(&proof.invite_secret);
+        self.invites
+            .iter()
+            .any(|invite| invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash)
     }
 }
 
@@ -993,7 +924,7 @@ impl Peer {
         if self.has_identity() {
             format!("{} ({})", self.name, self.connection_id)
         } else {
-            format!("{} {}", self.ip, self.node_id)
+            self.node_id.to_string()
         }
     }
 }
@@ -1049,6 +980,14 @@ fn generate_connection_id() -> String {
 
 pub fn is_valid_connection_id(id: &str) -> bool {
     id.len() == 6 && id.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn generate_invite_secret() -> String {
+    URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes())
+}
+
+fn hash_invite_secret(secret: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()))
 }
 
 pub fn encode_secret_key(secret_key: &SecretKey) -> String {

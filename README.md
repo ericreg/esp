@@ -34,9 +34,14 @@ On the first machine:
 esp init
 ```
 
-This creates `~/.esp.yml`, detects this host's name, generates a unique
-connection id, saves an invite code in that config, and prints it. Keep the
-daemon running on that machine:
+This creates `~/.esp.yml`, detects this host's name, and generates a unique
+connection id. Create an invite explicitly:
+
+```sh
+esp invite
+```
+
+Keep the daemon running on that machine:
 
 ```sh
 RUST_LOG=info esp
@@ -93,12 +98,12 @@ If multiple peers are named `host`, esp exits and prints the matching connection
 ids. Rename one of them with `esp rename NAME` or use the id directly.
 
 The remote daemon connects to `127.0.0.1:%p` on its own machine, so Linux
-firewall rules do not need to allow inbound SSH on an esp interface.
+firewall rules do not need to allow inbound SSH from esp peers.
 
 ## Commands
 
 ```sh
-esp init              # create ~/.esp.yml if missing and print an invite
+esp init              # create ~/.esp.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
@@ -154,7 +159,7 @@ local TCP connection.
 - The daemon allows proxying to local port 22 only by default. Additional ports
   must be explicitly allowed with `esp daemon --ports`.
 - Invite codes are bearer secrets. Anyone with a valid invite can attempt to
-  join that esp network as the assigned host.
+  join that esp network.
 - Peers share known peers during join and proxy setup. Shared peer lists are
   capped at 100 peers, and duplicate connection ids are rejected.
 - `~/.esp.yml` contains this host's private iroh key. Keep it private and do not
@@ -164,7 +169,6 @@ local TCP connection.
 
 ## Notes
 
-- The daemon does not create a TUN interface and should not need root.
 - SSH bytes are carried over iroh QUIC streams.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
