@@ -61,7 +61,7 @@ esp join <invite-code>
 RUST_LOG=info esp
 ```
 
-To add a third machine, print a new invite on the first machine:
+To add a third machine, print a new invite on any already-joined machine:
 
 ```sh
 esp invite
@@ -107,7 +107,7 @@ esp init              # create ~/.esp.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
-esp invite            # create and print another invite from the creator config
+esp invite            # create and print another invite from this network member
 esp status            # show local node and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 ```
@@ -173,7 +173,9 @@ local TCP connection.
   connections first and use relays when a direct path is unavailable.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
-- The creator accepts invited peers by checking the random network id and issued
-  invite. Treat invite codes as secrets.
+- The inviter accepts invited peers by checking the random network id and issued
+  invite. Any joined host can issue invites, so treat network members and invite
+  codes as trusted.
 - Hosts exchange known peers only during join and proxy connection setup.
-- Shared peer lists are capped at 100 peers.
+- Shared peer lists are capped at 100 peers. This is for security reasons.
+  You can change this in the code.

@@ -872,9 +872,6 @@ impl Config {
 
     pub fn issue_invite(&mut self) -> Result<InviteCode> {
         let secret_key = self.secret_key()?;
-        if self.creator_node_id != Some(secret_key.public()) {
-            bail!("only the network creator can issue invites in this MVP");
-        }
         let invite_id = generate_connection_id();
         let invite_secret = generate_invite_secret();
         let invite = Invite {

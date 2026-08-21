@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use esp::{
-    Config, DEFAULT_ALLOWED_PORT, Invite, MAX_SHARED_PEERS, Peer, encode_secret_key,
+    Config, DEFAULT_ALLOWED_PORT, Invite, InviteProof, MAX_SHARED_PEERS, Peer, encode_secret_key,
     ensure_port_allowed, is_valid_connection_id, remember_advertised_peers,
 };
 use iroh::SecretKey;
@@ -30,18 +30,26 @@ fn invite_round_trips() {
 }
 
 #[test]
-fn creator_issues_unique_invites_without_saving_codes() {
+fn joined_member_issues_unique_invites_without_saving_codes() {
     let secret_key = SecretKey::generate();
+    let creator_key = SecretKey::generate();
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(secret_key.public()),
-        invite_proof: None,
-        name: "creator".to_string(),
+        creator_node_id: Some(creator_key.public()),
+        invite_proof: Some(InviteProof {
+            invite_id: "ABC999".to_string(),
+            invite_secret: "member-proof".to_string(),
+        }),
+        name: "joined".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
-        peers: Vec::new(),
+        peers: vec![Peer {
+            node_id: creator_key.public(),
+            name: "creator".to_string(),
+            connection_id: "DEF456".to_string(),
+        }],
     };
 
     let first = cfg.issue_invite().unwrap();
@@ -54,6 +62,10 @@ fn creator_issues_unique_invites_without_saving_codes() {
     assert_eq!(
         Invite::decode(&second.code).unwrap().invite_id,
         second.invite_id
+    );
+    assert_eq!(
+        Invite::decode(&first.code).unwrap().inviter_node_id,
+        secret_key.public()
     );
 }
 
