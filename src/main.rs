@@ -6,6 +6,7 @@ use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use iroh::{
     Endpoint, EndpointId, RelayMode, SecretKey,
+    address_lookup::AddrFilter,
     endpoint::{Connection, VarInt, presets},
 };
 use serde::{Deserialize, Serialize};
@@ -174,7 +175,9 @@ fn status() -> Result<()> {
 async fn daemon() -> Result<()> {
     let cfg = Config::load(&config_path()?)?;
     let tun = Arc::new(create_tun(&cfg)?);
+    let tun_name = tun.name().context("failed to get TUN interface name")?;
     info!(
+        interface = %tun_name,
         ip = %cfg.my_ip,
         cidr = %cfg.cidr,
         mtu = cfg.mtu,
@@ -185,6 +188,7 @@ async fn daemon() -> Result<()> {
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALPN.to_vec()])
+        .addr_filter(AddrFilter::relay_only())
         .relay_mode(RelayMode::Default)
         .bind()
         .await
@@ -248,6 +252,7 @@ async fn run_acceptor(endpoint: Endpoint, tun: Arc<AsyncDevice>, cfg: Config) ->
                     return;
                 }
             };
+            let remote_addr = accepting.remote_addr();
 
             match accepting.await {
                 Ok(conn) => {
@@ -258,7 +263,11 @@ async fn run_acceptor(endpoint: Endpoint, tun: Arc<AsyncDevice>, cfg: Config) ->
                         conn.close(GRACEFUL_CLOSE, b"unknown peer");
                         return;
                     }
-                    info!(peer = %remote_id, "accepted arc peer");
+                    info!(
+                        peer = %remote_id,
+                        remote_addr = ?remote_addr,
+                        "accepted arc peer"
+                    );
                     if let Err(err) = bridge_connection(conn, tun, cfg, peer, remote_id).await {
                         warn!(error = %err, "arc peer bridge stopped");
                     }
@@ -380,6 +389,7 @@ async fn pump_tun_to_peer(
             debug!(dst = %ipv4.dst, peer_ip = %peer.ip, "dropping packet for non-peer destination");
             continue;
         }
+        debug!(packet = %ipv4, len = packet.len(), "sending packet to peer");
         if packet.len() > max_datagram {
             warn!(
                 len = packet.len(),
@@ -414,16 +424,19 @@ async fn pump_peer_to_tun(
             );
             continue;
         }
+        debug!(packet = %ipv4, len = packet.len(), "writing peer packet to TUN");
         tun.send(&packet).await?;
     }
 }
 
 fn create_tun(cfg: &Config) -> Result<AsyncDevice> {
     let prefix = cidr_prefix(&cfg.cidr)?;
-    let builder = DeviceBuilder::new()
-        .layer(Layer::L3)
-        .mtu(cfg.mtu)
-        .ipv4(cfg.my_ip, prefix, None);
+    let peer_ip = cfg.tunnel_peer_ip();
+    let builder =
+        DeviceBuilder::new()
+            .layer(Layer::L3)
+            .mtu(cfg.mtu)
+            .ipv4(cfg.my_ip, prefix, Some(peer_ip));
 
     #[cfg(not(target_os = "macos"))]
     let builder = builder.name("arc0");
@@ -494,6 +507,13 @@ impl Config {
         self.peers.iter().find(|peer| peer.node_id == id)
     }
 
+    fn tunnel_peer_ip(&self) -> Ipv4Addr {
+        self.peers
+            .first()
+            .map(|peer| peer.ip)
+            .unwrap_or(DEFAULT_INVITED_IP)
+    }
+
     fn invite_code(&self) -> Result<String> {
         if !self.peers.is_empty() {
             bail!("this two-host MVP only supports invites from the network creator");
@@ -544,6 +564,10 @@ impl Invite {
 struct Ipv4Packet {
     src: Ipv4Addr,
     dst: Ipv4Addr,
+    protocol: u8,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    tcp_flags: Option<u8>,
 }
 
 impl Ipv4Packet {
@@ -555,16 +579,82 @@ impl Ipv4Packet {
         if version != 4 {
             return None;
         }
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        if ihl < 20 || packet.len() < ihl {
+            return None;
+        }
+        let protocol = packet[9];
+        let (src_port, dst_port, tcp_flags) =
+            if matches!(protocol, 6 | 17) && packet.len() >= ihl + 4 {
+                let src_port = u16::from_be_bytes([packet[ihl], packet[ihl + 1]]);
+                let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
+                let tcp_flags = if protocol == 6 && packet.len() >= ihl + 14 {
+                    Some(packet[ihl + 13])
+                } else {
+                    None
+                };
+                (Some(src_port), Some(dst_port), tcp_flags)
+            } else {
+                (None, None, None)
+            };
         Some(Self {
             src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
             dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+            protocol,
+            src_port,
+            dst_port,
+            tcp_flags,
         })
+    }
+
+    fn protocol_name(&self) -> &'static str {
+        match self.protocol {
+            1 => "ICMP",
+            6 => "TCP",
+            17 => "UDP",
+            _ => "IPv4",
+        }
+    }
+
+    fn tcp_flags_text(&self) -> Option<String> {
+        let flags = self.tcp_flags?;
+        let mut text = String::new();
+        for (flag, name) in [
+            (0x01, "F"),
+            (0x02, "S"),
+            (0x04, "R"),
+            (0x08, "P"),
+            (0x10, "A"),
+            (0x20, "U"),
+            (0x40, "E"),
+            (0x80, "C"),
+        ] {
+            if flags & flag != 0 {
+                text.push_str(name);
+            }
+        }
+        if text.is_empty() {
+            text.push('0');
+        }
+        Some(text)
     }
 }
 
 impl fmt::Display for Ipv4Packet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} -> {}", self.src, self.dst)
+        write!(f, "{} ", self.protocol_name())?;
+        match (self.src_port, self.dst_port) {
+            (Some(src_port), Some(dst_port)) => {
+                write!(f, "{}:{} -> {}:{}", self.src, src_port, self.dst, dst_port)?;
+            }
+            _ => {
+                write!(f, "{} -> {}", self.src, self.dst)?;
+            }
+        }
+        if let Some(flags) = self.tcp_flags_text() {
+            write!(f, " flags={flags}")?;
+        }
+        Ok(())
     }
 }
 
@@ -601,5 +691,6 @@ mod tests {
         let parsed = Ipv4Packet::parse(&packet).unwrap();
         assert_eq!(parsed.src, Ipv4Addr::new(100, 88, 0, 1));
         assert_eq!(parsed.dst, Ipv4Addr::new(100, 88, 0, 2));
+        assert_eq!(parsed.protocol, 6);
     }
 }
