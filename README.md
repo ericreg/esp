@@ -160,10 +160,14 @@ local TCP connection.
   must be explicitly allowed with `esp daemon --ports`.
 - Invite codes are bearer bootstrap secrets. A successful join consumes the
   invite on the inviter and returns a signed membership certificate for the new
-  node.
+  node. The running daemon serializes invite consumption and peer-learning
+  config updates through a single config actor.
 - After join, peers authenticate esp membership with certificates signed by an
   existing member and chained back to the network creator. Normal proxy requests
   do not carry invite secrets.
+- When the daemon is running, local `esp invite`, `esp rename`, `esp status`,
+  and existing-config `esp init` commands use the daemon's private local control
+  socket instead of writing `~/.esp.yml` directly.
 - Peers share known peers and membership certificates during join and proxy
   setup. Shared peer and certificate lists are capped at 100 entries, and
   duplicate connection ids are rejected.

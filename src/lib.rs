@@ -15,25 +15,31 @@ use iroh::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{
-    io::{self, AsyncWriteExt},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
+    sync::{mpsc, oneshot},
     time::timeout,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 
 const CONTROL_ALPN: &[u8] = b"esp/control/0";
 const TCP_ALPN: &[u8] = b"esp/tcp/0";
 const CONFIG_FILE: &str = ".esp.yml";
+const LOCAL_CONTROL_SOCKET_FILE: &str = ".esp.sock";
 
 #[cfg(unix)]
 const CONFIG_FILE_MODE: u32 = 0o600;
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
 const MAX_PROXY_REQUEST_LEN: usize = 64 * 1024 - 1;
 const MAX_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
+const MAX_LOCAL_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
+const CONFIG_ACTOR_QUEUE: usize = 64;
 pub const MAX_SHARED_PEERS: usize = 100;
 const GRACEFUL_CLOSE: VarInt = VarInt::from_u32(0);
 const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/1";
@@ -196,6 +202,138 @@ struct TcpProxyRequest {
     port: u16,
 }
 
+#[derive(Debug, Clone)]
+struct HostIdentity {
+    name: String,
+    connection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StatusReport {
+    network_id: String,
+    name: String,
+    connection_id: String,
+    node_id: EndpointId,
+    invites: Vec<String>,
+    peers: Vec<Peer>,
+}
+
+#[derive(Clone)]
+struct ConfigActorHandle {
+    sender: mpsc::Sender<ConfigActorCommand>,
+}
+
+enum ConfigActorCommand {
+    Status {
+        respond: oneshot::Sender<Result<StatusReport>>,
+    },
+    Rename {
+        name: String,
+        respond: oneshot::Sender<Result<HostIdentity>>,
+    },
+    IssueInvite {
+        respond: oneshot::Sender<Result<InviteCode>>,
+    },
+    ControlSync {
+        node_id: EndpointId,
+        remote: Hello,
+        expected_peer: Option<Peer>,
+        respond: oneshot::Sender<Result<ControlResponse>>,
+    },
+    ProxyRequest {
+        node_id: EndpointId,
+        request: TcpProxyRequest,
+        respond: oneshot::Sender<Result<Peer>>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum LocalControlRequest {
+    Status,
+    Rename { name: String },
+    IssueInvite,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalControlResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<StatusReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renamed: Option<LocalRenameReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invite_code: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalRenameReport {
+    name: String,
+    connection_id: String,
+}
+
+#[derive(Debug)]
+enum LocalControlOk {
+    Status { report: StatusReport },
+    Renamed { name: String, connection_id: String },
+    Invite { code: String },
+}
+
+impl LocalControlResponse {
+    fn ok(ok: LocalControlOk) -> Self {
+        match ok {
+            LocalControlOk::Status { report } => Self {
+                error: None,
+                status: Some(report),
+                renamed: None,
+                invite_code: None,
+            },
+            LocalControlOk::Renamed {
+                name,
+                connection_id,
+            } => Self {
+                error: None,
+                status: None,
+                renamed: Some(LocalRenameReport {
+                    name,
+                    connection_id,
+                }),
+                invite_code: None,
+            },
+            LocalControlOk::Invite { code } => Self {
+                error: None,
+                status: None,
+                renamed: None,
+                invite_code: Some(code),
+            },
+        }
+    }
+
+    fn err(error: String) -> Self {
+        Self {
+            error: Some(error),
+            status: None,
+            renamed: None,
+            invite_code: None,
+        }
+    }
+
+    fn into_result(self) -> Result<LocalControlOk> {
+        if let Some(error) = self.error {
+            bail!(error);
+        }
+        match (self.status, self.renamed, self.invite_code) {
+            (Some(report), None, None) => Ok(LocalControlOk::Status { report }),
+            (None, Some(renamed), None) => Ok(LocalControlOk::Renamed {
+                name: renamed.name,
+                connection_id: renamed.connection_id,
+            }),
+            (None, None, Some(code)) => Ok(LocalControlOk::Invite { code }),
+            _ => bail!("invalid local esp control response"),
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -210,14 +348,21 @@ pub async fn run() -> Result<()> {
         Command::Join { invite } => join(&invite).await,
         Command::Daemon { ports } => daemon(ports).await,
         Command::Proxy { target, port } => proxy(target, port).await,
-        Command::Rename { name } => rename(&name),
-        Command::Invite => print_invite(),
-        Command::Status => status(),
+        Command::Rename { name } => rename(&name).await,
+        Command::Invite => print_invite().await,
+        Command::Status => status().await,
     }
 }
 
 async fn init() -> Result<()> {
     let path = config_path()?;
+    if path.exists()
+        && let Some(report) = request_daemon_status().await?
+    {
+        print_init_report(&path, &report);
+        return Ok(());
+    }
+
     let mut cfg = if path.exists() {
         Config::load(&path)?
     } else {
@@ -241,11 +386,8 @@ async fn init() -> Result<()> {
     cfg.ensure_local_config()?;
     cfg.save(&path)?;
 
-    println!("esp config: {}", path.display());
-    println!("name: {}", cfg.name);
-    println!("connection id: {}", cfg.connection_id);
-    println!("node id: {}", cfg.secret_key()?.public());
-    println!("run `esp invite` to create an invite");
+    let report = status_report_from_config(&cfg)?;
+    print_init_report(&path, &report);
     Ok(())
 }
 
@@ -301,17 +443,27 @@ async fn join(invite_code: &str) -> Result<()> {
     Ok(())
 }
 
-fn rename(name: &str) -> Result<()> {
+async fn rename(name: &str) -> Result<()> {
+    if let Some(identity) = request_daemon_rename(name).await? {
+        print_identity(&identity);
+        return Ok(());
+    }
+
     let path = config_path()?;
     let mut cfg = Config::load(&path)?;
     cfg.name = normalize_connection_name(name)?;
     cfg.save(&path)?;
-    println!("name: {}", cfg.name);
-    println!("connection id: {}", cfg.connection_id);
+    let identity = host_identity_from_config(&cfg);
+    print_identity(&identity);
     Ok(())
 }
 
-fn print_invite() -> Result<()> {
+async fn print_invite() -> Result<()> {
+    if let Some(code) = request_daemon_invite().await? {
+        println!("{code}");
+        return Ok(());
+    }
+
     let path = config_path()?;
     let mut cfg = Config::load(&path)?;
     let invite = cfg.issue_invite()?;
@@ -320,30 +472,180 @@ fn print_invite() -> Result<()> {
     Ok(())
 }
 
-fn status() -> Result<()> {
+async fn status() -> Result<()> {
     let path = config_path()?;
-    let cfg = Config::load(&path)?;
-    println!("esp config: {}", path.display());
-    println!("network: {}", cfg.network_id);
-    println!("name: {}", cfg.name);
-    println!("connection id: {}", cfg.connection_id);
-    println!("node id: {}", cfg.secret_key()?.public());
-    for invite in &cfg.invites {
-        println!("issued invite: {}", invite.invite_id);
+    if let Some(report) = request_daemon_status().await? {
+        print_status_report(&path, &report);
+        return Ok(());
     }
-    for peer in &cfg.peers {
+
+    let cfg = Config::load(&path)?;
+    let report = status_report_from_config(&cfg)?;
+    print_status_report(&path, &report);
+    Ok(())
+}
+
+async fn request_daemon_status() -> Result<Option<StatusReport>> {
+    let Some(response) = send_local_control_request(LocalControlRequest::Status).await? else {
+        return Ok(None);
+    };
+    match response {
+        LocalControlOk::Status { report } => Ok(Some(report)),
+        _ => bail!("daemon returned unexpected response to status request"),
+    }
+}
+
+async fn request_daemon_rename(name: &str) -> Result<Option<HostIdentity>> {
+    let Some(response) = send_local_control_request(LocalControlRequest::Rename {
+        name: name.to_string(),
+    })
+    .await?
+    else {
+        return Ok(None);
+    };
+    match response {
+        LocalControlOk::Renamed {
+            name,
+            connection_id,
+        } => Ok(Some(HostIdentity {
+            name,
+            connection_id,
+        })),
+        _ => bail!("daemon returned unexpected response to rename request"),
+    }
+}
+
+async fn request_daemon_invite() -> Result<Option<String>> {
+    let Some(response) = send_local_control_request(LocalControlRequest::IssueInvite).await? else {
+        return Ok(None);
+    };
+    match response {
+        LocalControlOk::Invite { code } => Ok(Some(code)),
+        _ => bail!("daemon returned unexpected response to invite request"),
+    }
+}
+
+async fn send_local_control_request(
+    request: LocalControlRequest,
+) -> Result<Option<LocalControlOk>> {
+    #[cfg(unix)]
+    {
+        let path = local_control_socket_path()?;
+        send_local_control_request_to_path(&path, request).await
+    }
+
+    #[cfg(not(unix))]
+    {
+        drop(request);
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+async fn send_local_control_request_to_path(
+    path: &Path,
+    request: LocalControlRequest,
+) -> Result<Option<LocalControlOk>> {
+    let mut stream = match UnixStream::connect(path).await {
+        Ok(stream) => stream,
+        Err(err) if is_local_control_unavailable(&err) => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to connect to {}", path.display()));
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        write_yaml_frame(
+            &mut stream,
+            &request,
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "local esp control request",
+        )
+        .await?;
+
+        let response: LocalControlResponse = read_yaml_frame(
+            &mut stream,
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "local esp control response",
+        )
+        .await?;
+        response.into_result().map(Some)
+    })
+    .await
+    .context("timed out waiting for local esp control response")?
+}
+
+#[cfg(unix)]
+fn is_local_control_unavailable(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}
+
+fn host_identity_from_config(cfg: &Config) -> HostIdentity {
+    HostIdentity {
+        name: cfg.name.clone(),
+        connection_id: cfg.connection_id.clone(),
+    }
+}
+
+fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
+    Ok(StatusReport {
+        network_id: cfg.network_id.clone(),
+        name: cfg.name.clone(),
+        connection_id: cfg.connection_id.clone(),
+        node_id: cfg.secret_key()?.public(),
+        invites: cfg
+            .invites
+            .iter()
+            .map(|invite| invite.invite_id.clone())
+            .collect(),
+        peers: cfg.peers.clone(),
+    })
+}
+
+fn print_init_report(path: &Path, report: &StatusReport) {
+    println!("esp config: {}", path.display());
+    println!("name: {}", report.name);
+    println!("connection id: {}", report.connection_id);
+    println!("node id: {}", report.node_id);
+    println!("run `esp invite` to create an invite");
+}
+
+fn print_identity(identity: &HostIdentity) {
+    println!("name: {}", identity.name);
+    println!("connection id: {}", identity.connection_id);
+}
+
+fn print_status_report(path: &Path, report: &StatusReport) {
+    println!("esp config: {}", path.display());
+    println!("network: {}", report.network_id);
+    println!("name: {}", report.name);
+    println!("connection id: {}", report.connection_id);
+    println!("node id: {}", report.node_id);
+    for invite in &report.invites {
+        println!("issued invite: {invite}");
+    }
+    for peer in &report.peers {
         println!("peer: {} {}", peer.display_name(), peer.node_id);
     }
-    Ok(())
 }
 
 async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
     if allowed_ports.is_empty() {
         bail!("at least one allowed port is required");
     }
+    #[cfg(unix)]
+    let (local_control_listener, _local_control_socket) =
+        prepare_local_control_socket().context("failed to start local esp control")?;
+
     let path = config_path()?;
     let cfg = Config::load(&path)?;
     let secret_key = cfg.secret_key()?;
+    let actor = spawn_config_actor(path, cfg);
+    #[cfg(unix)]
+    let local_control_task = spawn_local_control_server(local_control_listener, actor.clone());
+
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()])
@@ -357,8 +659,168 @@ async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
     info!(addr = ?endpoint.addr(), "esp endpoint online");
 
     info!(ports = ?allowed_ports, "esp TCP proxy port allowlist active");
-    run_acceptor(endpoint.clone(), path, allowed_ports).await?;
+    let accept_result = run_acceptor(endpoint.clone(), actor, allowed_ports).await;
+    #[cfg(unix)]
+    local_control_task.abort();
+    accept_result?;
     endpoint.close().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+struct LocalControlSocket {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for LocalControlSocket {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn prepare_local_control_socket() -> Result<(UnixListener, LocalControlSocket)> {
+    let path = local_control_socket_path()?;
+    let listener = bind_local_control_socket(&path)?;
+    let guard = LocalControlSocket { path: path.clone() };
+    info!(path = %path.display(), "local esp control socket listening");
+    Ok((listener, guard))
+}
+
+#[cfg(unix)]
+fn spawn_local_control_server(
+    listener: UnixListener,
+    actor: ConfigActorHandle,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_local_control_server(listener, actor))
+}
+
+#[cfg(unix)]
+fn local_control_socket_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(LOCAL_CONTROL_SOCKET_FILE))
+}
+
+#[cfg(unix)]
+fn bind_local_control_socket(path: &Path) -> Result<UnixListener> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                bail!(
+                    "{} is a symlink; refusing to use it as esp control socket",
+                    path.display()
+                );
+            }
+            if !file_type.is_socket() {
+                bail!("{} exists and is not a socket", path.display());
+            }
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => bail!(
+                    "esp daemon already appears to be running at {}",
+                    path.display()
+                ),
+                Err(err) if is_local_control_unavailable(&err) => {
+                    fs::remove_file(path)
+                        .with_context(|| format!("failed to remove stale {}", path.display()))?;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to inspect {}", path.display()));
+                }
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("failed to bind {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(CONFIG_FILE_MODE))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+async fn run_local_control_server(listener: UnixListener, actor: ConfigActorHandle) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                let actor = actor.clone();
+                tokio::spawn(async move {
+                    match timeout(
+                        Duration::from_secs(15),
+                        handle_local_control_connection(stream, actor),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "local esp control request failed");
+                        }
+                        Err(_) => {
+                            warn!("local esp control request timed out");
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                warn!(error = %err, "local esp control listener failed");
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn handle_local_control_connection(
+    mut stream: UnixStream,
+    actor: ConfigActorHandle,
+) -> Result<()> {
+    let result = match read_yaml_frame(
+        &mut stream,
+        MAX_LOCAL_CONTROL_MESSAGE_LEN,
+        "local esp control request",
+    )
+    .await
+    {
+        Ok(LocalControlRequest::Status) => actor
+            .status()
+            .await
+            .map(|report| LocalControlOk::Status { report }),
+        Ok(LocalControlRequest::Rename { name }) => {
+            actor
+                .rename(name)
+                .await
+                .map(|identity| LocalControlOk::Renamed {
+                    name: identity.name,
+                    connection_id: identity.connection_id,
+                })
+        }
+        Ok(LocalControlRequest::IssueInvite) => actor
+            .issue_invite()
+            .await
+            .map(|invite| LocalControlOk::Invite { code: invite.code }),
+        Err(err) => Err(err),
+    };
+    let response = match result {
+        Ok(ok) => LocalControlResponse::ok(ok),
+        Err(err) => LocalControlResponse::err(err.to_string()),
+    };
+    write_yaml_frame(
+        &mut stream,
+        &response,
+        MAX_LOCAL_CONTROL_MESSAGE_LEN,
+        "local esp control response",
+    )
+    .await?;
+    stream
+        .shutdown()
+        .await
+        .context("failed to finish local esp control response")?;
     Ok(())
 }
 
@@ -386,10 +848,14 @@ async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
     result
 }
 
-async fn run_acceptor(endpoint: Endpoint, path: PathBuf, allowed_ports: Vec<u16>) -> Result<()> {
+async fn run_acceptor(
+    endpoint: Endpoint,
+    actor: ConfigActorHandle,
+    allowed_ports: Vec<u16>,
+) -> Result<()> {
     info!("accepting esp control and TCP proxy connections");
     while let Some(incoming) = endpoint.accept().await {
-        let path = path.clone();
+        let actor = actor.clone();
         let allowed_ports = allowed_ports.clone();
         tokio::spawn(async move {
             let accepting = match incoming.accept() {
@@ -411,9 +877,9 @@ async fn run_acceptor(endpoint: Endpoint, path: PathBuf, allowed_ports: Vec<u16>
                         "accepted esp connection"
                     );
                     let result = if alpn == CONTROL_ALPN {
-                        handle_control_connection(conn, path).await
+                        handle_control_connection(conn, actor).await
                     } else if alpn == TCP_ALPN {
-                        handle_tcp_proxy_connection(conn, path, &allowed_ports).await
+                        handle_tcp_proxy_connection(conn, actor, &allowed_ports).await
                     } else {
                         conn.close(GRACEFUL_CLOSE, b"unknown alpn");
                         Ok(())
@@ -429,8 +895,8 @@ async fn run_acceptor(endpoint: Endpoint, path: PathBuf, allowed_ports: Vec<u16>
     Ok(())
 }
 
-async fn handle_control_connection(conn: Connection, path: PathBuf) -> Result<()> {
-    sync_control_server(&conn, &path).await?;
+async fn handle_control_connection(conn: Connection, actor: ConfigActorHandle) -> Result<()> {
+    sync_control_server(&conn, actor).await?;
     conn.close(GRACEFUL_CLOSE, b"synced");
     Ok(())
 }
@@ -475,36 +941,14 @@ async fn sync_control_client(conn: &Connection, path: &Path, expected_peer: &Pee
     .context("timed out waiting for esp control sync")?
 }
 
-async fn sync_control_server(conn: &Connection, path: &Path) -> Result<()> {
+async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Result<()> {
     timeout(Duration::from_secs(15), async {
-        let mut cfg = Config::load(path)?;
         let (mut send, mut recv) = conn
             .accept_bi()
             .await
             .context("failed to accept esp control stream")?;
         let remote = read_control_hello(&mut recv).await?;
-        let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, None)?;
-        let remote_memberships = memberships_from_hello(&remote);
-        let granted_membership = remember_control_peer(
-            path,
-            &mut cfg,
-            peer.clone(),
-            false,
-            remote.invite_proof.as_ref(),
-            remote.membership.as_ref(),
-            &remote_memberships,
-        )?;
-        remember_advertised_peers_with_memberships(
-            path,
-            &mut cfg,
-            &peer,
-            remote.peers,
-            remote_memberships,
-        )?;
-        let response = ControlResponse {
-            hello: hello_from_config(&cfg),
-            granted_membership,
-        };
+        let response = actor.control_sync(conn.remote_id(), remote, None).await?;
         write_control_response(&mut send, &response).await?;
         send.finish()
             .context("failed to finish esp control send stream")?;
@@ -512,6 +956,179 @@ async fn sync_control_server(conn: &Connection, path: &Path) -> Result<()> {
     })
     .await
     .context("timed out waiting for esp control sync")?
+}
+
+fn spawn_config_actor(path: PathBuf, cfg: Config) -> ConfigActorHandle {
+    let (sender, receiver) = mpsc::channel(CONFIG_ACTOR_QUEUE);
+    tokio::spawn(run_config_actor(path, cfg, receiver));
+    ConfigActorHandle { sender }
+}
+
+async fn run_config_actor(
+    path: PathBuf,
+    mut cfg: Config,
+    mut receiver: mpsc::Receiver<ConfigActorCommand>,
+) {
+    while let Some(command) = receiver.recv().await {
+        match command {
+            ConfigActorCommand::Status { respond } => {
+                let _ = respond.send(status_report_from_config(&cfg));
+            }
+            ConfigActorCommand::Rename { name, respond } => {
+                let result = commit_config_change(&path, &mut cfg, |next| {
+                    next.name = normalize_connection_name(&name)?;
+                    Ok((host_identity_from_config(next), true))
+                });
+                let _ = respond.send(result);
+            }
+            ConfigActorCommand::IssueInvite { respond } => {
+                let result = commit_config_change(&path, &mut cfg, |next| {
+                    let invite = next.issue_invite()?;
+                    Ok((invite, true))
+                });
+                let _ = respond.send(result);
+            }
+            ConfigActorCommand::ControlSync {
+                node_id,
+                remote,
+                expected_peer,
+                respond,
+            } => {
+                let result = commit_config_change(&path, &mut cfg, |next| {
+                    apply_control_sync(next, node_id, remote, expected_peer)
+                });
+                let _ = respond.send(result);
+            }
+            ConfigActorCommand::ProxyRequest {
+                node_id,
+                request,
+                respond,
+            } => {
+                let result = commit_config_change(&path, &mut cfg, |next| {
+                    apply_proxy_request(next, node_id, request)
+                });
+                let _ = respond.send(result);
+            }
+        }
+    }
+}
+
+fn commit_config_change<T>(
+    path: &Path,
+    cfg: &mut Config,
+    apply: impl FnOnce(&mut Config) -> Result<(T, bool)>,
+) -> Result<T> {
+    let mut next = cfg.clone();
+    let (output, changed) = apply(&mut next)?;
+    if changed {
+        next.save(path)?;
+    }
+    *cfg = next;
+    Ok(output)
+}
+
+impl ConfigActorHandle {
+    async fn status(&self) -> Result<StatusReport> {
+        self.request(|respond| ConfigActorCommand::Status { respond })
+            .await
+    }
+
+    async fn rename(&self, name: String) -> Result<HostIdentity> {
+        self.request(|respond| ConfigActorCommand::Rename { name, respond })
+            .await
+    }
+
+    async fn issue_invite(&self) -> Result<InviteCode> {
+        self.request(|respond| ConfigActorCommand::IssueInvite { respond })
+            .await
+    }
+
+    async fn control_sync(
+        &self,
+        node_id: EndpointId,
+        remote: Hello,
+        expected_peer: Option<Peer>,
+    ) -> Result<ControlResponse> {
+        self.request(|respond| ConfigActorCommand::ControlSync {
+            node_id,
+            remote,
+            expected_peer,
+            respond,
+        })
+        .await
+    }
+
+    async fn proxy_request(&self, node_id: EndpointId, request: TcpProxyRequest) -> Result<Peer> {
+        self.request(|respond| ConfigActorCommand::ProxyRequest {
+            node_id,
+            request,
+            respond,
+        })
+        .await
+    }
+
+    async fn request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T>>) -> ConfigActorCommand,
+    ) -> Result<T> {
+        let (respond, receive) = oneshot::channel();
+        self.sender
+            .send(build(respond))
+            .await
+            .map_err(|_| anyhow!("config actor stopped"))?;
+        receive.await.context("config actor dropped response")?
+    }
+}
+
+fn apply_control_sync(
+    cfg: &mut Config,
+    node_id: EndpointId,
+    remote: Hello,
+    expected_peer: Option<Peer>,
+) -> Result<(ControlResponse, bool)> {
+    let peer = validate_peer_report(cfg, node_id, &remote, expected_peer.as_ref())?;
+    let remote_memberships = memberships_from_hello(&remote);
+    let (granted_membership, mut changed) = remember_control_peer_in_config(
+        cfg,
+        peer.clone(),
+        expected_peer.is_some(),
+        remote.invite_proof.as_ref(),
+        remote.membership.as_ref(),
+        &remote_memberships,
+    )?;
+    changed |= remember_advertised_peers_in_config(cfg, &peer, remote.peers, remote_memberships)?;
+    let response = ControlResponse {
+        hello: hello_from_config(cfg),
+        granted_membership,
+    };
+    Ok((response, changed))
+}
+
+fn apply_proxy_request(
+    cfg: &mut Config,
+    node_id: EndpointId,
+    request: TcpProxyRequest,
+) -> Result<(Peer, bool)> {
+    let expected = cfg.peer_by_id(node_id).cloned();
+    let reported = Hello {
+        network_id: request.network_id,
+        name: request.requester_name,
+        connection_id: request.requester_connection_id,
+        invite_proof: request.invite_proof,
+        membership: request.membership,
+        memberships: request.memberships,
+        peers: Vec::new(),
+    };
+    let peer = validate_peer_report(cfg, node_id, &reported, expected.as_ref())?;
+    let remote_memberships = memberships_from_hello(&reported);
+    let mut changed = remember_proxy_peer_in_config(
+        cfg,
+        peer.clone(),
+        reported.membership.as_ref(),
+        &remote_memberships,
+    )?;
+    changed |= remember_advertised_peers_in_config(cfg, &peer, request.peers, remote_memberships)?;
+    Ok((peer, changed))
 }
 
 fn validate_peer_report(
@@ -560,45 +1177,63 @@ fn remember_control_peer(
     direct_membership: Option<&MembershipCertificate>,
     extra_memberships: &[MembershipCertificate],
 ) -> Result<Option<MembershipCertificate>> {
+    let (granted_membership, changed) = remember_control_peer_in_config(
+        cfg,
+        peer,
+        was_expected,
+        invite_proof,
+        direct_membership,
+        extra_memberships,
+    )?;
+    if changed {
+        cfg.save(path)?;
+    }
+    Ok(granted_membership)
+}
+
+fn remember_control_peer_in_config(
+    cfg: &mut Config,
+    peer: Peer,
+    was_expected: bool,
+    invite_proof: Option<&InviteProof>,
+    direct_membership: Option<&MembershipCertificate>,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<(Option<MembershipCertificate>, bool)> {
     let verified_membership =
         verified_membership_for_peer(cfg, &peer, direct_membership, extra_memberships)?;
+    let mut changed = false;
     if let Some(membership) = verified_membership.as_ref() {
-        insert_membership(cfg, membership.clone())?;
+        changed |= insert_membership(cfg, membership.clone())?;
     }
 
     if was_expected || cfg.peer_by_id(peer.node_id).is_some() {
-        if insert_peer(cfg, peer)? || verified_membership.is_some() {
-            cfg.save(path)?;
-        }
-        return Ok(None);
+        changed |= insert_peer(cfg, peer)?;
+        return Ok((None, changed));
     }
 
     if verified_membership.is_some() {
-        if insert_peer(cfg, peer)? {
-            cfg.save(path)?;
-        }
-        return Ok(None);
+        changed |= insert_peer(cfg, peer)?;
+        return Ok((None, changed));
     }
 
     let Some(granted_membership) = consume_invite_and_issue_membership(cfg, &peer, invite_proof)?
     else {
         bail!("rejecting unknown peer {}", peer.node_id);
     };
+    changed = true;
 
     info!(peer = %peer.node_id, "remembering invited peer");
-    insert_membership(cfg, granted_membership.clone())?;
-    insert_peer(cfg, peer)?;
-    cfg.save(path)?;
-    Ok(Some(granted_membership))
+    changed |= insert_membership(cfg, granted_membership.clone())?;
+    changed |= insert_peer(cfg, peer)?;
+    Ok((Some(granted_membership), changed))
 }
 
-fn remember_proxy_peer(
-    path: &Path,
+fn remember_proxy_peer_in_config(
     cfg: &mut Config,
     peer: Peer,
     direct_membership: Option<&MembershipCertificate>,
     extra_memberships: &[MembershipCertificate],
-) -> Result<()> {
+) -> Result<bool> {
     let verified_membership =
         verified_membership_for_peer(cfg, &peer, direct_membership, extra_memberships)?;
     let peer_is_known = cfg.peer_by_id(peer.node_id).is_some();
@@ -611,10 +1246,7 @@ fn remember_proxy_peer(
         changed |= insert_membership(cfg, membership)?;
     }
     changed |= insert_peer(cfg, peer)?;
-    if changed {
-        cfg.save(path)?;
-    }
-    Ok(())
+    Ok(changed)
 }
 
 pub fn remember_advertised_peers(
@@ -633,6 +1265,23 @@ fn remember_advertised_peers_with_memberships(
     advertised_peers: Vec<Peer>,
     advertised_memberships: Vec<MembershipCertificate>,
 ) -> Result<()> {
+    if remember_advertised_peers_in_config(
+        cfg,
+        remote_peer,
+        advertised_peers,
+        advertised_memberships,
+    )? {
+        cfg.save(path)?;
+    }
+    Ok(())
+}
+
+fn remember_advertised_peers_in_config(
+    cfg: &mut Config,
+    remote_peer: &Peer,
+    advertised_peers: Vec<Peer>,
+    advertised_memberships: Vec<MembershipCertificate>,
+) -> Result<bool> {
     ensure_shared_list_size("peers", advertised_peers.len())?;
     ensure_shared_list_size("memberships", advertised_memberships.len())?;
 
@@ -657,10 +1306,7 @@ fn remember_advertised_peers_with_memberships(
             changed = true;
         }
     }
-    if changed {
-        cfg.save(path)?;
-    }
-    Ok(())
+    Ok(changed)
 }
 
 fn insert_peer(cfg: &mut Config, peer: Peer) -> Result<bool> {
@@ -789,53 +1435,28 @@ async fn proxy(target: String, port: u16) -> Result<()> {
 
 async fn handle_tcp_proxy_connection(
     conn: Connection,
-    path: PathBuf,
+    actor: ConfigActorHandle,
     allowed_ports: &[u16],
 ) -> Result<()> {
-    let mut cfg = Config::load(&path)?;
     let (mut send, mut recv) = conn
         .accept_bi()
         .await
         .context("failed to accept TCP proxy stream")?;
     let request = read_proxy_request(&mut recv).await?;
     ensure_port_allowed(request.port, allowed_ports)?;
-    let expected = cfg.peer_by_id(conn.remote_id()).cloned();
-    let reported = Hello {
-        network_id: request.network_id,
-        name: request.requester_name,
-        connection_id: request.requester_connection_id,
-        invite_proof: request.invite_proof,
-        membership: request.membership,
-        memberships: request.memberships,
-        peers: Vec::new(),
-    };
-    let peer = validate_peer_report(&cfg, conn.remote_id(), &reported, expected.as_ref())?;
-    let remote_memberships = memberships_from_hello(&reported);
-    remember_proxy_peer(
-        &path,
-        &mut cfg,
-        peer.clone(),
-        reported.membership.as_ref(),
-        &remote_memberships,
-    )?;
-    remember_advertised_peers_with_memberships(
-        &path,
-        &mut cfg,
-        &peer,
-        request.peers,
-        remote_memberships,
-    )?;
+    let port = request.port;
+    let peer = actor.proxy_request(conn.remote_id(), request).await?;
     info!(
         peer = %peer.node_id,
         peer_name = %peer.name,
         peer_id = %peer.connection_id,
-        port = request.port,
+        port = port,
         "opening localhost TCP proxy"
     );
 
-    let tcp = TcpStream::connect(("127.0.0.1", request.port))
+    let tcp = TcpStream::connect(("127.0.0.1", port))
         .await
-        .with_context(|| format!("failed to connect to 127.0.0.1:{}", request.port))?;
+        .with_context(|| format!("failed to connect to 127.0.0.1:{port}"))?;
     let (mut tcp_read, mut tcp_write) = tcp.into_split();
 
     let mut peer_to_tcp = tokio::spawn(async move {
@@ -916,12 +1537,9 @@ async fn write_control_response(
     .await
 }
 
-async fn read_yaml_frame<T>(
-    recv: &mut iroh::endpoint::RecvStream,
-    max_len: usize,
-    label: &str,
-) -> Result<T>
+async fn read_yaml_frame<R, T>(recv: &mut R, max_len: usize, label: &str) -> Result<T>
 where
+    R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
     let mut len = [0u8; 2];
@@ -940,13 +1558,9 @@ where
     serde_yaml::from_slice(&data).with_context(|| format!("invalid {label}"))
 }
 
-async fn write_yaml_frame<T>(
-    send: &mut iroh::endpoint::SendStream,
-    value: &T,
-    max_len: usize,
-    label: &str,
-) -> Result<()>
+async fn write_yaml_frame<W, T>(send: &mut W, value: &T, max_len: usize, label: &str) -> Result<()>
 where
+    W: AsyncWrite + Unpin,
     T: Serialize,
 {
     let data = serde_yaml::to_string(value)?.into_bytes();
@@ -1430,12 +2044,24 @@ fn remember_local_membership_grant(
     membership: MembershipCertificate,
     extra_memberships: &[MembershipCertificate],
 ) -> Result<()> {
+    if remember_local_membership_grant_in_config(cfg, membership, extra_memberships)? {
+        cfg.save(path)?;
+    }
+    Ok(())
+}
+
+fn remember_local_membership_grant_in_config(
+    cfg: &mut Config,
+    membership: MembershipCertificate,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<bool> {
     let local_peer = cfg.local_peer()?;
     membership.matches_peer(cfg, &local_peer)?;
     verify_membership_chain(cfg, &membership, extra_memberships)?;
+    let changed = cfg.membership.as_ref() != Some(&membership) || cfg.invite_proof.is_some();
     cfg.membership = Some(membership);
     cfg.invite_proof = None;
-    cfg.save(path)
+    Ok(changed)
 }
 
 fn consume_invite_and_issue_membership(
@@ -1762,6 +2388,97 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn config_actor_serializes_invite_consumption() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let invite = cfg.issue_invite().unwrap();
+        let invite = Invite::decode(&invite.code).unwrap();
+        let proof = InviteProof {
+            invite_id: invite.invite_id,
+            invite_secret: invite.invite_secret,
+        };
+        let path = temp_config_path("actor-race");
+        cfg.save(&path).unwrap();
+        let actor = spawn_config_actor(path.clone(), cfg);
+
+        let first_key = SecretKey::generate();
+        let second_key = SecretKey::generate();
+        let first_hello = Hello {
+            network_id: "net".to_string(),
+            name: "joined-one".to_string(),
+            connection_id: "DEF456".to_string(),
+            invite_proof: Some(proof.clone()),
+            membership: None,
+            memberships: Vec::new(),
+            peers: Vec::new(),
+        };
+        let second_hello = Hello {
+            network_id: "net".to_string(),
+            name: "joined-two".to_string(),
+            connection_id: "FED654".to_string(),
+            invite_proof: Some(proof),
+            membership: None,
+            memberships: Vec::new(),
+            peers: Vec::new(),
+        };
+
+        let (first, second) = tokio::join!(
+            actor.control_sync(first_key.public(), first_hello, None),
+            actor.control_sync(second_key.public(), second_hello, None)
+        );
+
+        let first_granted = first
+            .as_ref()
+            .ok()
+            .and_then(|response| response.granted_membership.as_ref())
+            .is_some();
+        let second_granted = second
+            .as_ref()
+            .ok()
+            .and_then(|response| response.granted_membership.as_ref())
+            .is_some();
+        assert_eq!(usize::from(first_granted) + usize::from(second_granted), 1);
+        assert!(first.is_err() ^ second.is_err());
+
+        drop(actor);
+        let saved = Config::load(&path).unwrap();
+        assert!(saved.invites.is_empty());
+        assert_eq!(saved.peers.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_control_invite_uses_config_actor() {
+        let creator_key = SecretKey::generate();
+        let cfg = creator_config(&creator_key);
+        let path = temp_config_path("local-control");
+        let socket_path = std::env::temp_dir().join(format!("esp-{}.sock", Uuid::new_v4()));
+        cfg.save(&path).unwrap();
+        let actor = spawn_config_actor(path.clone(), cfg);
+        let listener = bind_local_control_socket(&socket_path).unwrap();
+        let server = tokio::spawn(run_local_control_server(listener, actor.clone()));
+
+        let response =
+            send_local_control_request_to_path(&socket_path, LocalControlRequest::IssueInvite)
+                .await
+                .unwrap()
+                .unwrap();
+        let LocalControlOk::Invite { code } = response else {
+            panic!("expected invite response");
+        };
+        let invite = Invite::decode(&code).unwrap();
+        let report = actor.status().await.unwrap();
+
+        assert_eq!(report.invites, vec![invite.invite_id]);
+
+        server.abort();
+        drop(actor);
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
