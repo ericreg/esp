@@ -764,6 +764,7 @@ dependencies = [
  "bytes",
  "clap",
  "iroh",
+ "libc",
  "serde",
  "serde_yaml",
  "sha2",

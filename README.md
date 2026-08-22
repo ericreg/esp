@@ -168,8 +168,10 @@ local TCP connection.
   setup. Shared peer and certificate lists are capped at 100 entries, and
   duplicate connection ids are rejected.
 - `~/.esp.yml` contains this host's private iroh key and, while a join is
-  pending, may contain an unused invite proof. Keep it private and do not share
-  the file between machines.
+  pending, may contain an unused invite proof. esp writes this file atomically
+  with `0600` permissions and refuses to use configs with group/world access,
+  symlinks, or hard links. Keep it private and do not share the file between
+  machines.
 - Duplicate peer names are allowed, so use the six-character connection id when
   a name is ambiguous.
 

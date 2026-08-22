@@ -1,4 +1,9 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    fs::{self, OpenOptions},
+    io::{Read as _, Write as _},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -17,9 +22,15 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
 const CONTROL_ALPN: &[u8] = b"esp/control/0";
 const TCP_ALPN: &[u8] = b"esp/tcp/0";
 const CONFIG_FILE: &str = ".esp.yml";
+
+#[cfg(unix)]
+const CONFIG_FILE_MODE: u32 = 0o600;
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
 const MAX_PROXY_REQUEST_LEN: usize = 64 * 1024 - 1;
 const MAX_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
@@ -351,7 +362,7 @@ async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
     Ok(())
 }
 
-async fn sync_joined_peer_once(path: &PathBuf, inviter: &Peer) -> Result<()> {
+async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
     let cfg = Config::load(path)?;
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -424,11 +435,7 @@ async fn handle_control_connection(conn: Connection, path: PathBuf) -> Result<()
     Ok(())
 }
 
-async fn sync_control_client(
-    conn: &Connection,
-    path: &PathBuf,
-    expected_peer: &Peer,
-) -> Result<()> {
+async fn sync_control_client(conn: &Connection, path: &Path, expected_peer: &Peer) -> Result<()> {
     timeout(Duration::from_secs(15), async {
         let mut cfg = Config::load(path)?;
         let (mut send, mut recv) = conn
@@ -468,7 +475,7 @@ async fn sync_control_client(
     .context("timed out waiting for esp control sync")?
 }
 
-async fn sync_control_server(conn: &Connection, path: &PathBuf) -> Result<()> {
+async fn sync_control_server(conn: &Connection, path: &Path) -> Result<()> {
     timeout(Duration::from_secs(15), async {
         let mut cfg = Config::load(path)?;
         let (mut send, mut recv) = conn
@@ -545,7 +552,7 @@ fn validate_peer_report(
 }
 
 fn remember_control_peer(
-    path: &PathBuf,
+    path: &Path,
     cfg: &mut Config,
     peer: Peer,
     was_expected: bool,
@@ -586,7 +593,7 @@ fn remember_control_peer(
 }
 
 fn remember_proxy_peer(
-    path: &PathBuf,
+    path: &Path,
     cfg: &mut Config,
     peer: Peer,
     direct_membership: Option<&MembershipCertificate>,
@@ -611,7 +618,7 @@ fn remember_proxy_peer(
 }
 
 pub fn remember_advertised_peers(
-    path: &PathBuf,
+    path: &Path,
     cfg: &mut Config,
     remote_peer: &Peer,
     advertised_peers: Vec<Peer>,
@@ -620,7 +627,7 @@ pub fn remember_advertised_peers(
 }
 
 fn remember_advertised_peers_with_memberships(
-    path: &PathBuf,
+    path: &Path,
     cfg: &mut Config,
     remote_peer: &Peer,
     advertised_peers: Vec<Peer>,
@@ -960,10 +967,128 @@ fn config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(CONFIG_FILE))
 }
 
+fn validate_existing_config_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    validate_config_metadata(path, &metadata)
+}
+
+fn validate_config_target_for_write(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_config_metadata(path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn validate_config_metadata(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!(
+            "{} is a symlink; refusing to use it as esp config",
+            path.display()
+        );
+    }
+    if !file_type.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    validate_private_config_permissions(path, metadata)
+}
+
+#[cfg(unix)]
+fn validate_private_config_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} permissions are {:03o}; refusing to use config with group/world access (run `chmod 600 {}`)",
+            path.display(),
+            mode,
+            path.display()
+        );
+    }
+    if metadata.nlink() > 1 {
+        bail!(
+            "{} has {} hard links; refusing to use linked secret config",
+            path.display(),
+            metadata.nlink()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_config_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
+}
+
+fn write_private_config(path: &Path, bytes: &[u8]) -> Result<()> {
+    validate_config_target_for_write(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+
+    let result = write_private_config_temp(&temp_path, bytes).and_then(|()| {
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        sync_parent_dir(parent);
+        validate_existing_config_file(path)
+    });
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn write_private_config_temp(temp_path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(CONFIG_FILE_MODE);
+
+    let mut file = options
+        .open(temp_path)
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(CONFIG_FILE_MODE))
+        .with_context(|| {
+            format!(
+                "failed to set private permissions on {}",
+                temp_path.display()
+            )
+        })?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+    Ok(())
+}
+
+fn sync_parent_dir(parent: &Path) {
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+}
+
 impl Config {
-    fn load(path: &PathBuf) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+    fn load(path: &Path) -> Result<Self> {
+        let text = read_private_config(path)?;
         let mut cfg: Self = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         let changed = cfg.ensure_local_config()?;
@@ -973,9 +1098,9 @@ impl Config {
         Ok(cfg)
     }
 
-    fn save(&self, path: &PathBuf) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         let text = serde_yaml::to_string(self)?;
-        std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+        write_private_config(path, text.as_bytes())
     }
 
     fn secret_key(&self) -> Result<SecretKey> {
@@ -1164,6 +1289,35 @@ impl Config {
     }
 }
 
+#[cfg(unix)]
+fn read_private_config(path: &Path) -> Result<String> {
+    validate_existing_config_file(path)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "failed to open {} without following symlinks",
+            path.display()
+        )
+    })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    validate_config_metadata(path, &metadata)?;
+
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(text)
+}
+
+#[cfg(not(unix))]
+fn read_private_config(path: &Path) -> Result<String> {
+    validate_existing_config_file(path)?;
+    fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
 impl Peer {
     fn has_identity(&self) -> bool {
         !self.name.trim().is_empty() && is_valid_connection_id(&self.connection_id)
@@ -1271,7 +1425,7 @@ fn memberships_from_hello(hello: &Hello) -> Vec<MembershipCertificate> {
 }
 
 fn remember_local_membership_grant(
-    path: &PathBuf,
+    path: &Path,
     cfg: &mut Config,
     membership: MembershipCertificate,
     extra_memberships: &[MembershipCertificate],
@@ -1558,6 +1712,10 @@ mod tests {
         cfg
     }
 
+    fn temp_config_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("esp-{label}-{}.yml", Uuid::new_v4()))
+    }
+
     #[test]
     fn membership_certificate_chains_to_creator_and_rejects_tampering() {
         let creator_key = SecretKey::generate();
@@ -1670,6 +1828,84 @@ mod tests {
 
         assert!(err.contains("has no valid membership"));
         assert!(cfg.peer_by_id(advertised_peer.node_id).is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_save_creates_private_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let secret_key = SecretKey::generate();
+        let cfg = creator_config(&secret_key);
+        let path = temp_config_path("private");
+
+        cfg.save(&path).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, CONFIG_FILE_MODE);
+        Config::load(&path).unwrap();
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_and_save_reject_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let secret_key = SecretKey::generate();
+        let cfg = creator_config(&secret_key);
+        let path = temp_config_path("loose");
+        cfg.save(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let load_err = Config::load(&path).unwrap_err().to_string();
+        assert!(load_err.contains("group/world access"));
+        let save_err = cfg.save(&path).unwrap_err().to_string();
+        assert!(save_err.contains("group/world access"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_and_save_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let secret_key = SecretKey::generate();
+        let cfg = creator_config(&secret_key);
+        let target_path = temp_config_path("target");
+        let link_path = temp_config_path("link");
+        cfg.save(&target_path).unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let load_err = Config::load(&link_path).unwrap_err().to_string();
+        assert!(load_err.contains("is a symlink"));
+        let save_err = cfg.save(&link_path).unwrap_err().to_string();
+        assert!(save_err.contains("is a symlink"));
+
+        let _ = std::fs::remove_file(link_path);
+        let _ = std::fs::remove_file(target_path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_load_and_save_reject_hard_links() {
+        let secret_key = SecretKey::generate();
+        let cfg = creator_config(&secret_key);
+        let path = temp_config_path("hard-link");
+        let link_path = temp_config_path("hard-link-copy");
+        cfg.save(&path).unwrap();
+        std::fs::hard_link(&path, &link_path).unwrap();
+
+        let load_err = Config::load(&path).unwrap_err().to_string();
+        assert!(load_err.contains("hard links"));
+        let save_err = cfg.save(&path).unwrap_err().to_string();
+        assert!(save_err.contains("hard links"));
+
+        let _ = std::fs::remove_file(link_path);
         let _ = std::fs::remove_file(path);
     }
 }
