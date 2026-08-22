@@ -48,11 +48,21 @@ RUST_LOG=info esp
 ```
 
 By default, the daemon only allows peers to proxy to local SSH on port `22`.
-Allow additional localhost ports explicitly:
+Allow additional localhost ports explicitly on that host:
 
 ```sh
 RUST_LOG=info esp daemon --ports 22,8000
 ```
+
+Invites are SSH-only by default too. To grant a peer additional ports, include
+them in the invite:
+
+```sh
+esp invite --ports 22,80,8080
+```
+
+The effective policy is the intersection of the peer's signed invite grant and
+the daemon's local `--ports` allowlist.
 
 On the second machine:
 
@@ -107,7 +117,7 @@ esp init              # create ~/.esp.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
-esp invite            # create and print another invite from this network member
+esp invite --ports 22 # create and print another invite from this network member
 esp status            # show local node and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 ```
@@ -160,8 +170,11 @@ local TCP connection.
   must be explicitly allowed with `esp daemon --ports`.
 - Invite codes are bearer bootstrap secrets. A successful join consumes the
   invite on the inviter and returns a signed membership certificate for the new
-  node. The running daemon serializes invite consumption and peer-learning
-  config updates through a single config actor.
+  node. Membership certificates include the peer's allowed port list in the
+  signed payload.
+- Invites grant port access per peer with `esp invite --ports`. Proxy traffic is
+  accepted only when both the peer's signed membership and the daemon's local
+  `--ports` allow the requested port.
 - After join, peers authenticate esp membership with certificates signed by an
   existing member and chained back to the network creator. Normal proxy requests
   do not carry invite secrets.

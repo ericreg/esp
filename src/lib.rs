@@ -42,7 +42,9 @@ const MAX_LOCAL_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
 const CONFIG_ACTOR_QUEUE: usize = 64;
 pub const MAX_SHARED_PEERS: usize = 100;
 const GRACEFUL_CLOSE: VarInt = VarInt::from_u32(0);
-const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/1";
+const INVITE_VERSION: u8 = 2;
+const MEMBERSHIP_CERTIFICATE_VERSION: u8 = 2;
+const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/2";
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -78,7 +80,11 @@ enum Command {
     /// Rename this host in esp.
     Rename { name: String },
     /// Print a fresh invite code for the configured network.
-    Invite,
+    Invite {
+        /// Localhost ports this invited peer may connect to on esp daemons.
+        #[arg(long, value_delimiter = ',', default_value = "22")]
+        ports: Vec<u16>,
+    },
     /// Print local esp information.
     Status,
 }
@@ -119,6 +125,7 @@ pub struct Peer {
 pub struct IssuedInvite {
     pub invite_id: String,
     pub secret_hash: String,
+    pub allowed_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +147,7 @@ pub struct Invite {
     pub inviter_name: String,
     #[serde(default)]
     pub inviter_connection_id: String,
+    pub allowed_ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub membership_chain: Vec<MembershipCertificate>,
 }
@@ -156,6 +164,7 @@ pub struct MembershipCertificate {
     pub network_id: String,
     pub subject_node_id: EndpointId,
     pub subject_connection_id: String,
+    pub allowed_ports: Vec<u16>,
     pub issuer_node_id: EndpointId,
     pub signature: String,
 }
@@ -232,6 +241,7 @@ enum ConfigActorCommand {
         respond: oneshot::Sender<Result<HostIdentity>>,
     },
     IssueInvite {
+        allowed_ports: Vec<u16>,
         respond: oneshot::Sender<Result<InviteCode>>,
     },
     ControlSync {
@@ -251,7 +261,7 @@ enum ConfigActorCommand {
 enum LocalControlRequest {
     Status,
     Rename { name: String },
-    IssueInvite,
+    IssueInvite { ports: Vec<u16> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -349,7 +359,7 @@ pub async fn run() -> Result<()> {
         Command::Daemon { ports } => daemon(ports).await,
         Command::Proxy { target, port } => proxy(target, port).await,
         Command::Rename { name } => rename(&name).await,
-        Command::Invite => print_invite().await,
+        Command::Invite { ports } => print_invite(&ports).await,
         Command::Status => status().await,
     }
 }
@@ -401,6 +411,7 @@ async fn join(invite_code: &str) -> Result<()> {
     }
 
     let invite = Invite::decode(invite_code)?;
+    let invite_allowed_ports = normalize_allowed_ports(&invite.allowed_ports)?;
     let secret_key = SecretKey::generate();
     let creator_node_id = invite.creator_node_id.unwrap_or(invite.inviter_node_id);
     let mut connection_id = generate_connection_id();
@@ -435,6 +446,7 @@ async fn join(invite_code: &str) -> Result<()> {
     println!("connection id: {}", cfg.connection_id);
     println!("node id: {}", secret_key.public());
     println!("peer: {}", cfg.peers[0].display_name());
+    println!("allowed ports: {}", format_ports(&invite_allowed_ports));
 
     match sync_joined_peer_once(&path, &cfg.peers[0]).await {
         Ok(()) => println!("join sync: complete"),
@@ -458,15 +470,16 @@ async fn rename(name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn print_invite() -> Result<()> {
-    if let Some(code) = request_daemon_invite().await? {
+async fn print_invite(ports: &[u16]) -> Result<()> {
+    let allowed_ports = normalize_allowed_ports(ports)?;
+    if let Some(code) = request_daemon_invite(&allowed_ports).await? {
         println!("{code}");
         return Ok(());
     }
 
     let path = config_path()?;
     let mut cfg = Config::load(&path)?;
-    let invite = cfg.issue_invite()?;
+    let invite = cfg.issue_invite(&allowed_ports)?;
     cfg.save(&path)?;
     println!("{}", invite.code);
     Ok(())
@@ -515,8 +528,12 @@ async fn request_daemon_rename(name: &str) -> Result<Option<HostIdentity>> {
     }
 }
 
-async fn request_daemon_invite() -> Result<Option<String>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::IssueInvite).await? else {
+async fn request_daemon_invite(ports: &[u16]) -> Result<Option<String>> {
+    let Some(response) = send_local_control_request(LocalControlRequest::IssueInvite {
+        ports: ports.to_vec(),
+    })
+    .await?
+    else {
         return Ok(None);
     };
     match response {
@@ -632,9 +649,7 @@ fn print_status_report(path: &Path, report: &StatusReport) {
 }
 
 async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
-    if allowed_ports.is_empty() {
-        bail!("at least one allowed port is required");
-    }
+    let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
     #[cfg(unix)]
     let (local_control_listener, _local_control_socket) =
         prepare_local_control_socket().context("failed to start local esp control")?;
@@ -800,8 +815,8 @@ async fn handle_local_control_connection(
                     connection_id: identity.connection_id,
                 })
         }
-        Ok(LocalControlRequest::IssueInvite) => actor
-            .issue_invite()
+        Ok(LocalControlRequest::IssueInvite { ports }) => actor
+            .issue_invite(ports)
             .await
             .map(|invite| LocalControlOk::Invite { code: invite.code }),
         Err(err) => Err(err),
@@ -981,9 +996,12 @@ async fn run_config_actor(
                 });
                 let _ = respond.send(result);
             }
-            ConfigActorCommand::IssueInvite { respond } => {
+            ConfigActorCommand::IssueInvite {
+                allowed_ports,
+                respond,
+            } => {
                 let result = commit_config_change(&path, &mut cfg, |next| {
-                    let invite = next.issue_invite()?;
+                    let invite = next.issue_invite(&allowed_ports)?;
                     Ok((invite, true))
                 });
                 let _ = respond.send(result);
@@ -1038,9 +1056,12 @@ impl ConfigActorHandle {
             .await
     }
 
-    async fn issue_invite(&self) -> Result<InviteCode> {
-        self.request(|respond| ConfigActorCommand::IssueInvite { respond })
-            .await
+    async fn issue_invite(&self, allowed_ports: Vec<u16>) -> Result<InviteCode> {
+        self.request(|respond| ConfigActorCommand::IssueInvite {
+            allowed_ports,
+            respond,
+        })
+        .await
     }
 
     async fn control_sync(
@@ -1121,11 +1142,13 @@ fn apply_proxy_request(
     };
     let peer = validate_peer_report(cfg, node_id, &reported, expected.as_ref())?;
     let remote_memberships = memberships_from_hello(&reported);
+    let requested_port = request.port;
     let mut changed = remember_proxy_peer_in_config(
         cfg,
         peer.clone(),
         reported.membership.as_ref(),
         &remote_memberships,
+        requested_port,
     )?;
     changed |= remember_advertised_peers_in_config(cfg, &peer, request.peers, remote_memberships)?;
     Ok((peer, changed))
@@ -1204,21 +1227,22 @@ fn remember_control_peer_in_config(
     let mut changed = false;
     if let Some(membership) = verified_membership.as_ref() {
         changed |= insert_membership(cfg, membership.clone())?;
-    }
-
-    if was_expected || cfg.peer_by_id(peer.node_id).is_some() {
-        changed |= insert_peer(cfg, peer)?;
-        return Ok((None, changed));
-    }
-
-    if verified_membership.is_some() {
         changed |= insert_peer(cfg, peer)?;
         return Ok((None, changed));
     }
 
     let Some(granted_membership) = consume_invite_and_issue_membership(cfg, &peer, invite_proof)?
     else {
-        bail!("rejecting unknown peer {}", peer.node_id);
+        if was_expected || cfg.peer_by_id(peer.node_id).is_some() {
+            bail!(
+                "rejecting peer {} without a valid membership certificate",
+                peer.node_id
+            );
+        }
+        bail!(
+            "rejecting unknown peer {} without invite or valid membership",
+            peer.node_id
+        );
     };
     changed = true;
 
@@ -1233,18 +1257,20 @@ fn remember_proxy_peer_in_config(
     peer: Peer,
     direct_membership: Option<&MembershipCertificate>,
     extra_memberships: &[MembershipCertificate],
+    port: u16,
 ) -> Result<bool> {
     let verified_membership =
         verified_membership_for_peer(cfg, &peer, direct_membership, extra_memberships)?;
-    let peer_is_known = cfg.peer_by_id(peer.node_id).is_some();
-    if !peer_is_known && verified_membership.is_none() {
-        bail!("rejecting unknown peer {}", peer.node_id);
-    }
+    let Some(membership) = verified_membership else {
+        bail!(
+            "rejecting peer {} without a valid membership certificate",
+            peer.node_id
+        );
+    };
+    ensure_membership_allows_port(&peer, &membership, port)?;
 
     let mut changed = false;
-    if let Some(membership) = verified_membership {
-        changed |= insert_membership(cfg, membership)?;
-    }
+    changed |= insert_membership(cfg, membership)?;
     changed |= insert_peer(cfg, peer)?;
     Ok(changed)
 }
@@ -1299,7 +1325,7 @@ fn remember_advertised_peers_in_config(
         let membership = verified_membership_for_peer(cfg, &peer, None, &advertised_memberships)?;
         if let Some(membership) = membership {
             changed |= insert_membership(cfg, membership)?;
-        } else if cfg.peer_by_id(peer.node_id).is_none() {
+        } else {
             bail!("advertised peer {} has no valid membership", peer.node_id);
         }
         if insert_peer(cfg, peer)? {
@@ -1492,13 +1518,60 @@ async fn handle_tcp_proxy_connection(
 }
 
 pub fn ensure_port_allowed(port: u16, allowed_ports: &[u16]) -> Result<()> {
+    let allowed_ports = normalize_allowed_ports(allowed_ports)?;
     if allowed_ports.contains(&port) {
         return Ok(());
     }
     bail!(
-        "port {} is not allowed; restart the daemon with --ports to allow it",
-        port
+        "port {} is not allowed by this daemon; restart the daemon with --ports to allow it (allowed ports: {})",
+        port,
+        format_ports(&allowed_ports)
     )
+}
+
+fn ensure_membership_allows_port(
+    peer: &Peer,
+    membership: &MembershipCertificate,
+    port: u16,
+) -> Result<()> {
+    let allowed_ports = membership.allowed_ports()?;
+    if allowed_ports.contains(&port) {
+        return Ok(());
+    }
+    bail!(
+        "membership for peer {} does not allow port {}; allowed ports: {}",
+        peer.node_id,
+        port,
+        format_ports(&allowed_ports)
+    )
+}
+
+fn normalize_allowed_ports(ports: &[u16]) -> Result<Vec<u16>> {
+    if ports.is_empty() {
+        bail!("at least one allowed port is required");
+    }
+    if ports.contains(&0) {
+        bail!("port 0 is not a valid TCP target port");
+    }
+    let mut normalized = ports.to_vec();
+    normalized.sort_unstable();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn format_ports(ports: &[u16]) -> String {
+    ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn first_disallowed_port(requested_ports: &[u16], allowed_ports: &[u16]) -> Option<u16> {
+    requested_ports
+        .iter()
+        .copied()
+        .find(|port| !allowed_ports.contains(port))
 }
 
 async fn read_proxy_request(recv: &mut iroh::endpoint::RecvStream) -> Result<TcpProxyRequest> {
@@ -1788,6 +1861,7 @@ impl Config {
                     self,
                     &secret_key,
                     &local_peer,
+                    &[DEFAULT_ALLOWED_PORT],
                 )?);
                 changed = true;
             }
@@ -1851,13 +1925,15 @@ impl Config {
         }
     }
 
-    pub fn issue_invite(&mut self) -> Result<InviteCode> {
+    pub fn issue_invite(&mut self, allowed_ports: &[u16]) -> Result<InviteCode> {
         self.ensure_local_config()?;
+        let allowed_ports = normalize_allowed_ports(allowed_ports)?;
+        self.ensure_can_issue_ports(&allowed_ports)?;
         let secret_key = self.secret_key()?;
         let invite_id = generate_connection_id();
         let invite_secret = generate_invite_secret();
         let invite = Invite {
-            version: 2,
+            version: INVITE_VERSION,
             network_id: self.network_id.clone(),
             invite_id: invite_id.clone(),
             invite_secret: invite_secret.clone(),
@@ -1865,6 +1941,7 @@ impl Config {
             inviter_node_id: secret_key.public(),
             inviter_name: self.name.clone(),
             inviter_connection_id: self.connection_id.clone(),
+            allowed_ports: allowed_ports.clone(),
             membership_chain: self.membership_chain_for(secret_key.public())?,
         };
         let issued = InviteCode {
@@ -1874,18 +1951,44 @@ impl Config {
         self.invites.push(IssuedInvite {
             invite_id,
             secret_hash: hash_invite_secret(&invite_secret),
+            allowed_ports,
         });
         Ok(issued)
     }
 
-    fn has_invite_proof(&self, proof: Option<&InviteProof>) -> bool {
+    fn ensure_can_issue_ports(&self, requested_ports: &[u16]) -> Result<()> {
+        let local_node_id = self.secret_key()?.public();
+        if self.creator_node_id == Some(local_node_id) {
+            return Ok(());
+        }
+        let membership = self
+            .membership
+            .as_ref()
+            .ok_or_else(|| anyhow!("local host has no membership certificate"))?;
+        let granted_ports = membership.allowed_ports()?;
+        if let Some(port) = first_disallowed_port(requested_ports, &granted_ports) {
+            bail!(
+                "local membership cannot grant port {}; allowed ports: {}",
+                port,
+                format_ports(&granted_ports)
+            );
+        }
+        Ok(())
+    }
+
+    fn invite_allowed_ports_for_proof(
+        &self,
+        proof: Option<&InviteProof>,
+    ) -> Result<Option<Vec<u16>>> {
         let Some(proof) = proof else {
-            return false;
+            return Ok(None);
         };
         let secret_hash = hash_invite_secret(&proof.invite_secret);
         self.invites
             .iter()
-            .any(|invite| invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash)
+            .find(|invite| invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash)
+            .map(|invite| normalize_allowed_ports(&invite.allowed_ports))
+            .transpose()
     }
 
     fn consume_invite_proof(&mut self, proof: Option<&InviteProof>) -> bool {
@@ -1947,30 +2050,32 @@ impl Peer {
 }
 
 impl MembershipCertificate {
-    pub fn issue(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> Result<Self> {
+    pub fn issue(
+        cfg: &Config,
+        issuer_key: &SecretKey,
+        subject: &Peer,
+        allowed_ports: &[u16],
+    ) -> Result<Self> {
         if !is_valid_connection_id(&subject.connection_id) {
             bail!("cannot issue membership for invalid connection id");
         }
+        let allowed_ports = normalize_allowed_ports(allowed_ports)?;
         let mut membership = Self {
-            version: 1,
+            version: MEMBERSHIP_CERTIFICATE_VERSION,
             network_id: cfg.network_id.clone(),
             subject_node_id: subject.node_id,
             subject_connection_id: subject.connection_id.clone(),
+            allowed_ports,
             issuer_node_id: issuer_key.public(),
             signature: String::new(),
         };
-        let signature = issuer_key.sign(&membership.signature_payload());
+        let signature = issuer_key.sign(&membership.signature_payload()?);
         membership.signature = encode_signature(&signature);
         Ok(membership)
     }
 
     fn matches_peer(&self, cfg: &Config, peer: &Peer) -> Result<()> {
-        if self.version != 1 {
-            bail!(
-                "unsupported membership certificate version {}",
-                self.version
-            );
-        }
+        self.allowed_ports()?;
         if self.network_id != cfg.network_id {
             bail!("membership certificate is for a different esp network");
         }
@@ -1988,17 +2093,25 @@ impl MembershipCertificate {
 
     fn verify_signature(&self) -> Result<()> {
         let signature = decode_signature(&self.signature)?;
+        let payload = self.signature_payload()?;
         self.issuer_node_id
-            .verify(&self.signature_payload(), &signature)
+            .verify(&payload, &signature)
             .context("membership certificate signature is invalid")
     }
 
-    fn signature_payload(&self) -> Vec<u8> {
+    fn signature_payload(&self) -> Result<Vec<u8>> {
+        if self.version != MEMBERSHIP_CERTIFICATE_VERSION {
+            bail!(
+                "unsupported membership certificate version {}",
+                self.version
+            );
+        }
         let fields = [
             self.version.to_string(),
             self.network_id.clone(),
             self.subject_node_id.to_string(),
             self.subject_connection_id.clone(),
+            format_ports(&self.allowed_ports()?),
             self.issuer_node_id.to_string(),
         ];
         let mut payload = Vec::new();
@@ -2006,7 +2119,17 @@ impl MembershipCertificate {
         for field in &fields {
             append_signed_field(&mut payload, field);
         }
-        payload
+        Ok(payload)
+    }
+
+    fn allowed_ports(&self) -> Result<Vec<u16>> {
+        if self.version != MEMBERSHIP_CERTIFICATE_VERSION {
+            bail!(
+                "unsupported membership certificate version {}",
+                self.version
+            );
+        }
+        normalize_allowed_ports(&self.allowed_ports)
     }
 }
 
@@ -2069,9 +2192,9 @@ fn consume_invite_and_issue_membership(
     peer: &Peer,
     invite_proof: Option<&InviteProof>,
 ) -> Result<Option<MembershipCertificate>> {
-    if !cfg.has_invite_proof(invite_proof) {
+    let Some(allowed_ports) = cfg.invite_allowed_ports_for_proof(invite_proof)? else {
         return Ok(None);
-    }
+    };
     let local_peer = cfg.local_peer()?;
     let local_membership = cfg
         .membership
@@ -2079,11 +2202,12 @@ fn consume_invite_and_issue_membership(
         .ok_or_else(|| anyhow!("local host has no membership certificate"))?;
     local_membership.matches_peer(cfg, &local_peer)?;
     verify_membership_chain(cfg, local_membership, &[])?;
+    cfg.ensure_can_issue_ports(&allowed_ports)?;
     if !cfg.consume_invite_proof(invite_proof) {
         return Ok(None);
     }
     let secret_key = cfg.secret_key()?;
-    MembershipCertificate::issue(cfg, &secret_key, peer).map(Some)
+    MembershipCertificate::issue(cfg, &secret_key, peer, &allowed_ports).map(Some)
 }
 
 fn verified_membership_for_peer(
@@ -2117,12 +2241,13 @@ fn verify_membership_chain_inner(
     extra_memberships: &[MembershipCertificate],
     seen: &mut Vec<EndpointId>,
 ) -> Result<()> {
-    if membership.version != 1 {
+    if membership.version != MEMBERSHIP_CERTIFICATE_VERSION {
         bail!(
             "unsupported membership certificate version {}",
             membership.version
         );
     }
+    let membership_ports = membership.allowed_ports()?;
     if membership.network_id != cfg.network_id {
         bail!("membership certificate is for a different esp network");
     }
@@ -2145,6 +2270,18 @@ fn verify_membership_chain_inner(
     let issuer_membership =
         find_membership_by_subject(cfg, extra_memberships, membership.issuer_node_id)
             .ok_or_else(|| anyhow!("missing membership issuer {}", membership.issuer_node_id))?;
+    if Some(membership.issuer_node_id) != cfg.creator_node_id {
+        let issuer_ports = issuer_membership.allowed_ports()?;
+        if let Some(port) = first_disallowed_port(&membership_ports, &issuer_ports) {
+            bail!(
+                "membership for {} grants port {} outside issuer {} allowed ports: {}",
+                membership.subject_node_id,
+                port,
+                membership.issuer_node_id,
+                format_ports(&issuer_ports)
+            );
+        }
+    }
     verify_membership_chain_inner(cfg, issuer_membership, extra_memberships, seen)
 }
 
@@ -2312,7 +2449,11 @@ impl Invite {
         let yaml = URL_SAFE_NO_PAD
             .decode(code.trim())
             .context("invite is not valid base64")?;
-        serde_yaml::from_slice(&yaml).context("invite is not valid esp data")
+        let invite: Self = serde_yaml::from_slice(&yaml).context("invite is not valid esp data")?;
+        if invite.version != INVITE_VERSION {
+            bail!("unsupported invite version {}", invite.version);
+        }
+        Ok(invite)
     }
 }
 
@@ -2351,7 +2492,9 @@ mod tests {
             name: "member".to_string(),
             connection_id: "DEF456".to_string(),
         };
-        let membership = MembershipCertificate::issue(&cfg, &creator_key, &member).unwrap();
+        let membership =
+            MembershipCertificate::issue(&cfg, &creator_key, &member, &[DEFAULT_ALLOWED_PORT])
+                .unwrap();
 
         membership.matches_peer(&cfg, &member).unwrap();
         verify_membership_chain(&cfg, &membership, &[]).unwrap();
@@ -2362,10 +2505,41 @@ mod tests {
     }
 
     #[test]
+    fn invite_ports_are_signed_into_membership() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let invite = cfg
+            .issue_invite(&[8080, DEFAULT_ALLOWED_PORT, 8080])
+            .unwrap();
+        let invite = Invite::decode(&invite.code).unwrap();
+        let proof = InviteProof {
+            invite_id: invite.invite_id,
+            invite_secret: invite.invite_secret,
+        };
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "joined".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+
+        let granted = consume_invite_and_issue_membership(&mut cfg, &peer, Some(&proof))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(invite.allowed_ports, vec![DEFAULT_ALLOWED_PORT, 8080]);
+        assert_eq!(granted.allowed_ports, vec![DEFAULT_ALLOWED_PORT, 8080]);
+        verify_membership_chain(&cfg, &granted, &[]).unwrap();
+
+        let mut tampered = granted;
+        tampered.allowed_ports.push(80);
+        assert!(verify_membership_chain(&cfg, &tampered, &[]).is_err());
+    }
+
+    #[test]
     fn invite_proof_is_consumed_when_membership_is_granted() {
         let creator_key = SecretKey::generate();
         let mut cfg = creator_config(&creator_key);
-        let invite = cfg.issue_invite().unwrap();
+        let invite = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
         let invite = Invite::decode(&invite.code).unwrap();
         let proof = InviteProof {
             invite_id: invite.invite_id,
@@ -2382,6 +2556,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(granted.subject_node_id, peer.node_id);
+        assert_eq!(granted.allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
         assert!(cfg.invites.is_empty());
         assert!(
             consume_invite_and_issue_membership(&mut cfg, &peer, Some(&proof))
@@ -2390,11 +2565,204 @@ mod tests {
         );
     }
 
+    #[test]
+    fn joined_member_cannot_issue_invite_for_ungranted_port() {
+        let creator_key = SecretKey::generate();
+        let creator_cfg = creator_config(&creator_key);
+        let member_key = SecretKey::generate();
+        let member_peer = Peer {
+            node_id: member_key.public(),
+            name: "member".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let creator_peer = Peer {
+            node_id: creator_key.public(),
+            name: "creator".to_string(),
+            connection_id: "ABC123".to_string(),
+        };
+        let mut member_cfg = Config {
+            version: 1,
+            network_id: "net".to_string(),
+            secret_key: encode_secret_key(&member_key),
+            creator_node_id: Some(creator_key.public()),
+            invite_proof: None,
+            membership: Some(
+                MembershipCertificate::issue(
+                    &creator_cfg,
+                    &creator_key,
+                    &member_peer,
+                    &[DEFAULT_ALLOWED_PORT],
+                )
+                .unwrap(),
+            ),
+            memberships: vec![creator_cfg.membership.clone().unwrap()],
+            name: "member".to_string(),
+            connection_id: "DEF456".to_string(),
+            invites: Vec::new(),
+            peers: vec![creator_peer],
+        };
+
+        let err = member_cfg.issue_invite(&[8080]).unwrap_err().to_string();
+
+        assert!(err.contains("cannot grant port 8080"));
+    }
+
+    #[test]
+    fn membership_chain_rejects_delegated_port_widening() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let issuer_key = SecretKey::generate();
+        let issuer_peer = Peer {
+            node_id: issuer_key.public(),
+            name: "issuer".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let subject_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "subject".to_string(),
+            connection_id: "FED654".to_string(),
+        };
+        let issuer_membership =
+            MembershipCertificate::issue(&cfg, &creator_key, &issuer_peer, &[DEFAULT_ALLOWED_PORT])
+                .unwrap();
+        let subject_membership =
+            MembershipCertificate::issue(&cfg, &issuer_key, &subject_peer, &[8080]).unwrap();
+        cfg.memberships.push(issuer_membership);
+
+        let err = verify_membership_chain(&cfg, &subject_membership, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("outside issuer"));
+    }
+
+    #[test]
+    fn known_control_peer_without_membership_is_rejected() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "known".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        cfg.peers.push(peer.clone());
+
+        let err = remember_control_peer_in_config(&mut cfg, peer, false, None, None, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("valid membership certificate"));
+    }
+
+    #[test]
+    fn known_proxy_peer_without_membership_is_rejected() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "known".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        cfg.peers.push(peer.clone());
+
+        let err = remember_proxy_peer_in_config(&mut cfg, peer, None, &[], DEFAULT_ALLOWED_PORT)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("valid membership certificate"));
+    }
+
+    #[test]
+    fn known_peer_with_membership_is_accepted() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "known".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        cfg.peers.push(peer.clone());
+        let membership =
+            MembershipCertificate::issue(&cfg, &creator_key, &peer, &[DEFAULT_ALLOWED_PORT])
+                .unwrap();
+
+        let changed = remember_proxy_peer_in_config(
+            &mut cfg,
+            peer.clone(),
+            Some(&membership),
+            &[],
+            DEFAULT_ALLOWED_PORT,
+        )
+        .unwrap();
+
+        assert!(changed);
+        assert_eq!(
+            cfg.peer_by_id(peer.node_id).unwrap().connection_id,
+            peer.connection_id
+        );
+    }
+
+    #[test]
+    fn proxy_requires_membership_port_grant() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "known".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let membership =
+            MembershipCertificate::issue(&cfg, &creator_key, &peer, &[DEFAULT_ALLOWED_PORT])
+                .unwrap();
+
+        remember_proxy_peer_in_config(
+            &mut cfg,
+            peer.clone(),
+            Some(&membership),
+            &[],
+            DEFAULT_ALLOWED_PORT,
+        )
+        .unwrap();
+        let err = remember_proxy_peer_in_config(&mut cfg, peer, Some(&membership), &[], 8080)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("does not allow port 8080"));
+    }
+
+    #[test]
+    fn known_advertised_peer_without_membership_is_rejected() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let remote_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "remote".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let advertised_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "advertised".to_string(),
+            connection_id: "FED654".to_string(),
+        };
+        cfg.peers.push(advertised_peer.clone());
+
+        let err = remember_advertised_peers_in_config(
+            &mut cfg,
+            &remote_peer,
+            vec![advertised_peer],
+            Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("has no valid membership"));
+    }
+
     #[tokio::test]
     async fn config_actor_serializes_invite_consumption() {
         let creator_key = SecretKey::generate();
         let mut cfg = creator_config(&creator_key);
-        let invite = cfg.issue_invite().unwrap();
+        let invite = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
         let invite = Invite::decode(&invite.code).unwrap();
         let proof = InviteProof {
             invite_id: invite.invite_id,
@@ -2462,11 +2830,15 @@ mod tests {
         let listener = bind_local_control_socket(&socket_path).unwrap();
         let server = tokio::spawn(run_local_control_server(listener, actor.clone()));
 
-        let response =
-            send_local_control_request_to_path(&socket_path, LocalControlRequest::IssueInvite)
-                .await
-                .unwrap()
-                .unwrap();
+        let response = send_local_control_request_to_path(
+            &socket_path,
+            LocalControlRequest::IssueInvite {
+                ports: vec![DEFAULT_ALLOWED_PORT],
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let LocalControlOk::Invite { code } = response else {
             panic!("expected invite response");
         };
@@ -2495,8 +2867,13 @@ mod tests {
             name: "advertised".to_string(),
             connection_id: "FED654".to_string(),
         };
-        let advertised_membership =
-            MembershipCertificate::issue(&cfg, &creator_key, &advertised_peer).unwrap();
+        let advertised_membership = MembershipCertificate::issue(
+            &cfg,
+            &creator_key,
+            &advertised_peer,
+            &[DEFAULT_ALLOWED_PORT],
+        )
+        .unwrap();
         let path = std::env::temp_dir().join(format!("esp-test-{}.yml", Uuid::new_v4()));
 
         remember_advertised_peers_with_memberships(

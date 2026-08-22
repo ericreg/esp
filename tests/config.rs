@@ -8,14 +8,14 @@ use esp::{
 use iroh::SecretKey;
 
 fn issue_membership(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> MembershipCertificate {
-    MembershipCertificate::issue(cfg, issuer_key, subject).unwrap()
+    MembershipCertificate::issue(cfg, issuer_key, subject, &[DEFAULT_ALLOWED_PORT]).unwrap()
 }
 
 #[test]
 fn invite_round_trips() {
     let key = SecretKey::generate();
     let invite = Invite {
-        version: 1,
+        version: 2,
         network_id: "net".to_string(),
         invite_id: "invite1".to_string(),
         invite_secret: "secret1".to_string(),
@@ -23,6 +23,7 @@ fn invite_round_trips() {
         inviter_node_id: key.public(),
         inviter_name: "creator".to_string(),
         inviter_connection_id: "ABC123".to_string(),
+        allowed_ports: vec![DEFAULT_ALLOWED_PORT],
         membership_chain: Vec::new(),
     };
 
@@ -35,6 +36,7 @@ fn invite_round_trips() {
     assert_eq!(decoded.inviter_node_id, invite.inviter_node_id);
     assert_eq!(decoded.inviter_name, invite.inviter_name);
     assert_eq!(decoded.inviter_connection_id, invite.inviter_connection_id);
+    assert_eq!(decoded.allowed_ports, invite.allowed_ports);
     assert_eq!(decoded.membership_chain, invite.membership_chain);
 }
 
@@ -72,12 +74,13 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
     cfg.memberships
         .push(issue_membership(&cfg, &creator_key, &creator_peer));
 
-    let first = cfg.issue_invite().unwrap();
-    let second = cfg.issue_invite().unwrap();
+    let first = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
+    let second = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
 
     assert_ne!(first.invite_id, second.invite_id);
     assert_eq!(cfg.invites.len(), 2);
     assert_eq!(cfg.invites[0].invite_id, first.invite_id);
+    assert_eq!(cfg.invites[0].allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
     assert_ne!(cfg.invites[0].secret_hash, first.code);
     assert_eq!(
         Invite::decode(&second.code).unwrap().invite_id,
@@ -86,6 +89,7 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
     let decoded = Invite::decode(&first.code).unwrap();
     assert_eq!(decoded.inviter_node_id, secret_key.public());
     assert_eq!(decoded.creator_node_id, Some(creator_key.public()));
+    assert_eq!(decoded.allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
     assert_eq!(decoded.membership_chain.len(), 2);
 }
 
@@ -205,4 +209,8 @@ fn proxy_ports_are_allowlisted() {
     let custom_ports = [22, 5432, 11434];
     assert!(ensure_port_allowed(5432, &custom_ports).is_ok());
     assert!(ensure_port_allowed(8000, &custom_ports).is_err());
+
+    let duplicated_ports = [5432, 22, 5432];
+    assert!(ensure_port_allowed(22, &duplicated_ports).is_ok());
+    assert!(ensure_port_allowed(0, &[0]).is_err());
 }
