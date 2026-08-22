@@ -158,12 +158,18 @@ local TCP connection.
 
 - The daemon allows proxying to local port 22 only by default. Additional ports
   must be explicitly allowed with `esp daemon --ports`.
-- Invite codes are bearer secrets. Anyone with a valid invite can attempt to
-  join that esp network.
-- Peers share known peers during join and proxy setup. Shared peer lists are
-  capped at 100 peers, and duplicate connection ids are rejected.
-- `~/.esp.yml` contains this host's private iroh key. Keep it private and do not
-  share the file between machines.
+- Invite codes are bearer bootstrap secrets. A successful join consumes the
+  invite on the inviter and returns a signed membership certificate for the new
+  node.
+- After join, peers authenticate esp membership with certificates signed by an
+  existing member and chained back to the network creator. Normal proxy requests
+  do not carry invite secrets.
+- Peers share known peers and membership certificates during join and proxy
+  setup. Shared peer and certificate lists are capped at 100 entries, and
+  duplicate connection ids are rejected.
+- `~/.esp.yml` contains this host's private iroh key and, while a join is
+  pending, may contain an unused invite proof. Keep it private and do not share
+  the file between machines.
 - Duplicate peer names are allowed, so use the six-character connection id when
   a name is ambiguous.
 
@@ -174,8 +180,9 @@ local TCP connection.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
 - The inviter accepts invited peers by checking the random network id and issued
-  invite. Any joined host can issue invites, so treat network members and invite
-  codes as trusted.
+  invite, then signs a membership certificate bound to the joining node id and
+  connection id. Any joined host with a valid membership can issue invites, so
+  treat network members and invite codes as trusted.
 - Hosts exchange known peers only during join and proxy connection setup.
-- Shared peer lists are capped at 100 peers. This is for security reasons.
-  You can change this in the code.
+- Shared peer and certificate lists are capped at 100 entries. This is for
+  security reasons. You can change this in the code.

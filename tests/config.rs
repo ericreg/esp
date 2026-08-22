@@ -1,10 +1,15 @@
 use std::path::PathBuf;
 
 use esp::{
-    Config, DEFAULT_ALLOWED_PORT, Invite, InviteProof, MAX_SHARED_PEERS, Peer, encode_secret_key,
-    ensure_port_allowed, is_valid_connection_id, remember_advertised_peers,
+    Config, DEFAULT_ALLOWED_PORT, Invite, InviteProof, MAX_SHARED_PEERS, MembershipCertificate,
+    Peer, encode_secret_key, ensure_port_allowed, is_valid_connection_id,
+    remember_advertised_peers,
 };
 use iroh::SecretKey;
+
+fn issue_membership(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> MembershipCertificate {
+    MembershipCertificate::issue(cfg, issuer_key, subject).unwrap()
+}
 
 #[test]
 fn invite_round_trips() {
@@ -14,9 +19,11 @@ fn invite_round_trips() {
         network_id: "net".to_string(),
         invite_id: "invite1".to_string(),
         invite_secret: "secret1".to_string(),
+        creator_node_id: Some(key.public()),
         inviter_node_id: key.public(),
         inviter_name: "creator".to_string(),
         inviter_connection_id: "ABC123".to_string(),
+        membership_chain: Vec::new(),
     };
 
     let code = invite.encode().unwrap();
@@ -24,15 +31,22 @@ fn invite_round_trips() {
     assert_eq!(decoded.network_id, invite.network_id);
     assert_eq!(decoded.invite_id, invite.invite_id);
     assert_eq!(decoded.invite_secret, invite.invite_secret);
+    assert_eq!(decoded.creator_node_id, invite.creator_node_id);
     assert_eq!(decoded.inviter_node_id, invite.inviter_node_id);
     assert_eq!(decoded.inviter_name, invite.inviter_name);
     assert_eq!(decoded.inviter_connection_id, invite.inviter_connection_id);
+    assert_eq!(decoded.membership_chain, invite.membership_chain);
 }
 
 #[test]
 fn joined_member_issues_unique_invites_without_saving_codes() {
     let secret_key = SecretKey::generate();
     let creator_key = SecretKey::generate();
+    let creator_peer = Peer {
+        node_id: creator_key.public(),
+        name: "creator".to_string(),
+        connection_id: "DEF456".to_string(),
+    };
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
@@ -42,15 +56,21 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
             invite_id: "ABC999".to_string(),
             invite_secret: "member-proof".to_string(),
         }),
+        membership: None,
+        memberships: Vec::new(),
         name: "joined".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
-        peers: vec![Peer {
-            node_id: creator_key.public(),
-            name: "creator".to_string(),
-            connection_id: "DEF456".to_string(),
-        }],
+        peers: vec![creator_peer.clone()],
     };
+    let joined_peer = Peer {
+        node_id: secret_key.public(),
+        name: "joined".to_string(),
+        connection_id: "ABC123".to_string(),
+    };
+    cfg.membership = Some(issue_membership(&cfg, &creator_key, &joined_peer));
+    cfg.memberships
+        .push(issue_membership(&cfg, &creator_key, &creator_peer));
 
     let first = cfg.issue_invite().unwrap();
     let second = cfg.issue_invite().unwrap();
@@ -63,10 +83,10 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
         Invite::decode(&second.code).unwrap().invite_id,
         second.invite_id
     );
-    assert_eq!(
-        Invite::decode(&first.code).unwrap().inviter_node_id,
-        secret_key.public()
-    );
+    let decoded = Invite::decode(&first.code).unwrap();
+    assert_eq!(decoded.inviter_node_id, secret_key.public());
+    assert_eq!(decoded.creator_node_id, Some(creator_key.public()));
+    assert_eq!(decoded.membership_chain.len(), 2);
 }
 
 #[test]
@@ -80,6 +100,8 @@ fn resolving_duplicate_names_requires_connection_id() {
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: Some(secret_key.public()),
         invite_proof: None,
+        membership: None,
+        memberships: Vec::new(),
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
@@ -117,6 +139,8 @@ fn connection_ids_are_case_sensitive_base62() {
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: Some(secret_key.public()),
         invite_proof: None,
+        membership: None,
+        memberships: Vec::new(),
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
@@ -141,6 +165,8 @@ fn advertised_peer_lists_are_bounded() {
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: Some(secret_key.public()),
         invite_proof: None,
+        membership: None,
+        memberships: Vec::new(),
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),

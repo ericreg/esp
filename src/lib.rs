@@ -2,29 +2,30 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use iroh::{
-    Endpoint, EndpointId, RelayMode, SecretKey,
+    Endpoint, EndpointId, RelayMode, SecretKey, Signature,
     endpoint::{Connection, VarInt, presets},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::TcpStream,
-    time::{interval, timeout},
+    time::timeout,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use uuid::Uuid;
 
 const CONTROL_ALPN: &[u8] = b"esp/control/0";
 const TCP_ALPN: &[u8] = b"esp/tcp/0";
 const CONFIG_FILE: &str = ".esp.yml";
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
-const MAX_PROXY_REQUEST_LEN: usize = 1024;
+const MAX_PROXY_REQUEST_LEN: usize = 64 * 1024 - 1;
+const MAX_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
 pub const MAX_SHARED_PEERS: usize = 100;
 const GRACEFUL_CLOSE: VarInt = VarInt::from_u32(0);
+const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/1";
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -74,6 +75,10 @@ pub struct Config {
     pub creator_node_id: Option<EndpointId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invite_proof: Option<InviteProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<MembershipCertificate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memberships: Vec<MembershipCertificate>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -111,17 +116,31 @@ pub struct Invite {
     pub network_id: String,
     pub invite_id: String,
     pub invite_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_node_id: Option<EndpointId>,
     pub inviter_node_id: EndpointId,
     #[serde(default)]
     pub inviter_name: String,
     #[serde(default)]
     pub inviter_connection_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub membership_chain: Vec<MembershipCertificate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteProof {
     pub invite_id: String,
     pub invite_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembershipCertificate {
+    pub version: u8,
+    pub network_id: String,
+    pub subject_node_id: EndpointId,
+    pub subject_connection_id: String,
+    pub issuer_node_id: EndpointId,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,8 +152,19 @@ struct Hello {
     connection_id: String,
     #[serde(default)]
     invite_proof: Option<InviteProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership: Option<MembershipCertificate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memberships: Vec<MembershipCertificate>,
     #[serde(default)]
     peers: Vec<Peer>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlResponse {
+    hello: Hello,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    granted_membership: Option<MembershipCertificate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +176,10 @@ struct TcpProxyRequest {
     requester_connection_id: String,
     #[serde(default)]
     invite_proof: Option<InviteProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership: Option<MembershipCertificate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    memberships: Vec<MembershipCertificate>,
     #[serde(default)]
     peers: Vec<Peer>,
     port: u16,
@@ -183,6 +217,8 @@ async fn init() -> Result<()> {
             secret_key: encode_secret_key(&secret_key),
             creator_node_id: Some(secret_key.public()),
             invite_proof: None,
+            membership: None,
+            memberships: Vec::new(),
             name: default_connection_name(),
             connection_id: generate_connection_id(),
             invites: Vec::new(),
@@ -191,7 +227,7 @@ async fn init() -> Result<()> {
         cfg.save(&path)?;
         cfg
     };
-    cfg.ensure_local_identity();
+    cfg.ensure_local_config()?;
     cfg.save(&path)?;
 
     println!("esp config: {}", path.display());
@@ -213,6 +249,7 @@ async fn join(invite_code: &str) -> Result<()> {
 
     let invite = Invite::decode(invite_code)?;
     let secret_key = SecretKey::generate();
+    let creator_node_id = invite.creator_node_id.unwrap_or(invite.inviter_node_id);
     let mut connection_id = generate_connection_id();
     while !invite.inviter_connection_id.is_empty() && connection_id == invite.inviter_connection_id
     {
@@ -222,11 +259,13 @@ async fn join(invite_code: &str) -> Result<()> {
         version: 1,
         network_id: invite.network_id,
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(invite.inviter_node_id),
+        creator_node_id: Some(creator_node_id),
         invite_proof: Some(InviteProof {
             invite_id: invite.invite_id,
             invite_secret: invite.invite_secret,
         }),
+        membership: None,
+        memberships: invite.membership_chain.clone(),
         name: default_connection_name(),
         connection_id,
         invites: Vec::new(),
@@ -327,7 +366,7 @@ async fn sync_joined_peer_once(path: &PathBuf, inviter: &Peer) -> Result<()> {
             .connect(inviter.node_id, CONTROL_ALPN)
             .await
             .with_context(|| format!("failed to connect to inviter {}", inviter.node_id))?;
-        sync_control_connection(&conn, path, Some(inviter)).await?;
+        sync_control_client(&conn, path, inviter).await?;
         conn.close(GRACEFUL_CLOSE, b"synced");
         Ok::<(), anyhow::Error>(())
     }
@@ -380,64 +419,92 @@ async fn run_acceptor(endpoint: Endpoint, path: PathBuf, allowed_ports: Vec<u16>
 }
 
 async fn handle_control_connection(conn: Connection, path: PathBuf) -> Result<()> {
-    sync_control_connection(&conn, &path, None).await?;
+    sync_control_server(&conn, &path).await?;
     conn.close(GRACEFUL_CLOSE, b"synced");
     Ok(())
 }
 
-async fn sync_control_connection(
+async fn sync_control_client(
     conn: &Connection,
     path: &PathBuf,
-    expected_peer: Option<&Peer>,
+    expected_peer: &Peer,
 ) -> Result<()> {
-    let mut cfg = Config::load(path)?;
-    let remote = exchange_hello(conn, &cfg).await?;
-    let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, expected_peer)?;
-    remember_control_peer(
-        path,
-        &mut cfg,
-        peer.clone(),
-        expected_peer.is_some(),
-        remote.invite_proof.as_ref(),
-    )?;
-    remember_advertised_peers(path, &mut cfg, &peer, remote.peers)?;
-    Ok(())
-}
-
-async fn exchange_hello(conn: &Connection, cfg: &Config) -> Result<Hello> {
     timeout(Duration::from_secs(15), async {
-        let mut ticker = interval(Duration::from_millis(250));
-        send_hello(conn, cfg).await?;
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => send_hello(conn, cfg).await?,
-                data = conn.read_datagram() => {
-                    let data = data.context("failed to read esp hello")?;
-                    match serde_yaml::from_slice(&data) {
-                        Ok(hello) => return Ok(hello),
-                        Err(err) => debug!(error = %err, "ignoring non-hello datagram during handshake"),
-                    }
-                }
-            }
+        let mut cfg = Config::load(path)?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .context("failed to open esp control stream")?;
+        write_control_hello(&mut send, &hello_from_config(&cfg)).await?;
+        send.finish()
+            .context("failed to finish esp control send stream")?;
+
+        let response = read_control_response(&mut recv).await?;
+        let remote = response.hello;
+        let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, Some(expected_peer))?;
+        let remote_memberships = memberships_from_hello(&remote);
+        remember_control_peer(
+            path,
+            &mut cfg,
+            peer.clone(),
+            true,
+            remote.invite_proof.as_ref(),
+            remote.membership.as_ref(),
+            &remote_memberships,
+        )?;
+        remember_advertised_peers_with_memberships(
+            path,
+            &mut cfg,
+            &peer,
+            remote.peers,
+            remote_memberships.clone(),
+        )?;
+        if let Some(grant) = response.granted_membership {
+            remember_local_membership_grant(path, &mut cfg, grant, &remote_memberships)?;
         }
+        Ok::<(), anyhow::Error>(())
     })
     .await
-    .context("timed out waiting for esp peer hello")?
+    .context("timed out waiting for esp control sync")?
 }
 
-async fn send_hello(conn: &Connection, cfg: &Config) -> Result<()> {
-    let hello = Hello {
-        network_id: cfg.network_id.clone(),
-        name: cfg.name.clone(),
-        connection_id: cfg.connection_id.clone(),
-        invite_proof: cfg.invite_proof.clone(),
-        peers: cfg.peers.clone(),
-    };
-    let data = serde_yaml::to_string(&hello)?.into_bytes();
-    conn.send_datagram_wait(Bytes::from(data))
-        .await
-        .context("failed to send esp hello")?;
-    Ok(())
+async fn sync_control_server(conn: &Connection, path: &PathBuf) -> Result<()> {
+    timeout(Duration::from_secs(15), async {
+        let mut cfg = Config::load(path)?;
+        let (mut send, mut recv) = conn
+            .accept_bi()
+            .await
+            .context("failed to accept esp control stream")?;
+        let remote = read_control_hello(&mut recv).await?;
+        let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, None)?;
+        let remote_memberships = memberships_from_hello(&remote);
+        let granted_membership = remember_control_peer(
+            path,
+            &mut cfg,
+            peer.clone(),
+            false,
+            remote.invite_proof.as_ref(),
+            remote.membership.as_ref(),
+            &remote_memberships,
+        )?;
+        remember_advertised_peers_with_memberships(
+            path,
+            &mut cfg,
+            &peer,
+            remote.peers,
+            remote_memberships,
+        )?;
+        let response = ControlResponse {
+            hello: hello_from_config(&cfg),
+            granted_membership,
+        };
+        write_control_response(&mut send, &response).await?;
+        send.finish()
+            .context("failed to finish esp control send stream")?;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .context("timed out waiting for esp control sync")?
 }
 
 fn validate_peer_report(
@@ -483,21 +550,64 @@ fn remember_control_peer(
     peer: Peer,
     was_expected: bool,
     invite_proof: Option<&InviteProof>,
-) -> Result<()> {
+    direct_membership: Option<&MembershipCertificate>,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<Option<MembershipCertificate>> {
+    let verified_membership =
+        verified_membership_for_peer(cfg, &peer, direct_membership, extra_memberships)?;
+    if let Some(membership) = verified_membership.as_ref() {
+        insert_membership(cfg, membership.clone())?;
+    }
+
     if was_expected || cfg.peer_by_id(peer.node_id).is_some() {
+        if insert_peer(cfg, peer)? || verified_membership.is_some() {
+            cfg.save(path)?;
+        }
+        return Ok(None);
+    }
+
+    if verified_membership.is_some() {
         if insert_peer(cfg, peer)? {
             cfg.save(path)?;
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    if !cfg.can_accept_invited_peer(invite_proof) {
+    let Some(granted_membership) = consume_invite_and_issue_membership(cfg, &peer, invite_proof)?
+    else {
+        bail!("rejecting unknown peer {}", peer.node_id);
+    };
+
+    info!(peer = %peer.node_id, "remembering invited peer");
+    insert_membership(cfg, granted_membership.clone())?;
+    insert_peer(cfg, peer)?;
+    cfg.save(path)?;
+    Ok(Some(granted_membership))
+}
+
+fn remember_proxy_peer(
+    path: &PathBuf,
+    cfg: &mut Config,
+    peer: Peer,
+    direct_membership: Option<&MembershipCertificate>,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<()> {
+    let verified_membership =
+        verified_membership_for_peer(cfg, &peer, direct_membership, extra_memberships)?;
+    let peer_is_known = cfg.peer_by_id(peer.node_id).is_some();
+    if !peer_is_known && verified_membership.is_none() {
         bail!("rejecting unknown peer {}", peer.node_id);
     }
 
-    info!(peer = %peer.node_id, "remembering invited peer");
-    insert_peer(cfg, peer)?;
-    cfg.save(path)
+    let mut changed = false;
+    if let Some(membership) = verified_membership {
+        changed |= insert_membership(cfg, membership)?;
+    }
+    changed |= insert_peer(cfg, peer)?;
+    if changed {
+        cfg.save(path)?;
+    }
+    Ok(())
 }
 
 pub fn remember_advertised_peers(
@@ -506,39 +616,41 @@ pub fn remember_advertised_peers(
     remote_peer: &Peer,
     advertised_peers: Vec<Peer>,
 ) -> Result<()> {
-    if advertised_peers.len() > MAX_SHARED_PEERS {
-        bail!(
-            "peer shared {} peers, maximum is {}",
-            advertised_peers.len(),
-            MAX_SHARED_PEERS
-        );
-    }
+    remember_advertised_peers_with_memberships(path, cfg, remote_peer, advertised_peers, Vec::new())
+}
+
+fn remember_advertised_peers_with_memberships(
+    path: &PathBuf,
+    cfg: &mut Config,
+    remote_peer: &Peer,
+    advertised_peers: Vec<Peer>,
+    advertised_memberships: Vec<MembershipCertificate>,
+) -> Result<()> {
+    ensure_shared_list_size("peers", advertised_peers.len())?;
+    ensure_shared_list_size("memberships", advertised_memberships.len())?;
 
     let mut changed = false;
+    for membership in &advertised_memberships {
+        if verify_membership_chain(cfg, membership, &advertised_memberships).is_ok() {
+            changed |= insert_membership(cfg, membership.clone())?;
+        }
+    }
+
     for peer in advertised_peers {
         if peer.node_id == remote_peer.node_id {
             continue;
+        }
+        let membership = verified_membership_for_peer(cfg, &peer, None, &advertised_memberships)?;
+        if let Some(membership) = membership {
+            changed |= insert_membership(cfg, membership)?;
+        } else if cfg.peer_by_id(peer.node_id).is_none() {
+            bail!("advertised peer {} has no valid membership", peer.node_id);
         }
         if insert_peer(cfg, peer)? {
             changed = true;
         }
     }
     if changed {
-        cfg.save(path)?;
-    }
-    Ok(())
-}
-
-fn remember_proxy_peer(
-    path: &PathBuf,
-    cfg: &mut Config,
-    peer: Peer,
-    invite_proof: Option<&InviteProof>,
-) -> Result<()> {
-    if cfg.peer_by_id(peer.node_id).is_none() && !cfg.can_accept_invited_peer(invite_proof) {
-        bail!("rejecting unknown peer {}", peer.node_id);
-    }
-    if insert_peer(cfg, peer)? {
         cfg.save(path)?;
     }
     Ok(())
@@ -626,8 +738,10 @@ async fn proxy(target: String, port: u16) -> Result<()> {
     let request = TcpProxyRequest {
         network_id: cfg.network_id.clone(),
         requester_name: cfg.name.clone(),
-        requester_connection_id: cfg.connection_id,
-        invite_proof: cfg.invite_proof.clone(),
+        requester_connection_id: cfg.connection_id.clone(),
+        invite_proof: None,
+        membership: cfg.membership.clone(),
+        memberships: cfg.shared_memberships(),
         peers: cfg.peers.clone(),
         port,
     };
@@ -684,16 +798,26 @@ async fn handle_tcp_proxy_connection(
         name: request.requester_name,
         connection_id: request.requester_connection_id,
         invite_proof: request.invite_proof,
+        membership: request.membership,
+        memberships: request.memberships,
         peers: Vec::new(),
     };
     let peer = validate_peer_report(&cfg, conn.remote_id(), &reported, expected.as_ref())?;
+    let remote_memberships = memberships_from_hello(&reported);
     remember_proxy_peer(
         &path,
         &mut cfg,
         peer.clone(),
-        reported.invite_proof.as_ref(),
+        reported.membership.as_ref(),
+        &remote_memberships,
     )?;
-    remember_advertised_peers(&path, &mut cfg, &peer, request.peers)?;
+    remember_advertised_peers_with_memberships(
+        &path,
+        &mut cfg,
+        &peer,
+        request.peers,
+        remote_memberships,
+    )?;
     info!(
         peer = %peer.node_id,
         peer_name = %peer.name,
@@ -750,36 +874,84 @@ pub fn ensure_port_allowed(port: u16, allowed_ports: &[u16]) -> Result<()> {
 }
 
 async fn read_proxy_request(recv: &mut iroh::endpoint::RecvStream) -> Result<TcpProxyRequest> {
-    let mut len = [0u8; 2];
-    recv.read_exact(&mut len)
-        .await
-        .context("failed to read TCP proxy request length")?;
-    let len = usize::from(u16::from_be_bytes(len));
-    if len > MAX_PROXY_REQUEST_LEN {
-        bail!("TCP proxy request is too large");
-    }
-
-    let mut data = vec![0u8; len];
-    recv.read_exact(&mut data)
-        .await
-        .context("failed to read TCP proxy request")?;
-    serde_yaml::from_slice(&data).context("invalid TCP proxy request")
+    read_yaml_frame(recv, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
 }
 
 async fn write_proxy_request(
     send: &mut iroh::endpoint::SendStream,
     request: &TcpProxyRequest,
 ) -> Result<()> {
-    let data = serde_yaml::to_string(request)?.into_bytes();
-    if data.len() > MAX_PROXY_REQUEST_LEN || data.len() > usize::from(u16::MAX) {
-        bail!("TCP proxy request is too large");
+    write_yaml_frame(send, request, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
+}
+
+async fn read_control_hello(recv: &mut iroh::endpoint::RecvStream) -> Result<Hello> {
+    read_yaml_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
+}
+
+async fn write_control_hello(send: &mut iroh::endpoint::SendStream, hello: &Hello) -> Result<()> {
+    write_yaml_frame(send, hello, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
+}
+
+async fn read_control_response(recv: &mut iroh::endpoint::RecvStream) -> Result<ControlResponse> {
+    read_yaml_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control response").await
+}
+
+async fn write_control_response(
+    send: &mut iroh::endpoint::SendStream,
+    response: &ControlResponse,
+) -> Result<()> {
+    write_yaml_frame(
+        send,
+        response,
+        MAX_CONTROL_MESSAGE_LEN,
+        "esp control response",
+    )
+    .await
+}
+
+async fn read_yaml_frame<T>(
+    recv: &mut iroh::endpoint::RecvStream,
+    max_len: usize,
+    label: &str,
+) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let mut len = [0u8; 2];
+    recv.read_exact(&mut len)
+        .await
+        .with_context(|| format!("failed to read {label} length"))?;
+    let len = usize::from(u16::from_be_bytes(len));
+    if len > max_len {
+        bail!("{label} is too large");
+    }
+
+    let mut data = vec![0u8; len];
+    recv.read_exact(&mut data)
+        .await
+        .with_context(|| format!("failed to read {label}"))?;
+    serde_yaml::from_slice(&data).with_context(|| format!("invalid {label}"))
+}
+
+async fn write_yaml_frame<T>(
+    send: &mut iroh::endpoint::SendStream,
+    value: &T,
+    max_len: usize,
+    label: &str,
+) -> Result<()>
+where
+    T: Serialize,
+{
+    let data = serde_yaml::to_string(value)?.into_bytes();
+    if data.len() > max_len || data.len() > usize::from(u16::MAX) {
+        bail!("{label} is too large");
     }
     send.write_all(&(data.len() as u16).to_be_bytes())
         .await
-        .context("failed to write TCP proxy request length")?;
+        .with_context(|| format!("failed to write {label} length"))?;
     send.write_all(&data)
         .await
-        .context("failed to write TCP proxy request")?;
+        .with_context(|| format!("failed to write {label}"))?;
     Ok(())
 }
 
@@ -794,16 +966,7 @@ impl Config {
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut cfg: Self = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
-        let mut changed = cfg.ensure_local_identity();
-        if cfg.creator_node_id.is_none() {
-            cfg.creator_node_id = Some(
-                cfg.peers
-                    .first()
-                    .map(|peer| peer.node_id)
-                    .unwrap_or(cfg.secret_key()?.public()),
-            );
-            changed = true;
-        }
+        let changed = cfg.ensure_local_config()?;
         if changed {
             cfg.save(path)?;
         }
@@ -857,6 +1020,42 @@ impl Config {
         }
     }
 
+    fn ensure_local_config(&mut self) -> Result<bool> {
+        let mut changed = self.ensure_local_identity();
+        let local_node_id = self.secret_key()?.public();
+        if self.creator_node_id.is_none() {
+            self.creator_node_id = Some(
+                self.peers
+                    .first()
+                    .map(|peer| peer.node_id)
+                    .unwrap_or(local_node_id),
+            );
+            changed = true;
+        }
+
+        if self.creator_node_id == Some(local_node_id) {
+            let local_peer = self.local_peer()?;
+            let needs_membership = self
+                .membership
+                .as_ref()
+                .map(|membership| {
+                    membership.matches_peer(self, &local_peer).is_err()
+                        || verify_membership_chain(self, membership, &[]).is_err()
+                })
+                .unwrap_or(true);
+            if needs_membership {
+                let secret_key = self.secret_key()?;
+                self.membership = Some(MembershipCertificate::issue(
+                    self,
+                    &secret_key,
+                    &local_peer,
+                )?);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
     fn ensure_local_identity(&mut self) -> bool {
         let mut changed = false;
         if self.name.trim().is_empty() {
@@ -870,18 +1069,64 @@ impl Config {
         changed
     }
 
+    fn local_peer(&self) -> Result<Peer> {
+        Ok(Peer {
+            node_id: self.secret_key()?.public(),
+            name: self.name.clone(),
+            connection_id: self.connection_id.clone(),
+        })
+    }
+
+    fn shared_memberships(&self) -> Vec<MembershipCertificate> {
+        let mut memberships = self.memberships.clone();
+        if let Some(membership) = &self.membership
+            && !memberships
+                .iter()
+                .any(|known| known.subject_node_id == membership.subject_node_id)
+        {
+            memberships.push(membership.clone());
+        }
+        memberships
+    }
+
+    fn membership_chain_for(&self, node_id: EndpointId) -> Result<Vec<MembershipCertificate>> {
+        let mut chain = Vec::new();
+        let mut current = node_id;
+        loop {
+            if chain
+                .iter()
+                .any(|membership: &MembershipCertificate| membership.subject_node_id == current)
+            {
+                bail!("membership chain contains a cycle");
+            }
+            let membership = find_membership_by_subject(self, &[], current)
+                .cloned()
+                .ok_or_else(|| anyhow!("no membership certificate for {}", current))?;
+            verify_membership_chain(self, &membership, &[])?;
+            current = membership.issuer_node_id;
+            let is_root = membership.subject_node_id == membership.issuer_node_id;
+            chain.push(membership);
+            if is_root {
+                return Ok(chain);
+            }
+        }
+    }
+
     pub fn issue_invite(&mut self) -> Result<InviteCode> {
+        self.ensure_local_config()?;
         let secret_key = self.secret_key()?;
         let invite_id = generate_connection_id();
         let invite_secret = generate_invite_secret();
         let invite = Invite {
-            version: 1,
+            version: 2,
             network_id: self.network_id.clone(),
             invite_id: invite_id.clone(),
             invite_secret: invite_secret.clone(),
+            creator_node_id: self.creator_node_id,
             inviter_node_id: secret_key.public(),
             inviter_name: self.name.clone(),
             inviter_connection_id: self.connection_id.clone(),
+            membership_chain: self.membership_chain_for(secret_key.public())?,
         };
         let issued = InviteCode {
             invite_id: invite_id.clone(),
@@ -894,7 +1139,7 @@ impl Config {
         Ok(issued)
     }
 
-    fn can_accept_invited_peer(&self, proof: Option<&InviteProof>) -> bool {
+    fn has_invite_proof(&self, proof: Option<&InviteProof>) -> bool {
         let Some(proof) = proof else {
             return false;
         };
@@ -902,6 +1147,20 @@ impl Config {
         self.invites
             .iter()
             .any(|invite| invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash)
+    }
+
+    fn consume_invite_proof(&mut self, proof: Option<&InviteProof>) -> bool {
+        let Some(proof) = proof else {
+            return false;
+        };
+        let secret_hash = hash_invite_secret(&proof.invite_secret);
+        let Some(index) = self.invites.iter().position(|invite| {
+            invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash
+        }) else {
+            return false;
+        };
+        self.invites.remove(index);
+        true
     }
 }
 
@@ -917,6 +1176,275 @@ impl Peer {
             self.node_id.to_string()
         }
     }
+}
+
+impl MembershipCertificate {
+    pub fn issue(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> Result<Self> {
+        if !is_valid_connection_id(&subject.connection_id) {
+            bail!("cannot issue membership for invalid connection id");
+        }
+        let mut membership = Self {
+            version: 1,
+            network_id: cfg.network_id.clone(),
+            subject_node_id: subject.node_id,
+            subject_connection_id: subject.connection_id.clone(),
+            issuer_node_id: issuer_key.public(),
+            signature: String::new(),
+        };
+        let signature = issuer_key.sign(&membership.signature_payload());
+        membership.signature = encode_signature(&signature);
+        Ok(membership)
+    }
+
+    fn matches_peer(&self, cfg: &Config, peer: &Peer) -> Result<()> {
+        if self.version != 1 {
+            bail!(
+                "unsupported membership certificate version {}",
+                self.version
+            );
+        }
+        if self.network_id != cfg.network_id {
+            bail!("membership certificate is for a different esp network");
+        }
+        if self.subject_node_id != peer.node_id {
+            bail!("membership certificate subject does not match peer node id");
+        }
+        if self.subject_connection_id != peer.connection_id {
+            bail!("membership certificate subject does not match peer connection id");
+        }
+        if !is_valid_connection_id(&self.subject_connection_id) {
+            bail!("membership certificate has invalid connection id");
+        }
+        Ok(())
+    }
+
+    fn verify_signature(&self) -> Result<()> {
+        let signature = decode_signature(&self.signature)?;
+        self.issuer_node_id
+            .verify(&self.signature_payload(), &signature)
+            .context("membership certificate signature is invalid")
+    }
+
+    fn signature_payload(&self) -> Vec<u8> {
+        let fields = [
+            self.version.to_string(),
+            self.network_id.clone(),
+            self.subject_node_id.to_string(),
+            self.subject_connection_id.clone(),
+            self.issuer_node_id.to_string(),
+        ];
+        let mut payload = Vec::new();
+        append_signed_field(&mut payload, MEMBERSHIP_SIGNATURE_CONTEXT);
+        for field in &fields {
+            append_signed_field(&mut payload, field);
+        }
+        payload
+    }
+}
+
+fn hello_from_config(cfg: &Config) -> Hello {
+    Hello {
+        network_id: cfg.network_id.clone(),
+        name: cfg.name.clone(),
+        connection_id: cfg.connection_id.clone(),
+        invite_proof: if cfg.membership.is_none() {
+            cfg.invite_proof.clone()
+        } else {
+            None
+        },
+        membership: cfg.membership.clone(),
+        memberships: cfg.shared_memberships(),
+        peers: cfg.peers.clone(),
+    }
+}
+
+fn memberships_from_hello(hello: &Hello) -> Vec<MembershipCertificate> {
+    let mut memberships = hello.memberships.clone();
+    if let Some(membership) = &hello.membership
+        && !memberships
+            .iter()
+            .any(|known| known.subject_node_id == membership.subject_node_id)
+    {
+        memberships.push(membership.clone());
+    }
+    memberships
+}
+
+fn remember_local_membership_grant(
+    path: &PathBuf,
+    cfg: &mut Config,
+    membership: MembershipCertificate,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<()> {
+    let local_peer = cfg.local_peer()?;
+    membership.matches_peer(cfg, &local_peer)?;
+    verify_membership_chain(cfg, &membership, extra_memberships)?;
+    cfg.membership = Some(membership);
+    cfg.invite_proof = None;
+    cfg.save(path)
+}
+
+fn consume_invite_and_issue_membership(
+    cfg: &mut Config,
+    peer: &Peer,
+    invite_proof: Option<&InviteProof>,
+) -> Result<Option<MembershipCertificate>> {
+    if !cfg.has_invite_proof(invite_proof) {
+        return Ok(None);
+    }
+    let local_peer = cfg.local_peer()?;
+    let local_membership = cfg
+        .membership
+        .as_ref()
+        .ok_or_else(|| anyhow!("local host has no membership certificate"))?;
+    local_membership.matches_peer(cfg, &local_peer)?;
+    verify_membership_chain(cfg, local_membership, &[])?;
+    if !cfg.consume_invite_proof(invite_proof) {
+        return Ok(None);
+    }
+    let secret_key = cfg.secret_key()?;
+    MembershipCertificate::issue(cfg, &secret_key, peer).map(Some)
+}
+
+fn verified_membership_for_peer(
+    cfg: &Config,
+    peer: &Peer,
+    direct_membership: Option<&MembershipCertificate>,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<Option<MembershipCertificate>> {
+    let membership = direct_membership
+        .or_else(|| find_membership_by_subject(cfg, extra_memberships, peer.node_id));
+    let Some(membership) = membership else {
+        return Ok(None);
+    };
+    membership.matches_peer(cfg, peer)?;
+    verify_membership_chain(cfg, membership, extra_memberships)?;
+    Ok(Some(membership.clone()))
+}
+
+fn verify_membership_chain(
+    cfg: &Config,
+    membership: &MembershipCertificate,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<()> {
+    let mut seen = Vec::new();
+    verify_membership_chain_inner(cfg, membership, extra_memberships, &mut seen)
+}
+
+fn verify_membership_chain_inner(
+    cfg: &Config,
+    membership: &MembershipCertificate,
+    extra_memberships: &[MembershipCertificate],
+    seen: &mut Vec<EndpointId>,
+) -> Result<()> {
+    if membership.version != 1 {
+        bail!(
+            "unsupported membership certificate version {}",
+            membership.version
+        );
+    }
+    if membership.network_id != cfg.network_id {
+        bail!("membership certificate is for a different esp network");
+    }
+    if !is_valid_connection_id(&membership.subject_connection_id) {
+        bail!("membership certificate has invalid connection id");
+    }
+    if seen.contains(&membership.subject_node_id) {
+        bail!("membership certificate chain contains a cycle");
+    }
+    membership.verify_signature()?;
+    seen.push(membership.subject_node_id);
+
+    if membership.subject_node_id == membership.issuer_node_id {
+        if Some(membership.subject_node_id) != cfg.creator_node_id {
+            bail!("membership root is not the esp network creator");
+        }
+        return Ok(());
+    }
+
+    let issuer_membership =
+        find_membership_by_subject(cfg, extra_memberships, membership.issuer_node_id)
+            .ok_or_else(|| anyhow!("missing membership issuer {}", membership.issuer_node_id))?;
+    verify_membership_chain_inner(cfg, issuer_membership, extra_memberships, seen)
+}
+
+fn find_membership_by_subject<'a>(
+    cfg: &'a Config,
+    extra_memberships: &'a [MembershipCertificate],
+    subject_node_id: EndpointId,
+) -> Option<&'a MembershipCertificate> {
+    cfg.membership
+        .iter()
+        .chain(cfg.memberships.iter())
+        .chain(extra_memberships.iter())
+        .find(|membership| membership.subject_node_id == subject_node_id)
+}
+
+fn insert_membership(cfg: &mut Config, membership: MembershipCertificate) -> Result<bool> {
+    if membership.subject_node_id == cfg.secret_key()?.public() {
+        return Ok(false);
+    }
+
+    if let Some(existing) = cfg
+        .memberships
+        .iter_mut()
+        .find(|known| known.subject_node_id == membership.subject_node_id)
+    {
+        if existing.subject_connection_id != membership.subject_connection_id {
+            bail!(
+                "membership for {} changed connection id from {} to {}",
+                membership.subject_node_id,
+                existing.subject_connection_id,
+                membership.subject_connection_id
+            );
+        }
+        if *existing == membership {
+            return Ok(false);
+        }
+        *existing = membership;
+        return Ok(true);
+    }
+
+    cfg.memberships.push(membership);
+    cfg.memberships.sort_by(|left, right| {
+        left.subject_node_id
+            .to_string()
+            .cmp(&right.subject_node_id.to_string())
+    });
+    Ok(true)
+}
+
+fn ensure_shared_list_size(label: &str, len: usize) -> Result<()> {
+    if len <= MAX_SHARED_PEERS {
+        return Ok(());
+    }
+    bail!(
+        "peer shared {} {}, maximum is {}",
+        len,
+        label,
+        MAX_SHARED_PEERS
+    )
+}
+
+fn append_signed_field(payload: &mut Vec<u8>, field: &str) {
+    payload.extend_from_slice(field.len().to_string().as_bytes());
+    payload.push(b':');
+    payload.extend_from_slice(field.as_bytes());
+    payload.push(b'\n');
+}
+
+fn encode_signature(signature: &Signature) -> String {
+    URL_SAFE_NO_PAD.encode(signature.to_bytes())
+}
+
+fn decode_signature(encoded: &str) -> Result<Signature> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded.trim())
+        .context("membership signature is not valid base64")?;
+    let bytes: [u8; Signature::LENGTH] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("membership signature must decode to 64 bytes"))?;
+    Ok(Signature::from_bytes(&bytes))
 }
 
 fn default_connection_name() -> String {
@@ -1005,5 +1533,143 @@ impl Invite {
             .decode(code.trim())
             .context("invite is not valid base64")?;
         serde_yaml::from_slice(&yaml).context("invite is not valid esp data")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn creator_config(secret_key: &SecretKey) -> Config {
+        let mut cfg = Config {
+            version: 1,
+            network_id: "net".to_string(),
+            secret_key: encode_secret_key(secret_key),
+            creator_node_id: Some(secret_key.public()),
+            invite_proof: None,
+            membership: None,
+            memberships: Vec::new(),
+            name: "creator".to_string(),
+            connection_id: "ABC123".to_string(),
+            invites: Vec::new(),
+            peers: Vec::new(),
+        };
+        cfg.ensure_local_config().unwrap();
+        cfg
+    }
+
+    #[test]
+    fn membership_certificate_chains_to_creator_and_rejects_tampering() {
+        let creator_key = SecretKey::generate();
+        let cfg = creator_config(&creator_key);
+        let member = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "member".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let membership = MembershipCertificate::issue(&cfg, &creator_key, &member).unwrap();
+
+        membership.matches_peer(&cfg, &member).unwrap();
+        verify_membership_chain(&cfg, &membership, &[]).unwrap();
+
+        let mut tampered = membership;
+        tampered.subject_connection_id = "FED654".to_string();
+        assert!(verify_membership_chain(&cfg, &tampered, &[]).is_err());
+    }
+
+    #[test]
+    fn invite_proof_is_consumed_when_membership_is_granted() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let invite = cfg.issue_invite().unwrap();
+        let invite = Invite::decode(&invite.code).unwrap();
+        let proof = InviteProof {
+            invite_id: invite.invite_id,
+            invite_secret: invite.invite_secret,
+        };
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "joined".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+
+        let granted = consume_invite_and_issue_membership(&mut cfg, &peer, Some(&proof))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(granted.subject_node_id, peer.node_id);
+        assert!(cfg.invites.is_empty());
+        assert!(
+            consume_invite_and_issue_membership(&mut cfg, &peer, Some(&proof))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn advertised_peer_with_valid_membership_is_remembered_without_invite() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let remote_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "remote".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let advertised_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "advertised".to_string(),
+            connection_id: "FED654".to_string(),
+        };
+        let advertised_membership =
+            MembershipCertificate::issue(&cfg, &creator_key, &advertised_peer).unwrap();
+        let path = std::env::temp_dir().join(format!("esp-test-{}.yml", Uuid::new_v4()));
+
+        remember_advertised_peers_with_memberships(
+            &path,
+            &mut cfg,
+            &remote_peer,
+            vec![advertised_peer.clone()],
+            vec![advertised_membership],
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.peer_by_id(advertised_peer.node_id)
+                .unwrap()
+                .connection_id,
+            advertised_peer.connection_id
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn unknown_advertised_peer_without_membership_is_rejected() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let remote_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "remote".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+        let advertised_peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "advertised".to_string(),
+            connection_id: "FED654".to_string(),
+        };
+        let path = std::env::temp_dir().join(format!("esp-test-{}.yml", Uuid::new_v4()));
+
+        let err = remember_advertised_peers_with_memberships(
+            &path,
+            &mut cfg,
+            &remote_peer,
+            vec![advertised_peer.clone()],
+            Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("has no valid membership"));
+        assert!(cfg.peer_by_id(advertised_peer.node_id).is_none());
+        let _ = std::fs::remove_file(path);
     }
 }
