@@ -63,14 +63,7 @@ const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
 const MAX_SHARED_REVOCATIONS: usize = 100;
 const ENDPOINT_ID_BYTES: usize = 32;
 const CONNECTION_ID_LEN: usize = 6;
-const INVITE_ID_LEN: usize = CONNECTION_ID_LEN;
-const COMPACT_POLICY_BYTES: usize = 1 + 16 + 4 + ENDPOINT_ID_BYTES + 8 + Signature::LENGTH;
-const COMPACT_REVOCATION_BYTES: usize =
-    1 + 16 + ENDPOINT_ID_BYTES + ENDPOINT_ID_BYTES + 8 + Signature::LENGTH;
-const COMPACT_MEMBERSHIP_MIN_BYTES: usize =
-    1 + 16 + ENDPOINT_ID_BYTES + CONNECTION_ID_LEN + 1 + 2 + ENDPOINT_ID_BYTES + Signature::LENGTH;
 const INVITE_SECRET_BYTES: usize = 16;
-const SHORT_INVITE_BYTES: usize = 1 + 16 + 32 + 32 + INVITE_ID_LEN + INVITE_SECRET_BYTES;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -185,6 +178,48 @@ pub struct Invite {
     pub inviter_node_id: EndpointId,
 }
 
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug)]
+struct InviteMessage {
+    version: u8,
+    network_id: [u8; 16],
+    invite_id: [u8; CONNECTION_ID_LEN],
+    invite_secret: [u8; INVITE_SECRET_BYTES],
+    creator_node_id: [u8; ENDPOINT_ID_BYTES],
+    inviter_node_id: [u8; ENDPOINT_ID_BYTES],
+}
+
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug)]
+struct MembershipCertificateMessage {
+    version: u8,
+    network_id: [u8; 16],
+    subject_node_id: [u8; ENDPOINT_ID_BYTES],
+    subject_connection_id: [u8; CONNECTION_ID_LEN],
+    role: u8,
+    allowed_ports: Vec<u16>,
+    issuer_node_id: [u8; ENDPOINT_ID_BYTES],
+    signature: [u8; Signature::LENGTH],
+}
+
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug)]
+struct NetworkPolicyCertificateMessage {
+    version: u8,
+    network_id: [u8; 16],
+    max_peers: u32,
+    issuer_node_id: [u8; ENDPOINT_ID_BYTES],
+    issued_at_unix: u64,
+    signature: [u8; Signature::LENGTH],
+}
+
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize, Debug)]
+struct RevocationCertificateMessage {
+    version: u8,
+    network_id: [u8; 16],
+    subject_node_id: [u8; ENDPOINT_ID_BYTES],
+    issuer_node_id: [u8; ENDPOINT_ID_BYTES],
+    issued_at_unix: u64,
+    signature: [u8; Signature::LENGTH],
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InviteProof {
@@ -217,14 +252,14 @@ impl MembershipRole {
         matches!(self, Self::Admin)
     }
 
-    fn to_compact_byte(self) -> u8 {
+    fn to_message_byte(self) -> u8 {
         match self {
             Self::Admin => 1,
             Self::Peer => 2,
         }
     }
 
-    fn from_compact_byte(byte: u8) -> Result<Self> {
+    fn from_message_byte(byte: u8) -> Result<Self> {
         match byte {
             1 => Ok(Self::Admin),
             2 => Ok(Self::Peer),
@@ -3348,49 +3383,51 @@ impl MembershipCertificate {
             bail!("membership certificate has invalid connection id");
         }
         let allowed_ports = self.allowed_ports()?;
-        let port_count: u16 = allowed_ports
-            .len()
-            .try_into()
-            .map_err(|_| anyhow!("membership certificate has too many allowed ports"))?;
         let signature = decode_signature(&self.signature)
             .context("membership certificate signature is invalid")?
             .to_bytes();
+        let subject_connection_id: [u8; CONNECTION_ID_LEN] = self
+            .subject_connection_id
+            .as_bytes()
+            .try_into()
+            .map_err(|_| anyhow!("membership certificate has invalid connection id"))?;
 
-        let mut bytes = Vec::with_capacity(COMPACT_MEMBERSHIP_MIN_BYTES + allowed_ports.len() * 2);
-        bytes.push(self.version);
-        bytes.extend_from_slice(network_id.as_bytes());
-        bytes.extend_from_slice(self.subject_node_id.as_bytes());
-        bytes.extend_from_slice(self.subject_connection_id.as_bytes());
-        bytes.push(self.role.to_compact_byte());
-        bytes.extend_from_slice(&port_count.to_be_bytes());
-        for port in allowed_ports {
-            bytes.extend_from_slice(&port.to_be_bytes());
-        }
-        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
-        bytes.extend_from_slice(&signature);
+        let message = MembershipCertificateMessage {
+            version: self.version,
+            network_id: *network_id.as_bytes(),
+            subject_node_id: *self.subject_node_id.as_bytes(),
+            subject_connection_id,
+            role: self.role.to_message_byte(),
+            allowed_ports,
+            issuer_node_id: *self.issuer_node_id.as_bytes(),
+            signature,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message)
+            .context("failed to encode membership certificate")?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = decode_compact_record(code, "membership certificate")?;
-        let mut input = bytes.as_slice();
-        let version = take_u8(&mut input, "membership certificate")?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(code.trim())
+            .context("membership certificate is not valid base64")?;
+        let message = rkyv::from_bytes::<MembershipCertificateMessage, rkyv::rancor::Error>(&bytes)
+            .context("membership certificate is not a valid rkyv message")?;
+
+        let version = message.version;
         if version != MEMBERSHIP_CERTIFICATE_VERSION {
             bail!("unsupported membership certificate version {version}");
         }
-        let network_id = take_uuid(&mut input, "membership network_id")?;
-        let subject_node_id = take_endpoint_id(&mut input, "membership subject_node_id")?;
-        let subject_connection_id = take_connection_id(&mut input, "membership connection id")?;
-        let role = MembershipRole::from_compact_byte(take_u8(&mut input, "membership role")?)?;
-        let port_count = take_u16(&mut input, "membership allowed port count")? as usize;
-        let mut allowed_ports = Vec::with_capacity(port_count);
-        for _ in 0..port_count {
-            allowed_ports.push(take_u16(&mut input, "membership allowed port")?);
-        }
-        let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
-        let issuer_node_id = take_endpoint_id(&mut input, "membership issuer_node_id")?;
-        let signature = take_signature(&mut input, "membership signature")?;
-        ensure_compact_record_consumed(input, "membership certificate")?;
+        let network_id = Uuid::from_bytes(message.network_id).to_string();
+        let subject_node_id =
+            decode_endpoint_id(&message.subject_node_id, "membership subject_node_id")?;
+        let subject_connection_id =
+            decode_connection_id(&message.subject_connection_id, "membership connection id")?;
+        let role = MembershipRole::from_message_byte(message.role)?;
+        let allowed_ports = normalize_allowed_ports(&message.allowed_ports)?;
+        let issuer_node_id =
+            decode_endpoint_id(&message.issuer_node_id, "membership issuer_node_id")?;
+        let signature = encode_signature(&Signature::from_bytes(&message.signature));
 
         Ok(Self {
             version,
@@ -3500,37 +3537,38 @@ impl NetworkPolicyCertificate {
             .context("network policy signature is invalid")?
             .to_bytes();
 
-        let mut bytes = Vec::with_capacity(COMPACT_POLICY_BYTES);
-        bytes.push(self.version);
-        bytes.extend_from_slice(network_id.as_bytes());
-        bytes.extend_from_slice(&max_peers.to_be_bytes());
-        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
-        bytes.extend_from_slice(&self.issued_at_unix.to_be_bytes());
-        bytes.extend_from_slice(&signature);
+        let message = NetworkPolicyCertificateMessage {
+            version: self.version,
+            network_id: *network_id.as_bytes(),
+            max_peers,
+            issuer_node_id: *self.issuer_node_id.as_bytes(),
+            issued_at_unix: self.issued_at_unix,
+            signature,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message)
+            .context("failed to encode network policy")?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = decode_compact_record(code, "network policy")?;
-        if bytes.len() != COMPACT_POLICY_BYTES {
-            bail!(
-                "network policy has {} bytes; expected {}",
-                bytes.len(),
-                COMPACT_POLICY_BYTES
-            );
-        }
-        let mut input = bytes.as_slice();
-        let version = take_u8(&mut input, "network policy")?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(code.trim())
+            .context("network policy is not valid base64")?;
+        let message =
+            rkyv::from_bytes::<NetworkPolicyCertificateMessage, rkyv::rancor::Error>(&bytes)
+                .context("network policy is not a valid rkyv message")?;
+
+        let version = message.version;
         if version != NETWORK_POLICY_VERSION {
             bail!("unsupported network policy version {version}");
         }
-        let network_id = take_uuid(&mut input, "network policy network_id")?;
-        let max_peers = take_u32(&mut input, "network policy max_peers")? as usize;
+        let network_id = Uuid::from_bytes(message.network_id).to_string();
+        let max_peers = message.max_peers as usize;
         validate_max_known_peers(max_peers)?;
-        let issuer_node_id = take_endpoint_id(&mut input, "network policy issuer_node_id")?;
-        let issued_at_unix = take_u64(&mut input, "network policy issued_at_unix")?;
-        let signature = take_signature(&mut input, "network policy signature")?;
-        ensure_compact_record_consumed(input, "network policy")?;
+        let issuer_node_id =
+            decode_endpoint_id(&message.issuer_node_id, "network policy issuer_node_id")?;
+        let issued_at_unix = message.issued_at_unix;
+        let signature = encode_signature(&Signature::from_bytes(&message.signature));
 
         Ok(Self {
             version,
@@ -3594,36 +3632,37 @@ impl RevocationCertificate {
             .context("revocation signature is invalid")?
             .to_bytes();
 
-        let mut bytes = Vec::with_capacity(COMPACT_REVOCATION_BYTES);
-        bytes.push(self.version);
-        bytes.extend_from_slice(network_id.as_bytes());
-        bytes.extend_from_slice(self.subject_node_id.as_bytes());
-        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
-        bytes.extend_from_slice(&self.issued_at_unix.to_be_bytes());
-        bytes.extend_from_slice(&signature);
+        let message = RevocationCertificateMessage {
+            version: self.version,
+            network_id: *network_id.as_bytes(),
+            subject_node_id: *self.subject_node_id.as_bytes(),
+            issuer_node_id: *self.issuer_node_id.as_bytes(),
+            issued_at_unix: self.issued_at_unix,
+            signature,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message)
+            .context("failed to encode revocation")?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = decode_compact_record(code, "revocation")?;
-        if bytes.len() != COMPACT_REVOCATION_BYTES {
-            bail!(
-                "revocation has {} bytes; expected {}",
-                bytes.len(),
-                COMPACT_REVOCATION_BYTES
-            );
-        }
-        let mut input = bytes.as_slice();
-        let version = take_u8(&mut input, "revocation")?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(code.trim())
+            .context("revocation is not valid base64")?;
+        let message = rkyv::from_bytes::<RevocationCertificateMessage, rkyv::rancor::Error>(&bytes)
+            .context("revocation is not a valid rkyv message")?;
+
+        let version = message.version;
         if version != REVOCATION_CERTIFICATE_VERSION {
             bail!("unsupported revocation version {version}");
         }
-        let network_id = take_uuid(&mut input, "revocation network_id")?;
-        let subject_node_id = take_endpoint_id(&mut input, "revocation subject_node_id")?;
-        let issuer_node_id = take_endpoint_id(&mut input, "revocation issuer_node_id")?;
-        let issued_at_unix = take_u64(&mut input, "revocation issued_at_unix")?;
-        let signature = take_signature(&mut input, "revocation signature")?;
-        ensure_compact_record_consumed(input, "revocation")?;
+        let network_id = Uuid::from_bytes(message.network_id).to_string();
+        let subject_node_id =
+            decode_endpoint_id(&message.subject_node_id, "revocation subject_node_id")?;
+        let issuer_node_id =
+            decode_endpoint_id(&message.issuer_node_id, "revocation issuer_node_id")?;
+        let issued_at_unix = message.issued_at_unix;
+        let signature = encode_signature(&Signature::from_bytes(&message.signature));
 
         Ok(Self {
             version,
@@ -4236,14 +4275,22 @@ impl Invite {
         let invite_secret: [u8; INVITE_SECRET_BYTES] = invite_secret
             .try_into()
             .map_err(|_| anyhow!("invite secret must decode to {INVITE_SECRET_BYTES} bytes"))?;
+        let invite_id: [u8; CONNECTION_ID_LEN] = self
+            .invite_id
+            .as_bytes()
+            .try_into()
+            .map_err(|_| anyhow!("invite id must be six base62 characters"))?;
 
-        let mut bytes = Vec::with_capacity(SHORT_INVITE_BYTES);
-        bytes.push(self.version);
-        bytes.extend_from_slice(network_id.as_bytes());
-        bytes.extend_from_slice(self.creator_node_id.as_bytes());
-        bytes.extend_from_slice(self.inviter_node_id.as_bytes());
-        bytes.extend_from_slice(self.invite_id.as_bytes());
-        bytes.extend_from_slice(&invite_secret);
+        let message = InviteMessage {
+            version: self.version,
+            network_id: *network_id.as_bytes(),
+            invite_id,
+            invite_secret,
+            creator_node_id: *self.creator_node_id.as_bytes(),
+            inviter_node_id: *self.inviter_node_id.as_bytes(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message)
+            .context("failed to encode invite code")?;
         Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
@@ -4251,33 +4298,24 @@ impl Invite {
         let bytes = URL_SAFE_NO_PAD
             .decode(code.trim())
             .context("invite code is not valid base64")?;
-        if bytes.len() != SHORT_INVITE_BYTES {
-            bail!(
-                "invite code has {} bytes; expected {}",
-                bytes.len(),
-                SHORT_INVITE_BYTES
-            );
-        }
-        let version = bytes[0];
+        let message = rkyv::from_bytes::<InviteMessage, rkyv::rancor::Error>(&bytes)
+            .context("invite code is not a valid rkyv invite message")?;
+
+        let version = message.version;
         if version != INVITE_VERSION {
             bail!("unsupported invite version {version}");
         }
 
-        let network_id = Uuid::from_bytes(
-            bytes[1..17]
-                .try_into()
-                .expect("slice length is checked by SHORT_INVITE_BYTES"),
-        )
-        .to_string();
-        let creator_node_id = decode_endpoint_id(&bytes[17..49], "creator node id")?;
-        let inviter_node_id = decode_endpoint_id(&bytes[49..81], "inviter node id")?;
-        let invite_id = std::str::from_utf8(&bytes[81..87])
+        let network_id = Uuid::from_bytes(message.network_id).to_string();
+        let creator_node_id = decode_endpoint_id(&message.creator_node_id, "creator node id")?;
+        let inviter_node_id = decode_endpoint_id(&message.inviter_node_id, "inviter node id")?;
+        let invite_id = std::str::from_utf8(&message.invite_id)
             .context("invite id is not valid UTF-8")?
             .to_string();
         if !is_valid_connection_id(&invite_id) {
             bail!("invite id must be six base62 characters");
         }
-        let invite_secret = URL_SAFE_NO_PAD.encode(&bytes[87..103]);
+        let invite_secret = URL_SAFE_NO_PAD.encode(message.invite_secret);
         Ok(Self {
             version,
             network_id,
@@ -4296,74 +4334,14 @@ fn decode_endpoint_id(bytes: &[u8], label: &str) -> Result<EndpointId> {
     EndpointId::from_bytes(&bytes).with_context(|| format!("{label} is invalid"))
 }
 
-fn decode_compact_record(code: &str, label: &str) -> Result<Vec<u8>> {
-    URL_SAFE_NO_PAD
-        .decode(code.trim())
-        .with_context(|| format!("{label} is not valid base64"))
-}
-
-fn take_bytes<'a>(input: &mut &'a [u8], len: usize, label: &str) -> Result<&'a [u8]> {
-    if input.len() < len {
-        bail!(
-            "{label} is truncated: need {len} bytes, have {}",
-            input.len()
-        );
-    }
-    let (head, tail) = input.split_at(len);
-    *input = tail;
-    Ok(head)
-}
-
-fn take_array<const N: usize>(input: &mut &[u8], label: &str) -> Result<[u8; N]> {
-    take_bytes(input, N, label)?
-        .try_into()
-        .map_err(|_| anyhow!("{label} must be {N} bytes"))
-}
-
-fn take_u8(input: &mut &[u8], label: &str) -> Result<u8> {
-    Ok(take_array::<1>(input, label)?[0])
-}
-
-fn take_u16(input: &mut &[u8], label: &str) -> Result<u16> {
-    Ok(u16::from_be_bytes(take_array(input, label)?))
-}
-
-fn take_u32(input: &mut &[u8], label: &str) -> Result<u32> {
-    Ok(u32::from_be_bytes(take_array(input, label)?))
-}
-
-fn take_u64(input: &mut &[u8], label: &str) -> Result<u64> {
-    Ok(u64::from_be_bytes(take_array(input, label)?))
-}
-
-fn take_uuid(input: &mut &[u8], label: &str) -> Result<String> {
-    Ok(Uuid::from_bytes(take_array(input, label)?).to_string())
-}
-
-fn take_endpoint_id(input: &mut &[u8], label: &str) -> Result<EndpointId> {
-    decode_endpoint_id(&take_array::<ENDPOINT_ID_BYTES>(input, label)?, label)
-}
-
-fn take_connection_id(input: &mut &[u8], label: &str) -> Result<String> {
-    let id = std::str::from_utf8(take_bytes(input, CONNECTION_ID_LEN, label)?)
+fn decode_connection_id(bytes: &[u8], label: &str) -> Result<String> {
+    let id = std::str::from_utf8(bytes)
         .with_context(|| format!("{label} is not valid utf-8"))?
         .to_string();
     if !is_valid_connection_id(&id) {
         bail!("{label} must be six base62 characters");
     }
     Ok(id)
-}
-
-fn take_signature(input: &mut &[u8], label: &str) -> Result<String> {
-    let signature = Signature::from_bytes(&take_array::<{ Signature::LENGTH }>(input, label)?);
-    Ok(encode_signature(&signature))
-}
-
-fn ensure_compact_record_consumed(input: &[u8], label: &str) -> Result<()> {
-    if !input.is_empty() {
-        bail!("{label} has {} trailing bytes", input.len());
-    }
-    Ok(())
 }
 
 #[cfg(not(test))]
