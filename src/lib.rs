@@ -61,7 +61,6 @@ const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
 const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
 const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
 const MAX_SHARED_REVOCATIONS: usize = 100;
-const INVITE_CODE_PREFIX: &str = "esp1_";
 const INVITE_ID_LEN: usize = 6;
 const INVITE_SECRET_BYTES: usize = 16;
 const SHORT_INVITE_BYTES: usize = 1 + 16 + 32 + 32 + INVITE_ID_LEN + INVITE_SECRET_BYTES;
@@ -4002,19 +4001,12 @@ impl Invite {
         bytes.extend_from_slice(self.inviter_node_id.as_bytes());
         bytes.extend_from_slice(self.invite_id.as_bytes());
         bytes.extend_from_slice(&invite_secret);
-        Ok(format!(
-            "{INVITE_CODE_PREFIX}{}",
-            URL_SAFE_NO_PAD.encode(bytes)
-        ))
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let encoded = code
-            .trim()
-            .strip_prefix(INVITE_CODE_PREFIX)
-            .ok_or_else(|| anyhow!("invite code must start with {INVITE_CODE_PREFIX}"))?;
         let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
+            .decode(code.trim())
             .context("invite code is not valid base64")?;
         if bytes.len() != SHORT_INVITE_BYTES {
             bail!(

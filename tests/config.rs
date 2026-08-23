@@ -39,8 +39,7 @@ fn invite_round_trips() {
 
     let code = invite.encode().unwrap();
     let decoded = Invite::decode(&code).unwrap();
-    assert!(code.starts_with("esp1_"));
-    assert!(code.len() < 150);
+    assert_eq!(code.len(), 138);
     assert_eq!(decoded.network_id, invite.network_id);
     assert_eq!(decoded.invite_id, invite.invite_id);
     assert_eq!(decoded.invite_secret, invite.invite_secret);
