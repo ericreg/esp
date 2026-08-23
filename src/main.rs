@@ -61,7 +61,14 @@ const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
 const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
 const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
 const MAX_SHARED_REVOCATIONS: usize = 100;
-const INVITE_ID_LEN: usize = 6;
+const ENDPOINT_ID_BYTES: usize = 32;
+const CONNECTION_ID_LEN: usize = 6;
+const INVITE_ID_LEN: usize = CONNECTION_ID_LEN;
+const COMPACT_POLICY_BYTES: usize = 1 + 16 + 4 + ENDPOINT_ID_BYTES + 8 + Signature::LENGTH;
+const COMPACT_REVOCATION_BYTES: usize =
+    1 + 16 + ENDPOINT_ID_BYTES + ENDPOINT_ID_BYTES + 8 + Signature::LENGTH;
+const COMPACT_MEMBERSHIP_MIN_BYTES: usize =
+    1 + 16 + ENDPOINT_ID_BYTES + CONNECTION_ID_LEN + 1 + 2 + ENDPOINT_ID_BYTES + Signature::LENGTH;
 const INVITE_SECRET_BYTES: usize = 16;
 const SHORT_INVITE_BYTES: usize = 1 + 16 + 32 + 32 + INVITE_ID_LEN + INVITE_SECRET_BYTES;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
@@ -209,6 +216,21 @@ impl MembershipRole {
     fn can_issue_invites(self) -> bool {
         matches!(self, Self::Admin)
     }
+
+    fn to_compact_byte(self) -> u8 {
+        match self {
+            Self::Admin => 1,
+            Self::Peer => 2,
+        }
+    }
+
+    fn from_compact_byte(byte: u8) -> Result<Self> {
+        match byte {
+            1 => Ok(Self::Admin),
+            2 => Ok(Self::Peer),
+            _ => bail!("unsupported membership role byte {byte}"),
+        }
+    }
 }
 
 impl std::fmt::Display for MembershipRole {
@@ -217,8 +239,7 @@ impl std::fmt::Display for MembershipRole {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipCertificate {
     pub version: u8,
     pub network_id: String,
@@ -230,8 +251,7 @@ pub struct MembershipCertificate {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicyCertificate {
     pub version: u8,
     pub network_id: String,
@@ -241,8 +261,7 @@ pub struct NetworkPolicyCertificate {
     pub signature: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevocationCertificate {
     pub version: u8,
     pub network_id: String,
@@ -250,6 +269,63 @@ pub struct RevocationCertificate {
     pub issuer_node_id: EndpointId,
     pub issued_at_unix: u64,
     pub signature: String,
+}
+
+impl Serialize for MembershipCertificate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_compact().map_err(serde::ser::Error::custom)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for MembershipCertificate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let code = String::deserialize(deserializer)?;
+        Self::decode_compact(&code).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for NetworkPolicyCertificate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_compact().map_err(serde::ser::Error::custom)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for NetworkPolicyCertificate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let code = String::deserialize(deserializer)?;
+        Self::decode_compact(&code).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for RevocationCertificate {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.encode_compact().map_err(serde::ser::Error::custom)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for RevocationCertificate {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let code = String::deserialize(deserializer)?;
+        Self::decode_compact(&code).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3264,6 +3340,70 @@ impl MembershipCertificate {
         Ok(membership)
     }
 
+    fn encode_compact(&self) -> Result<String> {
+        self.signature_payload()?;
+        let network_id =
+            Uuid::parse_str(&self.network_id).context("membership network_id must be a UUID")?;
+        if !is_valid_connection_id(&self.subject_connection_id) {
+            bail!("membership certificate has invalid connection id");
+        }
+        let allowed_ports = self.allowed_ports()?;
+        let port_count: u16 = allowed_ports
+            .len()
+            .try_into()
+            .map_err(|_| anyhow!("membership certificate has too many allowed ports"))?;
+        let signature = decode_signature(&self.signature)
+            .context("membership certificate signature is invalid")?
+            .to_bytes();
+
+        let mut bytes = Vec::with_capacity(COMPACT_MEMBERSHIP_MIN_BYTES + allowed_ports.len() * 2);
+        bytes.push(self.version);
+        bytes.extend_from_slice(network_id.as_bytes());
+        bytes.extend_from_slice(self.subject_node_id.as_bytes());
+        bytes.extend_from_slice(self.subject_connection_id.as_bytes());
+        bytes.push(self.role.to_compact_byte());
+        bytes.extend_from_slice(&port_count.to_be_bytes());
+        for port in allowed_ports {
+            bytes.extend_from_slice(&port.to_be_bytes());
+        }
+        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
+        bytes.extend_from_slice(&signature);
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn decode_compact(code: &str) -> Result<Self> {
+        let bytes = decode_compact_record(code, "membership certificate")?;
+        let mut input = bytes.as_slice();
+        let version = take_u8(&mut input, "membership certificate")?;
+        if version != MEMBERSHIP_CERTIFICATE_VERSION {
+            bail!("unsupported membership certificate version {version}");
+        }
+        let network_id = take_uuid(&mut input, "membership network_id")?;
+        let subject_node_id = take_endpoint_id(&mut input, "membership subject_node_id")?;
+        let subject_connection_id = take_connection_id(&mut input, "membership connection id")?;
+        let role = MembershipRole::from_compact_byte(take_u8(&mut input, "membership role")?)?;
+        let port_count = take_u16(&mut input, "membership allowed port count")? as usize;
+        let mut allowed_ports = Vec::with_capacity(port_count);
+        for _ in 0..port_count {
+            allowed_ports.push(take_u16(&mut input, "membership allowed port")?);
+        }
+        let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
+        let issuer_node_id = take_endpoint_id(&mut input, "membership issuer_node_id")?;
+        let signature = take_signature(&mut input, "membership signature")?;
+        ensure_compact_record_consumed(input, "membership certificate")?;
+
+        Ok(Self {
+            version,
+            network_id,
+            subject_node_id,
+            subject_connection_id,
+            role,
+            allowed_ports,
+            issuer_node_id,
+            signature,
+        })
+    }
+
     fn matches_peer(&self, cfg: &Config, peer: &Peer) -> Result<()> {
         self.allowed_ports()?;
         if self.network_id != cfg.network_id {
@@ -3348,6 +3488,60 @@ impl NetworkPolicyCertificate {
         Ok(policy)
     }
 
+    fn encode_compact(&self) -> Result<String> {
+        self.signature_payload()?;
+        let network_id = Uuid::parse_str(&self.network_id)
+            .context("network policy network_id must be a UUID")?;
+        let max_peers: u32 = self
+            .max_peers
+            .try_into()
+            .map_err(|_| anyhow!("network policy max_peers is too large"))?;
+        let signature = decode_signature(&self.signature)
+            .context("network policy signature is invalid")?
+            .to_bytes();
+
+        let mut bytes = Vec::with_capacity(COMPACT_POLICY_BYTES);
+        bytes.push(self.version);
+        bytes.extend_from_slice(network_id.as_bytes());
+        bytes.extend_from_slice(&max_peers.to_be_bytes());
+        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
+        bytes.extend_from_slice(&self.issued_at_unix.to_be_bytes());
+        bytes.extend_from_slice(&signature);
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn decode_compact(code: &str) -> Result<Self> {
+        let bytes = decode_compact_record(code, "network policy")?;
+        if bytes.len() != COMPACT_POLICY_BYTES {
+            bail!(
+                "network policy has {} bytes; expected {}",
+                bytes.len(),
+                COMPACT_POLICY_BYTES
+            );
+        }
+        let mut input = bytes.as_slice();
+        let version = take_u8(&mut input, "network policy")?;
+        if version != NETWORK_POLICY_VERSION {
+            bail!("unsupported network policy version {version}");
+        }
+        let network_id = take_uuid(&mut input, "network policy network_id")?;
+        let max_peers = take_u32(&mut input, "network policy max_peers")? as usize;
+        validate_max_known_peers(max_peers)?;
+        let issuer_node_id = take_endpoint_id(&mut input, "network policy issuer_node_id")?;
+        let issued_at_unix = take_u64(&mut input, "network policy issued_at_unix")?;
+        let signature = take_signature(&mut input, "network policy signature")?;
+        ensure_compact_record_consumed(input, "network policy")?;
+
+        Ok(Self {
+            version,
+            network_id,
+            max_peers,
+            issuer_node_id,
+            issued_at_unix,
+            signature,
+        })
+    }
+
     fn verify_signature(&self) -> Result<()> {
         let signature = decode_signature(&self.signature)?;
         let payload = self.signature_payload()?;
@@ -3390,6 +3584,55 @@ impl RevocationCertificate {
         let signature = issuer_key.sign(&revocation.signature_payload()?);
         revocation.signature = encode_signature(&signature);
         Ok(revocation)
+    }
+
+    fn encode_compact(&self) -> Result<String> {
+        self.signature_payload()?;
+        let network_id =
+            Uuid::parse_str(&self.network_id).context("revocation network_id must be a UUID")?;
+        let signature = decode_signature(&self.signature)
+            .context("revocation signature is invalid")?
+            .to_bytes();
+
+        let mut bytes = Vec::with_capacity(COMPACT_REVOCATION_BYTES);
+        bytes.push(self.version);
+        bytes.extend_from_slice(network_id.as_bytes());
+        bytes.extend_from_slice(self.subject_node_id.as_bytes());
+        bytes.extend_from_slice(self.issuer_node_id.as_bytes());
+        bytes.extend_from_slice(&self.issued_at_unix.to_be_bytes());
+        bytes.extend_from_slice(&signature);
+        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    }
+
+    fn decode_compact(code: &str) -> Result<Self> {
+        let bytes = decode_compact_record(code, "revocation")?;
+        if bytes.len() != COMPACT_REVOCATION_BYTES {
+            bail!(
+                "revocation has {} bytes; expected {}",
+                bytes.len(),
+                COMPACT_REVOCATION_BYTES
+            );
+        }
+        let mut input = bytes.as_slice();
+        let version = take_u8(&mut input, "revocation")?;
+        if version != REVOCATION_CERTIFICATE_VERSION {
+            bail!("unsupported revocation version {version}");
+        }
+        let network_id = take_uuid(&mut input, "revocation network_id")?;
+        let subject_node_id = take_endpoint_id(&mut input, "revocation subject_node_id")?;
+        let issuer_node_id = take_endpoint_id(&mut input, "revocation issuer_node_id")?;
+        let issued_at_unix = take_u64(&mut input, "revocation issued_at_unix")?;
+        let signature = take_signature(&mut input, "revocation signature")?;
+        ensure_compact_record_consumed(input, "revocation")?;
+
+        Ok(Self {
+            version,
+            network_id,
+            subject_node_id,
+            issuer_node_id,
+            issued_at_unix,
+            signature,
+        })
     }
 
     fn verify_signature(&self) -> Result<()> {
@@ -4051,6 +4294,76 @@ fn decode_endpoint_id(bytes: &[u8], label: &str) -> Result<EndpointId> {
         .try_into()
         .map_err(|_| anyhow!("{label} must be 32 bytes"))?;
     EndpointId::from_bytes(&bytes).with_context(|| format!("{label} is invalid"))
+}
+
+fn decode_compact_record(code: &str, label: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(code.trim())
+        .with_context(|| format!("{label} is not valid base64"))
+}
+
+fn take_bytes<'a>(input: &mut &'a [u8], len: usize, label: &str) -> Result<&'a [u8]> {
+    if input.len() < len {
+        bail!(
+            "{label} is truncated: need {len} bytes, have {}",
+            input.len()
+        );
+    }
+    let (head, tail) = input.split_at(len);
+    *input = tail;
+    Ok(head)
+}
+
+fn take_array<const N: usize>(input: &mut &[u8], label: &str) -> Result<[u8; N]> {
+    take_bytes(input, N, label)?
+        .try_into()
+        .map_err(|_| anyhow!("{label} must be {N} bytes"))
+}
+
+fn take_u8(input: &mut &[u8], label: &str) -> Result<u8> {
+    Ok(take_array::<1>(input, label)?[0])
+}
+
+fn take_u16(input: &mut &[u8], label: &str) -> Result<u16> {
+    Ok(u16::from_be_bytes(take_array(input, label)?))
+}
+
+fn take_u32(input: &mut &[u8], label: &str) -> Result<u32> {
+    Ok(u32::from_be_bytes(take_array(input, label)?))
+}
+
+fn take_u64(input: &mut &[u8], label: &str) -> Result<u64> {
+    Ok(u64::from_be_bytes(take_array(input, label)?))
+}
+
+fn take_uuid(input: &mut &[u8], label: &str) -> Result<String> {
+    Ok(Uuid::from_bytes(take_array(input, label)?).to_string())
+}
+
+fn take_endpoint_id(input: &mut &[u8], label: &str) -> Result<EndpointId> {
+    decode_endpoint_id(&take_array::<ENDPOINT_ID_BYTES>(input, label)?, label)
+}
+
+fn take_connection_id(input: &mut &[u8], label: &str) -> Result<String> {
+    let id = std::str::from_utf8(take_bytes(input, CONNECTION_ID_LEN, label)?)
+        .with_context(|| format!("{label} is not valid utf-8"))?
+        .to_string();
+    if !is_valid_connection_id(&id) {
+        bail!("{label} must be six base62 characters");
+    }
+    Ok(id)
+}
+
+fn take_signature(input: &mut &[u8], label: &str) -> Result<String> {
+    let signature = Signature::from_bytes(&take_array::<{ Signature::LENGTH }>(input, label)?);
+    Ok(encode_signature(&signature))
+}
+
+fn ensure_compact_record_consumed(input: &[u8], label: &str) -> Result<()> {
+    if !input.is_empty() {
+        bail!("{label} has {} trailing bytes", input.len());
+    }
+    Ok(())
 }
 
 #[cfg(not(test))]

@@ -295,6 +295,22 @@ revocations: []
 }
 
 #[test]
+fn config_serializes_signed_records_compactly() {
+    let secret_key = SecretKey::generate();
+    let cfg = creator_config(&secret_key);
+
+    let yaml = serde_yaml::to_string(&cfg).unwrap();
+    let decoded: Config = serde_yaml::from_str(&yaml).unwrap();
+
+    assert!(yaml.contains("network_policy: "));
+    assert!(yaml.contains("membership: "));
+    assert!(!yaml.contains("network_policy:\n  version:"));
+    assert!(!yaml.contains("membership:\n  version:"));
+    assert_eq!(decoded.network_policy, cfg.network_policy);
+    assert_eq!(decoded.membership, cfg.membership);
+}
+
+#[test]
 fn joined_admin_cannot_issue_invite_for_ungranted_port() {
     let creator_key = SecretKey::generate();
     let creator_cfg = creator_config(&creator_key);
