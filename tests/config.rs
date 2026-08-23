@@ -1,29 +1,43 @@
 use std::path::PathBuf;
 
 use esp::{
-    Config, DEFAULT_ALLOWED_PORT, Invite, InviteProof, MAX_SHARED_PEERS, MembershipCertificate,
-    Peer, encode_secret_key, ensure_port_allowed, is_valid_connection_id,
-    remember_advertised_peers,
+    Config, DEFAULT_ALLOWED_PORT, DEFAULT_MAX_KNOWN_PEERS, Invite, InviteProof, MAX_SHARED_PEERS,
+    MembershipCertificate, MembershipRole, NetworkPolicyCertificate, Peer, encode_secret_key,
+    ensure_port_allowed, is_valid_connection_id, remember_advertised_peers,
 };
 use iroh::SecretKey;
 
 fn issue_membership(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> MembershipCertificate {
-    MembershipCertificate::issue(cfg, issuer_key, subject, &[DEFAULT_ALLOWED_PORT]).unwrap()
+    MembershipCertificate::issue(
+        cfg,
+        issuer_key,
+        subject,
+        &[DEFAULT_ALLOWED_PORT],
+        MembershipRole::Admin,
+    )
+    .unwrap()
+}
+
+fn issue_policy(network_id: &str, issuer_key: &SecretKey) -> NetworkPolicyCertificate {
+    NetworkPolicyCertificate::issue_for_network(network_id, issuer_key, DEFAULT_MAX_KNOWN_PEERS)
+        .unwrap()
 }
 
 #[test]
 fn invite_round_trips() {
     let key = SecretKey::generate();
     let invite = Invite {
-        version: 2,
+        version: 1,
         network_id: "net".to_string(),
+        network_policy: issue_policy("net", &key),
         invite_id: "invite1".to_string(),
         invite_secret: "secret1".to_string(),
-        creator_node_id: Some(key.public()),
+        creator_node_id: key.public(),
         inviter_node_id: key.public(),
         inviter_name: "creator".to_string(),
         inviter_connection_id: "ABC123".to_string(),
         allowed_ports: vec![DEFAULT_ALLOWED_PORT],
+        role: MembershipRole::Peer,
         membership_chain: Vec::new(),
     };
 
@@ -37,11 +51,12 @@ fn invite_round_trips() {
     assert_eq!(decoded.inviter_name, invite.inviter_name);
     assert_eq!(decoded.inviter_connection_id, invite.inviter_connection_id);
     assert_eq!(decoded.allowed_ports, invite.allowed_ports);
+    assert_eq!(decoded.role, invite.role);
     assert_eq!(decoded.membership_chain, invite.membership_chain);
 }
 
 #[test]
-fn joined_member_issues_unique_invites_without_saving_codes() {
+fn joined_admin_issues_unique_invites_without_saving_codes() {
     let secret_key = SecretKey::generate();
     let creator_key = SecretKey::generate();
     let creator_peer = Peer {
@@ -52,8 +67,9 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
+        network_policy: issue_policy("net", &creator_key),
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(creator_key.public()),
+        creator_node_id: creator_key.public(),
         invite_proof: Some(InviteProof {
             invite_id: "ABC999".to_string(),
             invite_secret: "member-proof".to_string(),
@@ -64,6 +80,7 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
         peers: vec![creator_peer.clone()],
+        revocations: Vec::new(),
     };
     let joined_peer = Peer {
         node_id: secret_key.public(),
@@ -74,13 +91,18 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
     cfg.memberships
         .push(issue_membership(&cfg, &creator_key, &creator_peer));
 
-    let first = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
-    let second = cfg.issue_invite(&[DEFAULT_ALLOWED_PORT]).unwrap();
+    let first = cfg
+        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .unwrap();
+    let second = cfg
+        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .unwrap();
 
     assert_ne!(first.invite_id, second.invite_id);
     assert_eq!(cfg.invites.len(), 2);
     assert_eq!(cfg.invites[0].invite_id, first.invite_id);
     assert_eq!(cfg.invites[0].allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
+    assert_eq!(cfg.invites[0].role, MembershipRole::Peer);
     assert_ne!(cfg.invites[0].secret_hash, first.code);
     assert_eq!(
         Invite::decode(&second.code).unwrap().invite_id,
@@ -88,8 +110,9 @@ fn joined_member_issues_unique_invites_without_saving_codes() {
     );
     let decoded = Invite::decode(&first.code).unwrap();
     assert_eq!(decoded.inviter_node_id, secret_key.public());
-    assert_eq!(decoded.creator_node_id, Some(creator_key.public()));
+    assert_eq!(decoded.creator_node_id, creator_key.public());
     assert_eq!(decoded.allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
+    assert_eq!(decoded.role, MembershipRole::Peer);
     assert_eq!(decoded.membership_chain.len(), 2);
 }
 
@@ -101,8 +124,9 @@ fn resolving_duplicate_names_requires_connection_id() {
     let cfg = Config {
         version: 1,
         network_id: "net".to_string(),
+        network_policy: issue_policy("net", &secret_key),
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(secret_key.public()),
+        creator_node_id: secret_key.public(),
         invite_proof: None,
         membership: None,
         memberships: Vec::new(),
@@ -121,6 +145,7 @@ fn resolving_duplicate_names_requires_connection_id() {
                 connection_id: "FED654".to_string(),
             },
         ],
+        revocations: Vec::new(),
     };
 
     let err = cfg.resolve_peer("amd").unwrap_err().to_string();
@@ -140,8 +165,9 @@ fn connection_ids_are_case_sensitive_base62() {
     let cfg = Config {
         version: 1,
         network_id: "net".to_string(),
+        network_policy: issue_policy("net", &secret_key),
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(secret_key.public()),
+        creator_node_id: secret_key.public(),
         invite_proof: None,
         membership: None,
         memberships: Vec::new(),
@@ -153,6 +179,7 @@ fn connection_ids_are_case_sensitive_base62() {
             name: "amd".to_string(),
             connection_id: "aBc123".to_string(),
         }],
+        revocations: Vec::new(),
     };
 
     assert_eq!(cfg.resolve_peer("aBc123").unwrap().connection_id, "aBc123");
@@ -166,8 +193,9 @@ fn advertised_peer_lists_are_bounded() {
     let mut cfg = Config {
         version: 1,
         network_id: "net".to_string(),
+        network_policy: issue_policy("net", &secret_key),
         secret_key: encode_secret_key(&secret_key),
-        creator_node_id: Some(secret_key.public()),
+        creator_node_id: secret_key.public(),
         invite_proof: None,
         membership: None,
         memberships: Vec::new(),
@@ -175,6 +203,7 @@ fn advertised_peer_lists_are_bounded() {
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
         peers: Vec::new(),
+        revocations: Vec::new(),
     };
     let remote = Peer {
         node_id: remote_key.public(),

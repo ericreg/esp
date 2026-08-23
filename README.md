@@ -54,11 +54,18 @@ Allow additional localhost ports explicitly on that host:
 RUST_LOG=info esp daemon --ports 22,8000
 ```
 
-Invites are SSH-only by default too. To grant a peer additional ports, include
-them in the invite:
+Invites grant the `peer` role and SSH-only port access by default. To grant a
+peer additional ports, include them in the invite:
 
 ```sh
 esp invite --ports 22,80,8080
+```
+
+Only admins can create invites. To let a new host invite others, grant the
+`admin` role explicitly:
+
+```sh
+esp invite --role admin
 ```
 
 The effective policy is the intersection of the peer's signed invite grant and
@@ -71,7 +78,7 @@ esp join <invite-code>
 RUST_LOG=info esp
 ```
 
-To add a third machine, print a new invite on any already-joined machine:
+To add a third machine, print a new invite on any already-joined admin:
 
 ```sh
 esp invite
@@ -113,12 +120,14 @@ firewall rules do not need to allow inbound SSH from esp peers.
 ## Commands
 
 ```sh
-esp init              # create ~/.esp.yml if missing
+esp init --max-peers 100 # create ~/.esp.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
-esp invite --ports 22 # create and print another invite from this network member
-esp status            # show local node and peer details
+esp revoke TARGET     # revoke a peer by name, connection id, or node id as an admin
+esp policy --max-peers 100 # update the signed network peer cap as an admin
+esp invite --role peer --ports 22 # create and print an invite as an admin
+esp status            # show daemon state, local node, and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 ```
 
@@ -170,25 +179,42 @@ local TCP connection.
   must be explicitly allowed with `esp daemon --ports`.
 - Invite codes are bearer bootstrap secrets. A successful join consumes the
   invite on the inviter and returns a signed membership certificate for the new
-  node. Membership certificates include the peer's allowed port list in the
-  signed payload.
+  node. Membership certificates include the peer's role and allowed port list in
+  the signed payload.
+- The creator is an admin by default. Only admins can create invites, and admins
+  can grant either `peer` or `admin` with `esp invite --role`.
+- Network creation signs a peer storage policy. `esp init --max-peers` sets the
+  initial known-peer cap, and admins can update it with `esp policy --max-peers`.
 - Invites grant port access per peer with `esp invite --ports`. Proxy traffic is
   accepted only when both the peer's signed membership and the daemon's local
   `--ports` allow the requested port.
 - After join, peers authenticate esp membership with certificates signed by an
   existing member and chained back to the network creator. Normal proxy requests
   do not carry invite secrets.
-- When the daemon is running, local `esp invite`, `esp rename`, `esp status`,
-  and existing-config `esp init` commands use the daemon's private local control
-  socket instead of writing `~/.esp.yml` directly.
-- Peers share known peers and membership certificates during join and proxy
-  setup. Shared peer and certificate lists are capped at 100 entries, and
-  duplicate connection ids are rejected.
+- Admins can revoke peers with `esp revoke TARGET`. Revocations are signed,
+  persisted, shared during control/proxy sync, and cause the daemon to close
+  active connections from the revoked node.
+- `esp status` asks the daemon first and shows whether it is running. If the
+  daemon is unavailable, it falls back to the local config so peers can still
+  inspect their node identity. When the daemon is running, local `esp invite`,
+  `esp rename`, `esp revoke`, `esp policy`, and existing-config `esp init`
+  commands use the daemon's private local control socket instead of writing
+  `~/.esp.yml` directly.
+- Admins act as the peer directory. Generic hellos from peers carry only their
+  self identity, membership chain, signed network policy, and revocations; only
+  admins may advertise additional peers and membership certificates.
+- Shared peer, certificate, and revocation lists are capped per message, and
+  total stored peers/certificates are capped by signed network policy. Duplicate
+  connection ids are rejected.
+- The daemon bounds inbound work with small `try_send`-based worker queues,
+  per-peer concurrent connection quotas, handshake/setup read timeouts, and a
+  one-hour idle timeout on TCP proxy byte streams.
 - `~/.esp.yml` contains this host's private iroh key and, while a join is
   pending, may contain an unused invite proof. esp writes this file atomically
   with `0600` permissions and refuses to use configs with group/world access,
-  symlinks, or hard links. Keep it private and do not share the file between
-  machines.
+  symlinks, or hard links. Pending invite proofs are sent only during the
+  explicit join sync to the inviter. Keep the file private and do not share it
+  between machines.
 - Duplicate peer names are allowed, so use the six-character connection id when
   a name is ambiguous.
 
@@ -199,9 +225,10 @@ local TCP connection.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
 - The inviter accepts invited peers by checking the random network id and issued
-  invite, then signs a membership certificate bound to the joining node id and
-  connection id. Any joined host with a valid membership can issue invites, so
-  treat network members and invite codes as trusted.
-- Hosts exchange known peers only during join and proxy connection setup.
-- Shared peer and certificate lists are capped at 100 entries. This is for
-  security reasons. You can change this in the code.
+  invite, then signs a membership certificate bound to the joining node id,
+  connection id, role, and allowed ports. Only admins can issue invites.
+- Hosts exchange signed policy, minimal membership identity, and signed
+  revocations during join, control sync, and proxy connection setup. Admins can
+  additionally publish the peer directory.
+- Shared peer, certificate, and revocation lists are capped at 100 entries per
+  message. Total stored peers are capped by signed network policy.
