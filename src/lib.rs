@@ -272,8 +272,37 @@ struct Hello {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlResponse {
-    hello: Hello,
+    error: Option<String>,
+    hello: Option<Hello>,
     granted_membership: Option<MembershipCertificate>,
+}
+
+impl ControlResponse {
+    fn ok(hello: Hello, granted_membership: Option<MembershipCertificate>) -> Self {
+        Self {
+            error: None,
+            hello: Some(hello),
+            granted_membership,
+        }
+    }
+
+    fn err(error: impl Into<String>) -> Self {
+        Self {
+            error: Some(error.into()),
+            hello: None,
+            granted_membership: None,
+        }
+    }
+
+    fn into_ok(self) -> Result<(Hello, Option<MembershipCertificate>)> {
+        if let Some(error) = self.error {
+            bail!("remote esp control rejected request: {error}");
+        }
+        let hello = self
+            .hello
+            .ok_or_else(|| anyhow!("esp control response missing hello"))?;
+        Ok((hello, self.granted_membership))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1216,6 +1245,24 @@ async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
     result
 }
 
+async fn sync_pending_join_if_needed(path: &Path) -> Result<()> {
+    let cfg = Config::load(path)?;
+    if cfg.membership.is_some() {
+        return Ok(());
+    }
+    if cfg.invite_proof.is_none() {
+        bail!("local host has no membership certificate");
+    }
+    let inviter = cfg
+        .peers
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("pending join config is missing inviter peer"))?;
+    sync_joined_peer_once(path, &inviter)
+        .await
+        .context("failed to complete pending join sync")
+}
+
 fn spawn_control_sync_broadcast(endpoint: Endpoint, actor: ConfigActorHandle, peers: Vec<Peer>) {
     tokio::spawn(async move {
         for peer in peers {
@@ -1250,12 +1297,9 @@ async fn sync_known_peer_from_actor(
             .context("failed to finish esp control send stream")?;
 
         let response = read_control_response(&mut recv).await?;
+        let (remote, _) = response.into_ok()?;
         actor
-            .control_sync(
-                conn.remote_id(),
-                response.hello,
-                Some(expected_peer.clone()),
-            )
+            .control_sync(conn.remote_id(), remote, Some(expected_peer.clone()))
             .await?;
         Ok::<(), anyhow::Error>(())
     })
@@ -1477,7 +1521,7 @@ async fn sync_control_client(
             .context("failed to finish esp control send stream")?;
 
         let response = read_control_response(&mut recv).await?;
-        let remote = response.hello;
+        let (remote, granted_membership) = response.into_ok()?;
         let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, Some(expected_peer))?;
         let remote_memberships = memberships_from_hello(&remote);
         remember_control_peer(
@@ -1515,7 +1559,13 @@ async fn sync_control_client(
             remote_memberships.clone(),
             can_advertise_directory,
         )?;
-        if let Some(grant) = response.granted_membership {
+        let fallback_membership = if cfg.membership.is_none() {
+            let local_node_id = cfg.secret_key()?.public();
+            find_membership_by_subject(&cfg, &remote_memberships, local_node_id).cloned()
+        } else {
+            None
+        };
+        if let Some(grant) = granted_membership.or(fallback_membership) {
             remember_local_membership_grant(path, &mut cfg, grant, &remote_memberships)?;
         }
         Ok::<(), anyhow::Error>(())
@@ -1531,7 +1581,17 @@ async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Res
             .await
             .context("failed to accept esp control stream")?;
         let remote = read_control_hello(&mut recv).await?;
-        let response = actor.control_sync(conn.remote_id(), remote, None).await?;
+        let response = match actor.control_sync(conn.remote_id(), remote, None).await {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    peer = %conn.remote_id(),
+                    error = %err,
+                    "rejecting esp control sync"
+                );
+                ControlResponse::err(err.to_string())
+            }
+        };
         write_control_response(&mut send, &response).await?;
         send.finish()
             .context("failed to finish esp control send stream")?;
@@ -1924,10 +1984,7 @@ fn apply_control_sync(
         remote_memberships,
         can_advertise_directory,
     )?;
-    let response = ControlResponse {
-        hello: hello_from_config(cfg)?,
-        granted_membership,
-    };
+    let response = ControlResponse::ok(hello_from_config(cfg)?, granted_membership);
     Ok((response, revoked_nodes, changed))
 }
 
@@ -2058,7 +2115,12 @@ fn remember_control_peer_in_config(
         ensure_peer_capacity(cfg, peer.node_id)?;
         changed |= insert_verified_membership_chain(cfg, membership, extra_memberships)?;
         changed |= insert_peer(cfg, peer)?;
-        return Ok((None, changed));
+        let grant = if direct_membership.is_none() && invite_proof.is_some() {
+            Some(membership.clone())
+        } else {
+            None
+        };
+        return Ok((grant, changed));
     }
 
     let Some(granted_membership) = consume_invite_and_issue_membership(cfg, &peer, invite_proof)?
@@ -2359,7 +2421,9 @@ fn ensure_peer_capacity(cfg: &Config, node_id: EndpointId) -> Result<()> {
 }
 
 async fn proxy(target: String, port: u16) -> Result<()> {
-    let cfg = Config::load(&config_path()?)?;
+    let path = config_path()?;
+    sync_pending_join_if_needed(&path).await?;
+    let cfg = Config::load(&path)?;
     let peer = cfg.resolve_peer(&target)?.clone();
     let hello = hello_from_config(&cfg)?;
     let secret_key = cfg.secret_key()?;
@@ -3997,6 +4061,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn consumed_invite_regrants_existing_membership_to_same_node() {
+        let creator_key = SecretKey::generate();
+        let mut cfg = creator_config(&creator_key);
+        let invite = cfg
+            .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+            .unwrap();
+        let invite = Invite::decode(&invite.code).unwrap();
+        let proof = InviteProof {
+            invite_id: invite.invite_id,
+            invite_secret: invite.invite_secret,
+        };
+        let peer = Peer {
+            node_id: SecretKey::generate().public(),
+            name: "joined".to_string(),
+            connection_id: "DEF456".to_string(),
+        };
+
+        let (first_grant, first_changed) =
+            remember_control_peer_in_config(&mut cfg, peer.clone(), false, Some(&proof), None, &[])
+                .unwrap();
+        let first_grant = first_grant.unwrap();
+
+        let (retry_grant, retry_changed) =
+            remember_control_peer_in_config(&mut cfg, peer, false, Some(&proof), None, &[])
+                .unwrap();
+
+        assert!(first_changed);
+        assert!(cfg.invites.is_empty());
+        assert_eq!(retry_grant, Some(first_grant));
+        assert!(!retry_changed);
+    }
+
+    #[test]
+    fn control_response_error_is_reported_to_client() {
+        let err = ControlResponse::err("bad invite")
+            .into_ok()
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("remote esp control rejected request: bad invite"));
     }
 
     #[test]
