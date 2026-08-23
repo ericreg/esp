@@ -61,6 +61,10 @@ const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
 const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
 const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
 const MAX_SHARED_REVOCATIONS: usize = 100;
+const INVITE_CODE_PREFIX: &str = "esp1_";
+const INVITE_ID_LEN: usize = 6;
+const INVITE_SECRET_BYTES: usize = 16;
+const SHORT_INVITE_BYTES: usize = 1 + 16 + 32 + 32 + INVITE_ID_LEN + INVITE_SECRET_BYTES;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -169,16 +173,10 @@ pub struct InviteCode {
 pub struct Invite {
     pub version: u8,
     pub network_id: String,
-    pub network_policy: NetworkPolicyCertificate,
     pub invite_id: String,
     pub invite_secret: String,
     pub creator_node_id: EndpointId,
     pub inviter_node_id: EndpointId,
-    pub inviter_name: String,
-    pub inviter_connection_id: String,
-    pub allowed_ports: Vec<u16>,
-    pub role: MembershipRole,
-    pub membership_chain: Vec<MembershipCertificate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,7 +257,7 @@ pub struct RevocationCertificate {
 #[serde(deny_unknown_fields)]
 struct Hello {
     network_id: String,
-    network_policy: NetworkPolicyCertificate,
+    network_policy: Option<NetworkPolicyCertificate>,
     name: String,
     connection_id: String,
     invite_proof: Option<InviteProof>,
@@ -634,19 +632,13 @@ async fn join(invite_code: &str) -> Result<()> {
     }
 
     let invite = Invite::decode(invite_code)?;
-    let invite_allowed_ports = normalize_allowed_ports(&invite.allowed_ports)?;
-    let invite_role = invite.role;
     let secret_key = SecretKey::generate();
     let creator_node_id = invite.creator_node_id;
-    let mut connection_id = generate_connection_id();
-    while !invite.inviter_connection_id.is_empty() && connection_id == invite.inviter_connection_id
-    {
-        connection_id = generate_connection_id();
-    }
-    let cfg = Config {
+    let connection_id = generate_connection_id();
+    let mut cfg = Config {
         version: CONFIG_VERSION,
-        network_id: invite.network_id,
-        network_policy: invite.network_policy.clone(),
+        network_id: invite.network_id.clone(),
+        network_policy: pending_join_network_policy(&invite.network_id, creator_node_id),
         secret_key: encode_secret_key(&secret_key),
         creator_node_id,
         invite_proof: Some(InviteProof {
@@ -654,31 +646,45 @@ async fn join(invite_code: &str) -> Result<()> {
             invite_secret: invite.invite_secret,
         }),
         membership: None,
-        memberships: invite.membership_chain.clone(),
+        memberships: Vec::new(),
         name: default_connection_name(),
-        connection_id,
+        connection_id: connection_id.clone(),
         invites: Vec::new(),
         peers: vec![Peer {
             node_id: invite.inviter_node_id,
-            name: invite.inviter_name,
-            connection_id: invite.inviter_connection_id,
+            name: String::new(),
+            connection_id: String::new(),
         }],
         revocations: Vec::new(),
     };
-    cfg.save(&path)?;
+    let inviter = cfg.peers[0].clone();
+
+    sync_joined_config_once(&mut cfg, &inviter)
+        .await
+        .context("failed to complete join sync")?;
+    if path.exists() {
+        bail!(
+            "{} was created while joining; refusing to overwrite it",
+            path.display()
+        );
+    }
+    save_completed_join(&path, &cfg)?;
 
     println!("esp config: {}", path.display());
     println!("name: {}", cfg.name);
     println!("connection id: {}", cfg.connection_id);
     println!("node id: {}", secret_key.public());
     println!("peer: {}", cfg.peers[0].display_name());
-    println!("role: {invite_role}");
-    println!("allowed ports: {}", format_ports(&invite_allowed_ports));
-
-    match sync_joined_peer_once(&path, &cfg.peers[0]).await {
-        Ok(()) => println!("join sync: complete"),
-        Err(err) => println!("join sync: skipped ({err})"),
-    }
+    let membership = cfg
+        .membership
+        .as_ref()
+        .ok_or_else(|| anyhow!("join completed without local membership"))?;
+    println!("role: {}", membership.role);
+    println!(
+        "allowed ports: {}",
+        format_ports(&membership.allowed_ports()?)
+    );
+    println!("join sync: complete");
     Ok(())
 }
 
@@ -1222,7 +1228,15 @@ async fn handle_local_control_connection(
 }
 
 async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
-    let cfg = Config::load(path)?;
+    let mut cfg = Config::load(path)?;
+    let changed = sync_joined_config_once(&mut cfg, inviter).await?;
+    if changed {
+        save_completed_join(path, &cfg)?;
+    }
+    Ok(())
+}
+
+async fn sync_joined_config_once(cfg: &mut Config, inviter: &Peer) -> Result<bool> {
     let secret_key = cfg.secret_key()?;
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
@@ -1236,13 +1250,15 @@ async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
             .connect(inviter.node_id, CONTROL_ALPN)
             .await
             .with_context(|| format!("failed to connect to inviter {}", inviter.node_id))?;
-        sync_control_client(&conn, path, inviter, true).await?;
+        let changed = sync_control_config(&conn, cfg, inviter, true).await?;
         conn.close(GRACEFUL_CLOSE, b"synced");
-        Ok::<(), anyhow::Error>(())
+        Ok::<bool, anyhow::Error>(changed)
     }
     .await;
     endpoint.close().await;
-    result
+    let changed = result?;
+    ensure_completed_join(cfg)?;
+    Ok(changed)
 }
 
 async fn sync_pending_join_if_needed(path: &Path) -> Result<()> {
@@ -1261,6 +1277,35 @@ async fn sync_pending_join_if_needed(path: &Path) -> Result<()> {
     sync_joined_peer_once(path, &inviter)
         .await
         .context("failed to complete pending join sync")
+}
+
+fn save_completed_join(path: &Path, cfg: &Config) -> Result<()> {
+    ensure_completed_join(cfg)?;
+    cfg.save(path)
+}
+
+fn ensure_completed_join(cfg: &Config) -> Result<()> {
+    if cfg.membership.is_none() {
+        bail!("join did not complete; no membership certificate was returned");
+    }
+    if cfg.invite_proof.is_some() {
+        bail!("join did not complete; invite proof is still pending");
+    }
+    cfg.validate_local_config()
+}
+
+fn pending_join_network_policy(
+    network_id: &str,
+    creator_node_id: EndpointId,
+) -> NetworkPolicyCertificate {
+    NetworkPolicyCertificate {
+        version: NETWORK_POLICY_VERSION,
+        network_id: network_id.to_string(),
+        max_peers: DEFAULT_MAX_KNOWN_PEERS,
+        issuer_node_id: creator_node_id,
+        issued_at_unix: 0,
+        signature: String::new(),
+    }
 }
 
 fn spawn_control_sync_broadcast(endpoint: Endpoint, actor: ConfigActorHandle, peers: Vec<Peer>) {
@@ -1504,72 +1549,91 @@ async fn sync_control_client(
     expected_peer: &Peer,
     include_invite_proof: bool,
 ) -> Result<()> {
+    let mut cfg = Config::load(path)?;
+    if sync_control_config(conn, &mut cfg, expected_peer, include_invite_proof).await? {
+        cfg.save(path)?;
+    }
+    Ok(())
+}
+
+async fn sync_control_config(
+    conn: &Connection,
+    cfg: &mut Config,
+    expected_peer: &Peer,
+    include_invite_proof: bool,
+) -> Result<bool> {
     timeout(Duration::from_secs(15), async {
-        let mut cfg = Config::load(path)?;
         let (mut send, mut recv) = conn
             .open_bi()
             .await
             .context("failed to open esp control stream")?;
         let hello = if include_invite_proof {
-            join_hello_from_config(&cfg)
+            join_hello_from_config(cfg)
         } else {
-            hello_from_config(&cfg)
+            hello_from_config(cfg)
         }?;
         write_control_hello(&mut send, &hello).await?;
         finish_control_send(&mut send).await?;
 
         let response = read_control_response(&mut recv).await?;
         let (remote, granted_membership) = response.into_ok()?;
-        let peer = validate_peer_report(&cfg, conn.remote_id(), &remote, Some(expected_peer))?;
-        let remote_memberships = memberships_from_hello(&remote);
-        remember_control_peer(
-            path,
-            &mut cfg,
-            peer.clone(),
-            true,
-            remote.invite_proof.as_ref(),
-            remote.membership.as_ref(),
-            &remote_memberships,
-        )?;
-        remember_revocations_with_memberships(
-            path,
-            &mut cfg,
-            remote.revocations.clone(),
-            &remote_memberships,
-        )?;
-        remember_network_policy_with_memberships(
-            path,
-            &mut cfg,
-            remote.network_policy.clone(),
-            &remote_memberships,
-        )?;
-        let can_advertise_directory = peer_can_advertise_directory(
-            &cfg,
-            &peer,
-            remote.membership.as_ref(),
-            &remote_memberships,
-        )?;
-        remember_advertised_peers_with_memberships(
-            path,
-            &mut cfg,
-            &peer,
-            remote.peers,
-            remote_memberships.clone(),
-            can_advertise_directory,
-        )?;
-        let fallback_membership = if cfg.membership.is_none() {
-            let local_node_id = cfg.secret_key()?.public();
-            find_membership_by_subject(&cfg, &remote_memberships, local_node_id).cloned()
-        } else {
-            None
-        };
-        if let Some(grant) = granted_membership.or(fallback_membership) {
-            remember_local_membership_grant(path, &mut cfg, grant, &remote_memberships)?;
-        }
-        Ok::<(), anyhow::Error>(())
+        apply_control_response_to_config(
+            cfg,
+            conn.remote_id(),
+            remote,
+            expected_peer,
+            granted_membership,
+        )
     })
     .await
     .context("timed out waiting for esp control sync")?
+}
+
+fn apply_control_response_to_config(
+    cfg: &mut Config,
+    node_id: EndpointId,
+    remote: Hello,
+    expected_peer: &Peer,
+    granted_membership: Option<MembershipCertificate>,
+) -> Result<bool> {
+    let peer = validate_peer_report(cfg, node_id, &remote, Some(expected_peer))?;
+    let remote_memberships = memberships_from_hello(&remote);
+    let mut changed = if let Some(policy) = remote.network_policy.clone() {
+        remember_network_policy_in_config(cfg, policy, &remote_memberships)?
+    } else {
+        false
+    };
+    let (_, peer_changed) = remember_control_peer_in_config(
+        cfg,
+        peer.clone(),
+        true,
+        remote.invite_proof.as_ref(),
+        remote.membership.as_ref(),
+        &remote_memberships,
+    )?;
+    changed |= peer_changed;
+    let (revocations_changed, _) =
+        remember_revocations_in_config(cfg, remote.revocations.clone(), &remote_memberships)?;
+    changed |= revocations_changed;
+    let can_advertise_directory =
+        peer_can_advertise_directory(cfg, &peer, remote.membership.as_ref(), &remote_memberships)?;
+    changed |= remember_advertised_peers_in_config(
+        cfg,
+        &peer,
+        remote.peers,
+        remote_memberships.clone(),
+        can_advertise_directory,
+    )?;
+    let fallback_membership = if cfg.membership.is_none() {
+        let local_node_id = cfg.secret_key()?.public();
+        find_membership_by_subject(cfg, &remote_memberships, local_node_id).cloned()
+    } else {
+        None
+    };
+    if let Some(grant) = granted_membership.or(fallback_membership) {
+        changed |= remember_local_membership_grant_in_config(cfg, grant, &remote_memberships)?;
+    }
+    Ok(changed)
 }
 
 async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Result<()> {
@@ -1970,8 +2034,9 @@ fn apply_control_sync(
     let (revocations_changed, revoked_nodes) =
         remember_revocations_in_config(cfg, remote.revocations, &remote_memberships)?;
     changed |= revocations_changed;
-    changed |=
-        remember_network_policy_in_config(cfg, remote.network_policy.clone(), &remote_memberships)?;
+    if let Some(policy) = remote.network_policy.clone() {
+        changed |= remember_network_policy_in_config(cfg, policy, &remote_memberships)?;
+    }
     let can_advertise_directory =
         peer_can_advertise_directory(cfg, &peer, remote.membership.as_ref(), &remote_memberships)?;
     changed |= remember_advertised_peers_in_config(
@@ -1991,9 +2056,10 @@ fn apply_proxy_request(
     request: TcpProxyRequest,
 ) -> Result<(Peer, Vec<EndpointId>, bool, bool)> {
     let expected = cfg.peer_by_id(node_id).cloned();
+    let request_policy = request.network_policy.clone();
     let reported = Hello {
         network_id: request.network_id,
-        network_policy: request.network_policy.clone(),
+        network_policy: Some(request_policy.clone()),
         name: request.requester_name,
         connection_id: request.requester_connection_id,
         invite_proof: request.invite_proof,
@@ -2015,11 +2081,7 @@ fn apply_proxy_request(
     let (revocations_changed, revoked_nodes) =
         remember_revocations_in_config(cfg, reported.revocations, &remote_memberships)?;
     changed |= revocations_changed;
-    changed |= remember_network_policy_in_config(
-        cfg,
-        reported.network_policy.clone(),
-        &remote_memberships,
-    )?;
+    changed |= remember_network_policy_in_config(cfg, request_policy, &remote_memberships)?;
     let can_advertise_directory = peer_can_advertise_directory(
         cfg,
         &peer,
@@ -2072,29 +2134,6 @@ fn validate_peer_report(
         name: remote_name,
         connection_id: remote.connection_id.clone(),
     })
-}
-
-fn remember_control_peer(
-    path: &Path,
-    cfg: &mut Config,
-    peer: Peer,
-    was_expected: bool,
-    invite_proof: Option<&InviteProof>,
-    direct_membership: Option<&MembershipCertificate>,
-    extra_memberships: &[MembershipCertificate],
-) -> Result<Option<MembershipCertificate>> {
-    let (granted_membership, changed) = remember_control_peer_in_config(
-        cfg,
-        peer,
-        was_expected,
-        invite_proof,
-        direct_membership,
-        extra_memberships,
-    )?;
-    if changed {
-        cfg.save(path)?;
-    }
-    Ok(granted_membership)
 }
 
 fn remember_control_peer_in_config(
@@ -2247,18 +2286,6 @@ fn remember_advertised_peers_in_config(
     Ok(changed)
 }
 
-fn remember_network_policy_with_memberships(
-    path: &Path,
-    cfg: &mut Config,
-    policy: NetworkPolicyCertificate,
-    extra_memberships: &[MembershipCertificate],
-) -> Result<()> {
-    if remember_network_policy_in_config(cfg, policy, extra_memberships)? {
-        cfg.save(path)?;
-    }
-    Ok(())
-}
-
 fn remember_network_policy_in_config(
     cfg: &mut Config,
     policy: NetworkPolicyCertificate,
@@ -2276,20 +2303,6 @@ fn remember_network_policy_in_config(
     cfg.network_policy = policy;
     enforce_state_caps(cfg)?;
     Ok(true)
-}
-
-fn remember_revocations_with_memberships(
-    path: &Path,
-    cfg: &mut Config,
-    revocations: Vec<RevocationCertificate>,
-    extra_memberships: &[MembershipCertificate],
-) -> Result<Vec<EndpointId>> {
-    let (changed, revoked_nodes) =
-        remember_revocations_in_config(cfg, revocations, extra_memberships)?;
-    if changed {
-        cfg.save(path)?;
-    }
-    Ok(revoked_nodes)
 }
 
 fn remember_revocations_in_config(
@@ -2441,7 +2454,7 @@ async fn proxy(target: String, port: u16) -> Result<()> {
         .context("failed to open TCP proxy stream")?;
     let request = TcpProxyRequest {
         network_id: hello.network_id,
-        network_policy: hello.network_policy,
+        network_policy: cfg.network_policy.clone(),
         requester_name: hello.name,
         requester_connection_id: hello.connection_id,
         invite_proof: None,
@@ -3058,23 +3071,15 @@ impl Config {
         let allowed_ports = normalize_allowed_ports(allowed_ports)?;
         self.ensure_can_issue_invite(&allowed_ports)?;
         let secret_key = self.secret_key()?;
-        let network_policy =
-            NetworkPolicyCertificate::issue(self, &secret_key, self.max_known_peers()?)?;
         let invite_id = generate_connection_id();
         let invite_secret = generate_invite_secret();
         let invite = Invite {
             version: INVITE_VERSION,
             network_id: self.network_id.clone(),
-            network_policy,
             invite_id: invite_id.clone(),
             invite_secret: invite_secret.clone(),
             creator_node_id: self.creator_node_id,
             inviter_node_id: secret_key.public(),
-            inviter_name: self.name.clone(),
-            inviter_connection_id: self.connection_id.clone(),
-            allowed_ports: allowed_ports.clone(),
-            role,
-            membership_chain: self.membership_chain_for(secret_key.public())?,
         };
         let issued = InviteCode {
             invite_id: invite_id.clone(),
@@ -3413,7 +3418,7 @@ fn hello_from_config(cfg: &Config) -> Result<Hello> {
     let can_advertise_directory = cfg.can_advertise_directory();
     Ok(Hello {
         network_id: cfg.network_id.clone(),
-        network_policy: cfg.network_policy.clone(),
+        network_policy: Some(cfg.network_policy.clone()),
         name: cfg.name.clone(),
         connection_id: cfg.connection_id.clone(),
         invite_proof: None,
@@ -3442,7 +3447,7 @@ fn join_hello_from_config(cfg: &Config) -> Result<Hello> {
         .ok_or_else(|| anyhow!("joined config missing invite proof"))?;
     Ok(Hello {
         network_id: cfg.network_id.clone(),
-        network_policy: cfg.network_policy.clone(),
+        network_policy: None,
         name: cfg.name.clone(),
         connection_id: cfg.connection_id.clone(),
         invite_proof: Some(invite_proof),
@@ -3463,18 +3468,6 @@ fn memberships_from_hello(hello: &Hello) -> Vec<MembershipCertificate> {
         memberships.push(membership.clone());
     }
     memberships
-}
-
-fn remember_local_membership_grant(
-    path: &Path,
-    cfg: &mut Config,
-    membership: MembershipCertificate,
-    extra_memberships: &[MembershipCertificate],
-) -> Result<()> {
-    if remember_local_membership_grant_in_config(cfg, membership, extra_memberships)? {
-        cfg.save(path)?;
-    }
-    Ok(())
 }
 
 fn remember_local_membership_grant_in_config(
@@ -3942,30 +3935,97 @@ fn decode_secret_key(encoded: &str) -> Result<SecretKey> {
 
 impl Invite {
     pub fn encode(&self) -> Result<String> {
-        let yaml = serde_yaml::to_string(self)?;
-        Ok(URL_SAFE_NO_PAD.encode(yaml))
+        if self.version != INVITE_VERSION {
+            bail!("unsupported invite version {}", self.version);
+        }
+        let network_id =
+            Uuid::parse_str(&self.network_id).context("invite network_id must be a UUID")?;
+        if !is_valid_connection_id(&self.invite_id) {
+            bail!("invite id must be six base62 characters");
+        }
+        let invite_secret = URL_SAFE_NO_PAD
+            .decode(self.invite_secret.trim())
+            .context("invite secret is not valid base64")?;
+        let invite_secret: [u8; INVITE_SECRET_BYTES] = invite_secret
+            .try_into()
+            .map_err(|_| anyhow!("invite secret must decode to {INVITE_SECRET_BYTES} bytes"))?;
+
+        let mut bytes = Vec::with_capacity(SHORT_INVITE_BYTES);
+        bytes.push(self.version);
+        bytes.extend_from_slice(network_id.as_bytes());
+        bytes.extend_from_slice(self.creator_node_id.as_bytes());
+        bytes.extend_from_slice(self.inviter_node_id.as_bytes());
+        bytes.extend_from_slice(self.invite_id.as_bytes());
+        bytes.extend_from_slice(&invite_secret);
+        Ok(format!(
+            "{INVITE_CODE_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(bytes)
+        ))
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let yaml = URL_SAFE_NO_PAD
-            .decode(code.trim())
-            .context("invite is not valid base64")?;
-        let invite: Self = serde_yaml::from_slice(&yaml).context("invite is not valid esp data")?;
-        if invite.version != INVITE_VERSION {
-            bail!("unsupported invite version {}", invite.version);
+        let encoded = code
+            .trim()
+            .strip_prefix(INVITE_CODE_PREFIX)
+            .ok_or_else(|| anyhow!("invite code must start with {INVITE_CODE_PREFIX}"))?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .context("invite code is not valid base64")?;
+        if bytes.len() != SHORT_INVITE_BYTES {
+            bail!(
+                "invite code has {} bytes; expected {}",
+                bytes.len(),
+                SHORT_INVITE_BYTES
+            );
         }
-        Ok(invite)
+        let version = bytes[0];
+        if version != INVITE_VERSION {
+            bail!("unsupported invite version {version}");
+        }
+
+        let network_id = Uuid::from_bytes(
+            bytes[1..17]
+                .try_into()
+                .expect("slice length is checked by SHORT_INVITE_BYTES"),
+        )
+        .to_string();
+        let creator_node_id = decode_endpoint_id(&bytes[17..49], "creator node id")?;
+        let inviter_node_id = decode_endpoint_id(&bytes[49..81], "inviter node id")?;
+        let invite_id = std::str::from_utf8(&bytes[81..87])
+            .context("invite id is not valid UTF-8")?
+            .to_string();
+        if !is_valid_connection_id(&invite_id) {
+            bail!("invite id must be six base62 characters");
+        }
+        let invite_secret = URL_SAFE_NO_PAD.encode(&bytes[87..103]);
+        Ok(Self {
+            version,
+            network_id,
+            invite_id,
+            invite_secret,
+            creator_node_id,
+            inviter_node_id,
+        })
     }
+}
+
+fn decode_endpoint_id(bytes: &[u8], label: &str) -> Result<EndpointId> {
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("{label} must be 32 bytes"))?;
+    EndpointId::from_bytes(&bytes).with_context(|| format!("{label} is invalid"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
+
     fn creator_config(secret_key: &SecretKey) -> Config {
         create_creator_config(
             secret_key,
-            "net".to_string(),
+            TEST_NETWORK_ID.to_string(),
             "creator".to_string(),
             "ABC123".to_string(),
             DEFAULT_MAX_KNOWN_PEERS,
@@ -4015,6 +4075,8 @@ mod tests {
             invite_id: invite.invite_id,
             invite_secret: invite.invite_secret,
         };
+        let issued_allowed_ports = cfg.invites[0].allowed_ports.clone();
+        let issued_role = cfg.invites[0].role;
         let peer = Peer {
             node_id: SecretKey::generate().public(),
             name: "joined".to_string(),
@@ -4025,8 +4087,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(invite.allowed_ports, vec![DEFAULT_ALLOWED_PORT, 8080]);
-        assert_eq!(invite.role, MembershipRole::Admin);
+        assert_eq!(issued_allowed_ports, vec![DEFAULT_ALLOWED_PORT, 8080]);
+        assert_eq!(issued_role, MembershipRole::Admin);
         assert_eq!(granted.allowed_ports, vec![DEFAULT_ALLOWED_PORT, 8080]);
         assert_eq!(granted.role, MembershipRole::Admin);
         verify_membership_chain(&cfg, &granted, &[]).unwrap();
@@ -4035,7 +4097,7 @@ mod tests {
         tampered.allowed_ports.push(80);
         assert!(verify_membership_chain(&cfg, &tampered, &[]).is_err());
 
-        let mut tampered = invite.membership_chain[0].clone();
+        let mut tampered = cfg.membership.clone().unwrap();
         tampered.role = MembershipRole::Peer;
         assert!(verify_membership_chain(&cfg, &tampered, &[]).is_err());
     }
@@ -4117,6 +4179,43 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_join_is_not_saved() {
+        let creator_key = SecretKey::generate();
+        let creator_cfg = creator_config(&creator_key);
+        let member_key = SecretKey::generate();
+        let pending = Config {
+            version: 1,
+            network_id: TEST_NETWORK_ID.to_string(),
+            network_policy: creator_cfg.network_policy.clone(),
+            secret_key: encode_secret_key(&member_key),
+            creator_node_id: creator_key.public(),
+            invite_proof: Some(InviteProof {
+                invite_id: "ABC999".to_string(),
+                invite_secret: "secret".to_string(),
+            }),
+            membership: None,
+            memberships: vec![creator_cfg.membership.clone().unwrap()],
+            name: "member".to_string(),
+            connection_id: "DEF456".to_string(),
+            invites: Vec::new(),
+            peers: vec![Peer {
+                node_id: creator_key.public(),
+                name: "creator".to_string(),
+                connection_id: "ABC123".to_string(),
+            }],
+            revocations: Vec::new(),
+        };
+        let path = temp_config_path("incomplete-join");
+
+        let err = save_completed_join(&path, &pending)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("join did not complete"));
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn pending_invite_proof_is_only_sent_in_join_hello() {
         let creator_key = SecretKey::generate();
         let mut cfg = creator_config(&creator_key);
@@ -4180,7 +4279,7 @@ revocations: []
         };
         let mut member_cfg = Config {
             version: 1,
-            network_id: "net".to_string(),
+            network_id: TEST_NETWORK_ID.to_string(),
             network_policy: creator_cfg.network_policy.clone(),
             secret_key: encode_secret_key(&member_key),
             creator_node_id: creator_key.public(),
@@ -4228,7 +4327,7 @@ revocations: []
         };
         let mut member_cfg = Config {
             version: 1,
-            network_id: "net".to_string(),
+            network_id: TEST_NETWORK_ID.to_string(),
             network_policy: creator_cfg.network_policy.clone(),
             secret_key: encode_secret_key(&member_key),
             creator_node_id: creator_key.public(),
@@ -4410,7 +4509,7 @@ revocations: []
         };
         let mut member_cfg = Config {
             version: 1,
-            network_id: "net".to_string(),
+            network_id: TEST_NETWORK_ID.to_string(),
             network_policy: creator_cfg.network_policy.clone(),
             secret_key: encode_secret_key(&member_key),
             creator_node_id: creator_key.public(),
@@ -4596,7 +4695,7 @@ revocations: []
         };
         let member_cfg = Config {
             version: 1,
-            network_id: "net".to_string(),
+            network_id: TEST_NETWORK_ID.to_string(),
             network_policy: creator_cfg.network_policy.clone(),
             secret_key: encode_secret_key(&member_key),
             creator_node_id: creator_key.public(),
@@ -4751,7 +4850,7 @@ revocations: []
         .unwrap();
         let mut admin_cfg = Config {
             version: 1,
-            network_id: "net".to_string(),
+            network_id: TEST_NETWORK_ID.to_string(),
             network_policy: creator_cfg.network_policy.clone(),
             secret_key: encode_secret_key(&admin_key),
             creator_node_id: creator_key.public(),
@@ -4794,14 +4893,13 @@ revocations: []
         };
         let path = temp_config_path("actor-race");
         cfg.save(&path).unwrap();
-        let network_policy = cfg.network_policy.clone();
         let actor = spawn_config_actor(path.clone(), cfg);
 
         let first_key = SecretKey::generate();
         let second_key = SecretKey::generate();
         let first_hello = Hello {
-            network_id: "net".to_string(),
-            network_policy: network_policy.clone(),
+            network_id: TEST_NETWORK_ID.to_string(),
+            network_policy: None,
             name: "joined-one".to_string(),
             connection_id: "DEF456".to_string(),
             invite_proof: Some(proof.clone()),
@@ -4811,8 +4909,8 @@ revocations: []
             revocations: Vec::new(),
         };
         let second_hello = Hello {
-            network_id: "net".to_string(),
-            network_policy,
+            network_id: TEST_NETWORK_ID.to_string(),
+            network_policy: None,
             name: "joined-two".to_string(),
             connection_id: "FED654".to_string(),
             invite_proof: Some(proof),
@@ -4913,9 +5011,10 @@ revocations: []
         };
         let invite = Invite::decode(&code).unwrap();
         let report = actor.status().await.unwrap();
+        let saved = Config::load(&path).unwrap();
 
         assert_eq!(report.invites, vec![invite.invite_id]);
-        assert_eq!(invite.role, MembershipRole::Admin);
+        assert_eq!(saved.invites[0].role, MembershipRole::Admin);
 
         server.abort();
         endpoint.close().await;

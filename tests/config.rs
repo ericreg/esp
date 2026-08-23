@@ -7,6 +7,8 @@ use esp::{
 };
 use iroh::SecretKey;
 
+const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
+
 fn issue_membership(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> MembershipCertificate {
     MembershipCertificate::issue(
         cfg,
@@ -28,31 +30,22 @@ fn invite_round_trips() {
     let key = SecretKey::generate();
     let invite = Invite {
         version: 1,
-        network_id: "net".to_string(),
-        network_policy: issue_policy("net", &key),
-        invite_id: "invite1".to_string(),
-        invite_secret: "secret1".to_string(),
+        network_id: TEST_NETWORK_ID.to_string(),
+        invite_id: "ABC123".to_string(),
+        invite_secret: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
         creator_node_id: key.public(),
         inviter_node_id: key.public(),
-        inviter_name: "creator".to_string(),
-        inviter_connection_id: "ABC123".to_string(),
-        allowed_ports: vec![DEFAULT_ALLOWED_PORT],
-        role: MembershipRole::Peer,
-        membership_chain: Vec::new(),
     };
 
     let code = invite.encode().unwrap();
     let decoded = Invite::decode(&code).unwrap();
+    assert!(code.starts_with("esp1_"));
+    assert!(code.len() < 150);
     assert_eq!(decoded.network_id, invite.network_id);
     assert_eq!(decoded.invite_id, invite.invite_id);
     assert_eq!(decoded.invite_secret, invite.invite_secret);
     assert_eq!(decoded.creator_node_id, invite.creator_node_id);
     assert_eq!(decoded.inviter_node_id, invite.inviter_node_id);
-    assert_eq!(decoded.inviter_name, invite.inviter_name);
-    assert_eq!(decoded.inviter_connection_id, invite.inviter_connection_id);
-    assert_eq!(decoded.allowed_ports, invite.allowed_ports);
-    assert_eq!(decoded.role, invite.role);
-    assert_eq!(decoded.membership_chain, invite.membership_chain);
 }
 
 #[test]
@@ -66,8 +59,8 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
     };
     let mut cfg = Config {
         version: 1,
-        network_id: "net".to_string(),
-        network_policy: issue_policy("net", &creator_key),
+        network_id: TEST_NETWORK_ID.to_string(),
+        network_policy: issue_policy(TEST_NETWORK_ID, &creator_key),
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: creator_key.public(),
         invite_proof: Some(InviteProof {
@@ -109,11 +102,9 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         second.invite_id
     );
     let decoded = Invite::decode(&first.code).unwrap();
+    assert!(first.code.len() < 150);
     assert_eq!(decoded.inviter_node_id, secret_key.public());
     assert_eq!(decoded.creator_node_id, creator_key.public());
-    assert_eq!(decoded.allowed_ports, vec![DEFAULT_ALLOWED_PORT]);
-    assert_eq!(decoded.role, MembershipRole::Peer);
-    assert_eq!(decoded.membership_chain.len(), 2);
 }
 
 #[test]
@@ -123,8 +114,8 @@ fn resolving_duplicate_names_requires_connection_id() {
     let second_peer_key = SecretKey::generate();
     let cfg = Config {
         version: 1,
-        network_id: "net".to_string(),
-        network_policy: issue_policy("net", &secret_key),
+        network_id: TEST_NETWORK_ID.to_string(),
+        network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: secret_key.public(),
         invite_proof: None,
@@ -164,8 +155,8 @@ fn connection_ids_are_case_sensitive_base62() {
     let peer_key = SecretKey::generate();
     let cfg = Config {
         version: 1,
-        network_id: "net".to_string(),
-        network_policy: issue_policy("net", &secret_key),
+        network_id: TEST_NETWORK_ID.to_string(),
+        network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: secret_key.public(),
         invite_proof: None,
@@ -192,8 +183,8 @@ fn advertised_peer_lists_are_bounded() {
     let remote_key = SecretKey::generate();
     let mut cfg = Config {
         version: 1,
-        network_id: "net".to_string(),
-        network_policy: issue_policy("net", &secret_key),
+        network_id: TEST_NETWORK_ID.to_string(),
+        network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
         creator_node_id: secret_key.public(),
         invite_proof: None,

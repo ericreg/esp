@@ -177,8 +177,10 @@ local TCP connection.
 
 - The daemon allows proxying to local port 22 only by default. Additional ports
   must be explicitly allowed with `esp daemon --ports`.
-- Invite codes are bearer bootstrap secrets. A successful join consumes the
-  invite on the inviter and returns a signed membership certificate for the new
+- Invite codes are short bearer bootstrap secrets containing the network id,
+  inviter node id, invite id, and invite secret. A successful join connects to
+  the inviter, consumes the invite there, fetches signed network policy and
+  membership chain data, and returns a signed membership certificate for the new
   node. Membership certificates include the peer's role and allowed port list in
   the signed payload.
 - The creator is an admin by default. Only admins can create invites, and admins
@@ -225,8 +227,8 @@ local TCP connection.
 - The daemon allows proxying to local port 22 only unless additional ports are
   passed with `esp daemon --ports`.
 - The inviter accepts invited peers by checking the random network id and issued
-  invite, then signs a membership certificate bound to the joining node id,
-  connection id, role, and allowed ports. Only admins can issue invites.
+  invite proof, then signs a membership certificate bound to the joining node
+  id, connection id, role, and allowed ports. Only admins can issue invites.
 - Hosts exchange signed policy, minimal membership identity, and signed
   revocations during join, control sync, and proxy connection setup. Admins can
   additionally publish the peer directory.
