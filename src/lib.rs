@@ -1293,8 +1293,7 @@ async fn sync_known_peer_from_actor(
             .context("failed to open esp control stream")?;
         let hello = actor.hello().await?;
         write_control_hello(&mut send, &hello).await?;
-        send.finish()
-            .context("failed to finish esp control send stream")?;
+        finish_control_send(&mut send).await?;
 
         let response = read_control_response(&mut recv).await?;
         let (remote, _) = response.into_ok()?;
@@ -1517,8 +1516,7 @@ async fn sync_control_client(
             hello_from_config(&cfg)
         }?;
         write_control_hello(&mut send, &hello).await?;
-        send.finish()
-            .context("failed to finish esp control send stream")?;
+        finish_control_send(&mut send).await?;
 
         let response = read_control_response(&mut recv).await?;
         let (remote, granted_membership) = response.into_ok()?;
@@ -1593,8 +1591,7 @@ async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Res
             }
         };
         write_control_response(&mut send, &response).await?;
-        send.finish()
-            .context("failed to finish esp control send stream")?;
+        finish_control_send(&mut send).await?;
         Ok::<(), anyhow::Error>(())
     })
     .await
@@ -2680,6 +2677,19 @@ async fn write_control_response(
         "esp control response",
     )
     .await
+}
+
+async fn finish_control_send(send: &mut iroh::endpoint::SendStream) -> Result<()> {
+    send.finish()
+        .context("failed to finish esp control send stream")?;
+    if let Some(code) = send
+        .stopped()
+        .await
+        .context("failed waiting for esp control send stream acknowledgement")?
+    {
+        bail!("esp control send stream stopped by peer with code {code}");
+    }
+    Ok(())
 }
 
 async fn read_yaml_frame<R, T>(recv: &mut R, max_len: usize, label: &str) -> Result<T>
