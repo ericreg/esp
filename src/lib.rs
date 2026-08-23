@@ -1598,7 +1598,14 @@ fn apply_control_response_to_config(
 ) -> Result<bool> {
     let peer = validate_peer_report(cfg, node_id, &remote, Some(expected_peer))?;
     let remote_memberships = memberships_from_hello(&remote);
+    let pending_join = cfg.membership.is_none() && cfg.invite_proof.is_some();
     let mut changed = if let Some(policy) = remote.network_policy.clone() {
+        if pending_join
+            && let Some(issuer_membership) =
+                find_membership_by_subject(cfg, &remote_memberships, policy.issuer_node_id).cloned()
+        {
+            remember_bootstrap_membership_chain(cfg, &issuer_membership, &remote_memberships)?;
+        }
         remember_network_policy_in_config(cfg, policy, &remote_memberships)?
     } else {
         false
@@ -3554,6 +3561,25 @@ fn insert_verified_membership_chain(
     }
 }
 
+fn remember_bootstrap_membership_chain(
+    cfg: &mut Config,
+    membership: &MembershipCertificate,
+    extra_memberships: &[MembershipCertificate],
+) -> Result<bool> {
+    verify_membership_chain(cfg, membership, extra_memberships)?;
+    let mut changed = false;
+    let mut current = membership.clone();
+    loop {
+        changed |= insert_bootstrap_membership(cfg, current.clone())?;
+        if current.subject_node_id == current.issuer_node_id {
+            return Ok(changed);
+        }
+        current = find_membership_by_subject(cfg, extra_memberships, current.issuer_node_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing membership issuer {}", current.issuer_node_id))?;
+    }
+}
+
 fn verify_membership_chain(
     cfg: &Config,
     membership: &MembershipCertificate,
@@ -3713,7 +3739,33 @@ fn insert_membership(cfg: &mut Config, membership: MembershipCertificate) -> Res
     if membership.subject_node_id == cfg.secret_key()?.public() {
         return Ok(false);
     }
+    if cfg
+        .memberships
+        .iter()
+        .all(|known| known.subject_node_id != membership.subject_node_id)
+    {
+        let max_memberships = max_stored_memberships(cfg)?;
+        if cfg.memberships.len() >= max_memberships {
+            bail!(
+                "known membership limit reached ({}); update network policy max_peers to store more",
+                max_memberships
+            );
+        }
+    }
+    upsert_membership(cfg, membership)
+}
 
+fn insert_bootstrap_membership(
+    cfg: &mut Config,
+    membership: MembershipCertificate,
+) -> Result<bool> {
+    if membership.subject_node_id == cfg.secret_key()?.public() {
+        return Ok(false);
+    }
+    upsert_membership(cfg, membership)
+}
+
+fn upsert_membership(cfg: &mut Config, membership: MembershipCertificate) -> Result<bool> {
     if let Some(existing) = cfg
         .memberships
         .iter_mut()
@@ -3734,13 +3786,6 @@ fn insert_membership(cfg: &mut Config, membership: MembershipCertificate) -> Res
         return Ok(true);
     }
 
-    let max_memberships = max_stored_memberships(cfg)?;
-    if cfg.memberships.len() >= max_memberships {
-        bail!(
-            "known membership limit reached ({}); update network policy max_peers to store more",
-            max_memberships
-        );
-    }
     cfg.memberships.push(membership);
     cfg.memberships.sort_by(|left, right| {
         left.subject_node_id
@@ -4213,6 +4258,57 @@ mod tests {
 
         assert!(err.contains("join did not complete"));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn short_invite_join_bootstraps_policy_issuer_membership() {
+        let creator_key = SecretKey::generate();
+        let mut inviter_cfg = creator_config(&creator_key);
+        let invite = inviter_cfg
+            .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+            .unwrap();
+        let invite = Invite::decode(&invite.code).unwrap();
+        let member_key = SecretKey::generate();
+        let mut join_cfg = Config {
+            version: 1,
+            network_id: invite.network_id.clone(),
+            network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),
+            secret_key: encode_secret_key(&member_key),
+            creator_node_id: invite.creator_node_id,
+            invite_proof: Some(InviteProof {
+                invite_id: invite.invite_id,
+                invite_secret: invite.invite_secret,
+            }),
+            membership: None,
+            memberships: Vec::new(),
+            name: "member".to_string(),
+            connection_id: "DEF456".to_string(),
+            invites: Vec::new(),
+            peers: vec![Peer {
+                node_id: invite.inviter_node_id,
+                name: String::new(),
+                connection_id: String::new(),
+            }],
+            revocations: Vec::new(),
+        };
+        let join_hello = join_hello_from_config(&join_cfg).unwrap();
+        let (response, _, _) =
+            apply_control_sync(&mut inviter_cfg, member_key.public(), join_hello, None).unwrap();
+        let (remote, granted_membership) = response.into_ok().unwrap();
+        let inviter = join_cfg.peers[0].clone();
+
+        apply_control_response_to_config(
+            &mut join_cfg,
+            creator_key.public(),
+            remote,
+            &inviter,
+            granted_membership,
+        )
+        .unwrap();
+
+        ensure_completed_join(&join_cfg).unwrap();
+        verify_network_policy(&join_cfg, &join_cfg.network_policy, &[]).unwrap();
+        assert_eq!(join_cfg.membership.unwrap().role, MembershipRole::Peer);
     }
 
     #[test]
