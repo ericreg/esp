@@ -1,11 +1,6 @@
-use std::path::PathBuf;
+#![allow(dead_code)]
 
-use esp::{
-    Config, DEFAULT_ALLOWED_PORT, DEFAULT_MAX_KNOWN_PEERS, Invite, InviteProof, MAX_SHARED_PEERS,
-    MembershipCertificate, MembershipRole, NetworkPolicyCertificate, Peer, encode_secret_key,
-    ensure_port_allowed, is_valid_connection_id, remember_advertised_peers,
-};
-use iroh::SecretKey;
+include!("../src/main.rs");
 
 const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
