@@ -25,17 +25,24 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
 const CONTROL_ALPN: &[u8] = b"esp/control/0";
 const TCP_ALPN: &[u8] = b"esp/tcp/0";
-const CONFIG_FILE: &str = ".esp.yml";
+const ESP_DIR: &str = ".esp";
+const CONFIG_FILE: &str = "config.yml";
+const LOG_DIR: &str = "logs";
+const LOG_FILE_PREFIX: &str = "esp";
 const LOCAL_CONTROL_SOCKET_FILE: &str = ".esp.sock";
 
 #[cfg(unix)]
 const CONFIG_FILE_MODE: u32 = 0o600;
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
 const MAX_PROXY_REQUEST_LEN: usize = 64 * 1024 - 1;
 const MAX_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
@@ -78,7 +85,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create ~/.esp.yml if needed.
+    /// Create ~/.esp/config.yml if needed.
     Init {
         /// Maximum number of remote peers this network should remember.
         #[arg(long, default_value_t = DEFAULT_MAX_KNOWN_PEERS)]
@@ -639,15 +646,14 @@ impl LocalControlResponse {
 }
 
 pub async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
-
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Daemon {
+    let command = cli.command.unwrap_or(Command::Daemon {
         ports: vec![DEFAULT_ALLOWED_PORT],
-    }) {
+    });
+    let is_daemon = matches!(command, Command::Daemon { .. });
+    let _logging_guard = init_logging(is_daemon)?;
+
+    match command {
         Command::Init { max_peers } => init(max_peers).await,
         Command::Join { invite } => join(&invite).await,
         Command::Daemon { ports } => daemon(ports).await,
@@ -658,6 +664,37 @@ pub async fn run() -> Result<()> {
         Command::Invite { ports, role } => print_invite(&ports, role).await,
         Command::Status => status().await,
     }
+}
+
+fn init_logging(daemon: bool) -> Result<Option<WorkerGuard>> {
+    if daemon {
+        let path = daemon_log_path()?;
+        let file = create_log_file(&path)?;
+        let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+            .lossy(false)
+            .thread_name("esp-log-writer")
+            .finish(file);
+        tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_env_filter(env_filter_with_default(LevelFilter::INFO))
+            .try_init()
+            .map_err(|err| anyhow!("failed to initialize daemon logging: {err}"))?;
+        info!(path = %path.display(), "esp daemon logging to file");
+        return Ok(Some(guard));
+    }
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(EnvFilter::from_default_env())
+        .try_init()
+        .map_err(|err| anyhow!("failed to initialize logging: {err}"))?;
+    Ok(None)
+}
+
+fn env_filter_with_default(default_level: LevelFilter) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(default_level.into())
+        .from_env_lossy()
 }
 
 async fn init(max_peers: usize) -> Result<()> {
@@ -2821,8 +2858,130 @@ where
 }
 
 fn config_path() -> Result<PathBuf> {
+    Ok(esp_dir()?.join(CONFIG_FILE))
+}
+
+fn daemon_log_path() -> Result<PathBuf> {
+    let state_dir = esp_dir()?;
+    ensure_state_dir(&state_dir)?;
+    let dir = log_dir_path()?;
+    ensure_state_dir(&dir)?;
+    Ok(dir.join(timestamped_log_file_name(SystemTime::now())?))
+}
+
+fn timestamped_log_file_name(now: SystemTime) -> Result<String> {
+    let timestamp = now
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?;
+    Ok(format!(
+        "{LOG_FILE_PREFIX}-{}-{:09}.log",
+        timestamp.as_secs(),
+        timestamp.subsec_nanos()
+    ))
+}
+
+fn log_dir_path() -> Result<PathBuf> {
+    Ok(esp_dir()?.join(LOG_DIR))
+}
+
+fn esp_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(CONFIG_FILE))
+    Ok(PathBuf::from(home).join(ESP_DIR))
+}
+
+fn create_log_file(path: &Path) -> Result<fs::File> {
+    validate_log_target_for_write(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(CONFIG_FILE_MODE);
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(CONFIG_FILE_MODE))
+        .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    Ok(file)
+}
+
+fn validate_log_target_for_write(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_config_metadata(path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn ensure_config_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_state_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn ensure_state_dir(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_state_dir(path, &metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let created = create_private_dir(path)?;
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            validate_state_dir(path, &metadata)?;
+            if created {
+                validate_private_dir_permissions(path, &metadata)?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn create_private_dir(path: &Path) -> Result<bool> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(PRIVATE_DIR_MODE);
+    match builder.create(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
+    }
+}
+
+fn validate_state_dir(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        bail!(
+            "{} is a symlink; refusing to use it as esp state directory",
+            path.display()
+        );
+    }
+    if !file_type.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_private_dir_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "{} permissions are {:03o}; refusing to use state directory with group/world access (run `chmod 700 {}`)",
+            path.display(),
+            mode,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_dir_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+    Ok(())
 }
 
 fn validate_existing_config_file(path: &Path) -> Result<()> {
@@ -2880,6 +3039,7 @@ fn validate_private_config_permissions(_path: &Path, _metadata: &fs::Metadata) -
 }
 
 fn write_private_config(path: &Path, bytes: &[u8]) -> Result<()> {
+    ensure_config_dir(path)?;
     validate_config_target_for_write(path)?;
     let parent = path
         .parent()

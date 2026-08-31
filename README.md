@@ -34,7 +34,7 @@ On the first machine:
 esp init
 ```
 
-This creates `~/.esp.yml`, detects this host's name, and generates a unique
+This creates `~/.esp/config.yml`, detects this host's name, and generates a unique
 connection id. Create an invite explicitly:
 
 ```sh
@@ -44,15 +44,19 @@ esp invite
 Keep the daemon running on that machine:
 
 ```sh
-RUST_LOG=info esp
+esp
 ```
 
 By default, the daemon only allows peers to proxy to local SSH on port `22`.
 Allow additional localhost ports explicitly on that host:
 
 ```sh
-RUST_LOG=info esp daemon --ports 22,8000
+esp daemon --ports 22,8000
 ```
+
+Daemon invocations write INFO-level logs by default to timestamped files under
+`~/.esp/logs`, for example `~/.esp/logs/esp-1767225600-000000000.log`. Set
+`RUST_LOG` to override the log level.
 
 Invites grant the `peer` role and SSH-only port access by default. To grant a
 peer additional ports, include them in the invite:
@@ -75,7 +79,7 @@ On the second machine:
 
 ```sh
 esp join <invite-code>
-RUST_LOG=info esp
+esp
 ```
 
 To add a third machine, print a new invite on any already-joined admin:
@@ -120,7 +124,7 @@ firewall rules do not need to allow inbound SSH from esp peers.
 ## Commands
 
 ```sh
-esp init --max-peers 100 # create ~/.esp.yml if missing
+esp init --max-peers 100 # create ~/.esp/config.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
@@ -167,7 +171,7 @@ sudo loginctl enable-linger "$USER"
 
 ## Leaving
 
-There is no leave command. Stop the daemon and delete `~/.esp.yml`.
+There is no leave command. Stop the daemon and delete `~/.esp/config.yml`.
 
 ## Security
 
@@ -201,7 +205,7 @@ local TCP connection.
   inspect their node identity. When the daemon is running, local `esp invite`,
   `esp rename`, `esp revoke`, `esp policy`, and existing-config `esp init`
   commands use the daemon's private local control socket instead of writing
-  `~/.esp.yml` directly.
+  `~/.esp/config.yml` directly.
 - Admins act as the peer directory. Generic hellos from peers carry only their
   self identity, membership chain, signed network policy, and revocations; only
   admins may advertise additional peers and membership certificates.
@@ -211,7 +215,7 @@ local TCP connection.
 - The daemon bounds inbound work with small `try_send`-based worker queues,
   per-peer concurrent connection quotas, handshake/setup read timeouts, and a
   one-hour idle timeout on TCP proxy byte streams.
-- `~/.esp.yml` contains this host's private iroh key and, while a join is
+- `~/.esp/config.yml` contains this host's private iroh key and, while a join is
   pending, may contain an unused invite proof. esp writes this file atomically
   with `0600` permissions and refuses to use configs with group/world access,
   symlinks, or hard links. Pending invite proofs are sent only during the

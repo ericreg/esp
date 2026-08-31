@@ -20,6 +20,24 @@ fn temp_config_path(label: &str) -> PathBuf {
 }
 
 #[test]
+fn default_config_path_is_under_esp_state_dir() {
+    let home = std::env::var_os("HOME").unwrap();
+    let expected = PathBuf::from(home).join(".esp").join("config.yml");
+
+    assert_eq!(config_path().unwrap(), expected);
+}
+
+#[test]
+fn daemon_log_file_name_is_timestamped() {
+    let now = UNIX_EPOCH + Duration::new(123, 45);
+
+    assert_eq!(
+        timestamped_log_file_name(now).unwrap(),
+        "esp-123-000000045.log"
+    );
+}
+
+#[test]
 fn membership_certificate_chains_to_creator_and_rejects_tampering() {
     let creator_key = SecretKey::generate();
     let cfg = creator_config(&creator_key);
@@ -1204,6 +1222,27 @@ fn config_save_creates_private_regular_file() {
     Config::load(&path).unwrap();
 
     let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_save_creates_private_state_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let secret_key = SecretKey::generate();
+    let cfg = creator_config(&secret_key);
+    let dir = std::env::temp_dir().join(format!("esp-state-{}", Uuid::new_v4()));
+    let path = dir.join("config.yml");
+
+    cfg.save(&path).unwrap();
+
+    let dir_metadata = std::fs::symlink_metadata(&dir).unwrap();
+    assert!(dir_metadata.file_type().is_dir());
+    assert_eq!(dir_metadata.permissions().mode() & 0o777, PRIVATE_DIR_MODE);
+    Config::load(&path).unwrap();
+
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir(dir);
 }
 
 #[cfg(unix)]
