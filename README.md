@@ -54,9 +54,10 @@ Allow additional localhost ports explicitly on that host:
 esp daemon --ports 22,8000
 ```
 
-Daemon invocations write INFO-level logs by default to timestamped files under
-`~/.esp/logs`, for example `~/.esp/logs/esp-1767225600-000000000.log`. Set
-`RUST_LOG` to override the log level.
+Each daemon process opens one timestamped log file at startup and writes
+INFO-level logs there by default, for example
+`~/.esp/logs/esp-1767225600-000000000.log`. Set `RUST_LOG` to override the log
+level.
 
 Invites grant the `peer` role and SSH-only port access by default. To grant a
 peer additional ports, include them in the invite:

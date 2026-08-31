@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -71,6 +72,7 @@ const MAX_SHARED_REVOCATIONS: usize = 100;
 const INVITE_SECRET_BYTES: usize = 16;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 mod esp_capnp {
     include!(concat!(env!("OUT_DIR"), "/esp_capnp.rs"));
@@ -2862,6 +2864,19 @@ fn config_path() -> Result<PathBuf> {
 }
 
 fn daemon_log_path() -> Result<PathBuf> {
+    if let Some(path) = DAEMON_LOG_PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let path = new_daemon_log_path()?;
+    let _ = DAEMON_LOG_PATH.set(path);
+    Ok(DAEMON_LOG_PATH
+        .get()
+        .expect("daemon log path is initialized")
+        .clone())
+}
+
+fn new_daemon_log_path() -> Result<PathBuf> {
     let state_dir = esp_dir()?;
     ensure_state_dir(&state_dir)?;
     let dir = log_dir_path()?;
