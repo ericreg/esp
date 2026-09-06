@@ -116,6 +116,23 @@ Then connect normally:
 ssh host
 ```
 
+The local daemon must also be running (`esp daemon`). Each `esp proxy` talks to
+that daemon through `~/.esp.sock`; the daemon uses its single iroh endpoint to
+open a separate connection for each SSH session. Multiple sessions can run at
+once, and closing one session leaves the others connected. If the local daemon
+is unavailable, `esp proxy` exits with instructions to start it.
+
+By default, a daemon accepts up to eight concurrent incoming connections from
+each peer, including control syncs. To allow more, set the limit on the receiving
+host:
+
+```sh
+esp daemon --max-connections-per-peer 32
+```
+
+The limit must be positive; the daemon also retains its overall worker limits.
+After upgrading esp, restart the local daemon to enable the new proxy request.
+
 If multiple peers are named `host`, esp exits and prints the matching connection
 ids. Rename one of them with `esp rename NAME` or use the id directly.
 
@@ -134,6 +151,7 @@ esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite --role peer --ports 22 # create and print an invite as an admin
 esp status            # show daemon state, local node, and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
+esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer
 ```
 
 ## Linux systemd
@@ -214,8 +232,10 @@ local TCP connection.
   total stored peers/certificates are capped by signed network policy. Duplicate
   connection ids are rejected.
 - The daemon bounds inbound work with small `try_send`-based worker queues,
-  per-peer concurrent connection quotas, handshake/setup read timeouts, and a
-  one-hour idle timeout on TCP proxy byte streams.
+  configurable per-peer concurrent connection quotas, handshake/setup read
+  timeouts, and a one-hour idle timeout in each direction on proxy byte streams.
+  The local request setup timeout does not limit the lifetime of an established
+  tunnel. TCP half-closes allow pending responses to finish after input EOF.
 - `~/.esp/config.yml` contains this host's private iroh key and, while a join is
   pending, may contain an unused invite proof. esp writes this file atomically
   with `0600` permissions and refuses to use configs with group/world access,
@@ -227,6 +247,19 @@ local TCP connection.
 
 ## Notes
 
+- Control messages, TCP proxy setup requests, and local daemon requests use CBOR
+  encoded with `minicbor`. Each message has a two-byte big-endian payload length
+  followed by one CBOR value, capped at 65,535 bytes. SSH data follows the proxy
+  setup as a raw byte stream.
+- Invites and signed records use derived CBOR arrays. UUIDs, signatures, and
+  invite secrets retain their string representations; endpoint keys use byte
+  strings. Invite codes and the signed-record fields in
+  `~/.esp/config.yml` contain URL-safe base64 of these CBOR values. Rust
+  `#[n(...)]` annotations define the field and variant numbers.
+- This format is a breaking change. Update all hosts, recreate network
+  configuration and invites, and rejoin peers. There is no legacy format reader
+  or migration path. The network protocols are `esp/control/cbor/1` and
+  `esp/tcp/cbor/1`; restart daemons after installing the new version.
 - SSH bytes are carried over iroh QUIC streams. esp lets iroh try direct
   connections first and use relays when a direct path is unavailable.
 - The daemon allows proxying to local port 22 only unless additional ports are

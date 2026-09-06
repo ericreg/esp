@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -12,9 +13,10 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
 use iroh::{
     Endpoint, EndpointId, RelayMode, SecretKey, Signature,
-    endpoint::{Connection, Incoming, VarInt, presets},
+    endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt, presets},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use minicbor::{Decode, Encode};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -32,8 +34,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
-const CONTROL_ALPN: &[u8] = b"esp/control/0";
-const TCP_ALPN: &[u8] = b"esp/tcp/0";
+const CONTROL_ALPN: &[u8] = b"esp/control/cbor/1";
+const TCP_ALPN: &[u8] = b"esp/tcp/cbor/1";
 const ESP_DIR: &str = ".esp";
 const CONFIG_FILE: &str = "config.yml";
 const LOG_DIR: &str = "logs";
@@ -52,7 +54,8 @@ const CONFIG_ACTOR_QUEUE: usize = 64;
 const INCOMING_WORKERS: usize = 64;
 const INCOMING_WORKER_QUEUE: usize = 1;
 const PEER_QUOTA_QUEUE: usize = 256;
-const MAX_CONNECTIONS_PER_PEER: usize = 8;
+const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 8;
+const LOCAL_CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const INCOMING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -69,14 +72,11 @@ const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
 const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
 const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
 const MAX_SHARED_REVOCATIONS: usize = 100;
-const INVITE_SECRET_BYTES: usize = 16;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-mod esp_capnp {
-    include!(concat!(env!("OUT_DIR"), "/esp_capnp.rs"));
-}
+mod cbor;
 
 #[derive(Parser, Debug)]
 #[command(about = "A tiny iroh-backed SSH transport proxy")]
@@ -103,6 +103,9 @@ enum Command {
         /// Localhost ports peers may connect to through this daemon.
         #[arg(long, value_delimiter = ',', default_value = "22")]
         ports: Vec<u16>,
+        /// Maximum concurrent incoming connections from each peer, including control syncs.
+        #[arg(long, default_value = "8")]
+        max_connections_per_peer: NonZeroUsize,
     },
     /// Proxy stdio to localhost:PORT on a peer over iroh.
     Proxy {
@@ -155,11 +158,16 @@ pub struct Config {
     pub revocations: Vec<RevocationCertificate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 #[serde(deny_unknown_fields)]
 pub struct Peer {
+    #[n(0)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub node_id: EndpointId,
+    #[n(1)]
     pub name: String,
+    #[n(2)]
     pub connection_id: String,
 }
 
@@ -178,21 +186,33 @@ pub struct InviteCode {
     pub code: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 #[serde(deny_unknown_fields)]
 pub struct Invite {
+    #[n(0)]
     pub version: u8,
+    #[n(1)]
     pub network_id: String,
+    #[n(2)]
     pub invite_id: String,
+    #[n(3)]
     pub invite_secret: String,
+    #[n(4)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub creator_node_id: EndpointId,
+    #[n(5)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub inviter_node_id: EndpointId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 #[serde(deny_unknown_fields)]
 pub struct InviteProof {
+    #[n(0)]
     pub invite_id: String,
+    #[n(1)]
     pub invite_secret: String,
 }
 
@@ -202,10 +222,13 @@ struct InviteGrant {
     role: MembershipRole,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum, Encode, Decode)]
 #[serde(rename_all = "lowercase")]
+#[cbor(index_only)]
 pub enum MembershipRole {
+    #[n(0)]
     Admin,
+    #[n(1)]
     Peer,
 }
 
@@ -220,20 +243,6 @@ impl MembershipRole {
     fn can_issue_invites(self) -> bool {
         matches!(self, Self::Admin)
     }
-
-    fn to_capnp(self) -> esp_capnp::MembershipRole {
-        match self {
-            Self::Admin => esp_capnp::MembershipRole::Admin,
-            Self::Peer => esp_capnp::MembershipRole::Peer,
-        }
-    }
-
-    fn from_capnp(role: esp_capnp::MembershipRole) -> Self {
-        match role {
-            esp_capnp::MembershipRole::Admin => Self::Admin,
-            esp_capnp::MembershipRole::Peer => Self::Peer,
-        }
-    }
 }
 
 impl std::fmt::Display for MembershipRole {
@@ -242,35 +251,63 @@ impl std::fmt::Display for MembershipRole {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 pub struct MembershipCertificate {
+    #[n(0)]
     pub version: u8,
+    #[n(1)]
     pub network_id: String,
+    #[n(2)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub subject_node_id: EndpointId,
+    #[n(3)]
     pub subject_connection_id: String,
+    #[n(4)]
     pub role: MembershipRole,
+    #[n(5)]
     pub allowed_ports: Vec<u16>,
+    #[n(6)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub issuer_node_id: EndpointId,
+    #[n(7)]
     pub signature: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 pub struct NetworkPolicyCertificate {
+    #[n(0)]
     pub version: u8,
+    #[n(1)]
     pub network_id: String,
+    #[n(2)]
     pub max_peers: usize,
+    #[n(3)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub issuer_node_id: EndpointId,
+    #[n(4)]
     pub issued_at_unix: u64,
+    #[n(5)]
     pub signature: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 pub struct RevocationCertificate {
+    #[n(0)]
     pub version: u8,
+    #[n(1)]
     pub network_id: String,
+    #[n(2)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub subject_node_id: EndpointId,
+    #[n(3)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub issuer_node_id: EndpointId,
+    #[n(4)]
     pub issued_at_unix: u64,
+    #[n(5)]
     pub signature: String,
 }
 
@@ -331,25 +368,37 @@ impl<'de> Deserialize<'de> for RevocationCertificate {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct Hello {
+    #[n(0)]
     network_id: String,
+    #[n(1)]
     network_policy: Option<NetworkPolicyCertificate>,
+    #[n(2)]
     name: String,
+    #[n(3)]
     connection_id: String,
+    #[n(4)]
     invite_proof: Option<InviteProof>,
+    #[n(5)]
     membership: Option<MembershipCertificate>,
+    #[n(6)]
     memberships: Vec<MembershipCertificate>,
+    #[n(7)]
     peers: Vec<Peer>,
+    #[n(8)]
     revocations: Vec<RevocationCertificate>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct ControlResponse {
+    #[n(0)]
     error: Option<String>,
+    #[n(1)]
     hello: Option<Hello>,
+    #[n(2)]
     granted_membership: Option<MembershipCertificate>,
 }
 
@@ -381,18 +430,28 @@ impl ControlResponse {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct TcpProxyRequest {
+    #[n(0)]
     network_id: String,
+    #[n(1)]
     network_policy: NetworkPolicyCertificate,
+    #[n(2)]
     requester_name: String,
+    #[n(3)]
     requester_connection_id: String,
+    #[n(4)]
     invite_proof: Option<InviteProof>,
+    #[n(5)]
     membership: Option<MembershipCertificate>,
+    #[n(6)]
     memberships: Vec<MembershipCertificate>,
+    #[n(7)]
     peers: Vec<Peer>,
+    #[n(8)]
     revocations: Vec<RevocationCertificate>,
+    #[n(9)]
     port: u16,
 }
 
@@ -402,33 +461,52 @@ struct HostIdentity {
     connection_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct StatusReport {
+    #[n(0)]
     network_id: String,
+    #[n(1)]
     max_peers: usize,
+    #[n(2)]
     name: String,
+    #[n(3)]
     connection_id: String,
+    #[n(4)]
+    #[cbor(with = "cbor::endpoint_id")]
     node_id: EndpointId,
+    #[n(5)]
     invites: Vec<String>,
+    #[n(6)]
     peers: Vec<Peer>,
+    #[n(7)]
+    #[cbor(with = "cbor::endpoint_ids")]
     revocations: Vec<EndpointId>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 pub struct RevocationReport {
+    #[n(0)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub node_id: EndpointId,
+    #[n(1)]
     pub display_name: String,
+    #[n(2)]
     pub peers: Vec<Peer>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 pub struct NetworkPolicyReport {
+    #[n(0)]
     pub max_peers: usize,
+    #[n(1)]
+    #[cbor(with = "cbor::endpoint_id")]
     pub issuer_node_id: EndpointId,
+    #[n(2)]
     pub issued_at_unix: u64,
+    #[n(3)]
     pub peers: Vec<Peer>,
 }
 
@@ -438,6 +516,11 @@ struct ConfigActorHandle {
 }
 
 enum ConfigActorCommand {
+    PrepareProxy {
+        target: String,
+        port: u16,
+        respond: oneshot::Sender<Result<(Peer, TcpProxyRequest)>>,
+    },
     Status {
         respond: oneshot::Sender<Result<StatusReport>>,
     },
@@ -514,40 +597,83 @@ enum PeerQuotaCommand {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 enum LocalControlRequest {
+    #[n(0)]
+    Proxy {
+        #[n(0)]
+        target: String,
+        #[n(1)]
+        port: u16,
+    },
+    #[n(1)]
     Status,
+    #[n(2)]
     Rename {
+        #[n(0)]
         name: String,
     },
+    #[n(3)]
     IssueInvite {
+        #[n(0)]
         ports: Vec<u16>,
+        #[n(1)]
         role: MembershipRole,
     },
+    #[n(4)]
     Revoke {
+        #[n(0)]
         target: String,
     },
+    #[n(5)]
     UpdatePolicy {
+        #[n(0)]
         max_peers: usize,
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
+enum LocalProxyResponse {
+    #[n(0)]
+    Ready,
+    #[n(1)]
+    Error(#[n(0)] String),
+}
+
+/// Close only this session's connection, including when its task is cancelled.
+struct CloseConnectionOnDrop(Connection);
+
+impl Drop for CloseConnectionOnDrop {
+    fn drop(&mut self) {
+        self.0.close(GRACEFUL_CLOSE, b"bye");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct LocalControlResponse {
+    #[n(0)]
     error: Option<String>,
+    #[n(1)]
     status: Option<StatusReport>,
+    #[n(2)]
     renamed: Option<LocalRenameReport>,
+    #[n(3)]
     invite_code: Option<String>,
+    #[n(4)]
     revoked: Option<RevocationReport>,
+    #[n(5)]
     policy: Option<NetworkPolicyReport>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, PartialEq, Eq, Encode, Decode)]
+#[cbor(array)]
 struct LocalRenameReport {
+    #[n(0)]
     name: String,
+    #[n(1)]
     connection_id: String,
 }
 
@@ -651,6 +777,7 @@ pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Daemon {
         ports: vec![DEFAULT_ALLOWED_PORT],
+        max_connections_per_peer: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS_PER_PEER).unwrap(),
     });
     let is_daemon = matches!(command, Command::Daemon { .. });
     let _logging_guard = init_logging(is_daemon)?;
@@ -658,7 +785,10 @@ pub async fn run() -> Result<()> {
     match command {
         Command::Init { max_peers } => init(max_peers).await,
         Command::Join { invite } => join(&invite).await,
-        Command::Daemon { ports } => daemon(ports).await,
+        Command::Daemon {
+            ports,
+            max_connections_per_peer,
+        } => daemon(ports, max_connections_per_peer.get()).await,
         Command::Proxy { target, port } => proxy(target, port).await,
         Command::Rename { name } => rename(&name).await,
         Command::Revoke { target } => revoke(&target).await,
@@ -972,7 +1102,7 @@ async fn send_local_control_request_to_path(
         }
     };
     timeout(Duration::from_secs(5), async {
-        write_yaml_frame(
+        write_cbor_frame(
             &mut stream,
             &request,
             MAX_LOCAL_CONTROL_MESSAGE_LEN,
@@ -980,7 +1110,7 @@ async fn send_local_control_request_to_path(
         )
         .await?;
 
-        let response: LocalControlResponse = read_yaml_frame(
+        let response: LocalControlResponse = read_cbor_frame(
             &mut stream,
             MAX_LOCAL_CONTROL_MESSAGE_LEN,
             "local esp control response",
@@ -1122,13 +1252,14 @@ fn print_policy_report(report: &NetworkPolicyReport) {
     println!("policy issued at: {}", report.issued_at_unix);
 }
 
-async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
+async fn daemon(allowed_ports: Vec<u16>, max_connections_per_peer: usize) -> Result<()> {
     let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
     #[cfg(unix)]
     let (local_control_listener, _local_control_socket) =
         prepare_local_control_socket().context("failed to start local esp control")?;
 
     let path = config_path()?;
+    sync_pending_join_if_needed(&path).await?;
     let cfg = Config::load(&path)?;
     let secret_key = cfg.secret_key()?;
     let actor = spawn_config_actor(path, cfg);
@@ -1148,13 +1279,31 @@ async fn daemon(allowed_ports: Vec<u16>) -> Result<()> {
     let local_control_task =
         spawn_local_control_server(local_control_listener, actor.clone(), endpoint.clone());
 
-    info!(ports = ?allowed_ports, "esp TCP proxy port allowlist active");
-    let accept_result = run_acceptor(endpoint.clone(), actor, allowed_ports).await;
+    info!(ports = ?allowed_ports, max_connections_per_peer, "esp TCP proxy port allowlist active");
+    let accept_result = tokio::select! {
+        result = run_acceptor(endpoint.clone(), actor, allowed_ports, max_connections_per_peer) => result,
+        result = shutdown_signal() => result,
+    };
     #[cfg(unix)]
     local_control_task.abort();
-    accept_result?;
     endpoint.close().await;
-    Ok(())
+    accept_result
+}
+
+async fn shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("failed to listen for interrupt"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for interrupt")
 }
 
 #[cfg(unix)]
@@ -1241,25 +1390,21 @@ async fn run_local_control_server(
     actor: ConfigActorHandle,
     endpoint: Endpoint,
 ) {
+    // Aborting the server also cancels its sessions instead of detaching them.
+    let mut sessions = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = sessions.join_next(), if !sessions.is_empty() => continue,
+        };
+        match accepted {
             Ok((stream, _addr)) => {
                 let actor = actor.clone();
                 let endpoint = endpoint.clone();
-                tokio::spawn(async move {
-                    match timeout(
-                        Duration::from_secs(15),
-                        handle_local_control_connection(stream, actor, endpoint),
-                    )
-                    .await
+                sessions.spawn(async move {
+                    if let Err(err) = handle_local_control_connection(stream, actor, endpoint).await
                     {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            warn!(error = %err, "local esp control request failed");
-                        }
-                        Err(_) => {
-                            warn!("local esp control request timed out");
-                        }
+                        warn!(error = %format_args!("{err:#}"), "local esp request failed");
                     }
                 });
             }
@@ -1277,62 +1422,75 @@ async fn handle_local_control_connection(
     actor: ConfigActorHandle,
     endpoint: Endpoint,
 ) -> Result<()> {
-    let result = match read_yaml_frame(
-        &mut stream,
-        MAX_LOCAL_CONTROL_MESSAGE_LEN,
-        "local esp control request",
+    let request = timeout(
+        LOCAL_CONTROL_SETUP_TIMEOUT,
+        read_cbor_frame(
+            &mut stream,
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "local esp control request",
+        ),
     )
     .await
-    {
-        Ok(LocalControlRequest::Status) => actor
-            .status()
-            .await
-            .map(|report| LocalControlOk::Status { report }),
-        Ok(LocalControlRequest::Rename { name }) => {
-            actor
-                .rename(name)
+    .context("timed out reading local esp control request")??;
+    if let LocalControlRequest::Proxy { target, port } = request {
+        return handle_local_proxy_connection(stream, actor, endpoint, target, port).await;
+    }
+    timeout(LOCAL_CONTROL_SETUP_TIMEOUT, async {
+        let result = match request {
+            LocalControlRequest::Status => actor
+                .status()
                 .await
-                .map(|identity| LocalControlOk::Renamed {
-                    name: identity.name,
-                    connection_id: identity.connection_id,
-                })
-        }
-        Ok(LocalControlRequest::IssueInvite { ports, role }) => actor
-            .issue_invite(ports, role)
+                .map(|report| LocalControlOk::Status { report }),
+            LocalControlRequest::Rename { name } => {
+                actor
+                    .rename(name)
+                    .await
+                    .map(|identity| LocalControlOk::Renamed {
+                        name: identity.name,
+                        connection_id: identity.connection_id,
+                    })
+            }
+            LocalControlRequest::IssueInvite { ports, role } => actor
+                .issue_invite(ports, role)
+                .await
+                .map(|invite| LocalControlOk::Invite { code: invite.code }),
+            LocalControlRequest::Revoke { target } => {
+                let result = actor.revoke(target).await;
+                if let Ok(report) = &result {
+                    spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
+                }
+                result.map(|report| LocalControlOk::Revoked { report })
+            }
+            LocalControlRequest::UpdatePolicy { max_peers } => {
+                let result = actor.update_policy(max_peers).await;
+                if let Ok(report) = &result {
+                    spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
+                }
+                result.map(|report| LocalControlOk::PolicyUpdated { report })
+            }
+            LocalControlRequest::Proxy { .. } => {
+                unreachable!("proxy handled before control dispatch")
+            }
+        };
+        let response = match result {
+            Ok(ok) => LocalControlResponse::ok(ok),
+            Err(err) => LocalControlResponse::err(err.to_string()),
+        };
+        write_cbor_frame(
+            &mut stream,
+            &response,
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "local esp control response",
+        )
+        .await?;
+        stream
+            .shutdown()
             .await
-            .map(|invite| LocalControlOk::Invite { code: invite.code }),
-        Ok(LocalControlRequest::Revoke { target }) => {
-            let result = actor.revoke(target).await;
-            if let Ok(report) = &result {
-                spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
-            }
-            result.map(|report| LocalControlOk::Revoked { report })
-        }
-        Ok(LocalControlRequest::UpdatePolicy { max_peers }) => {
-            let result = actor.update_policy(max_peers).await;
-            if let Ok(report) = &result {
-                spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
-            }
-            result.map(|report| LocalControlOk::PolicyUpdated { report })
-        }
-        Err(err) => Err(err),
-    };
-    let response = match result {
-        Ok(ok) => LocalControlResponse::ok(ok),
-        Err(err) => LocalControlResponse::err(err.to_string()),
-    };
-    write_yaml_frame(
-        &mut stream,
-        &response,
-        MAX_LOCAL_CONTROL_MESSAGE_LEN,
-        "local esp control response",
-    )
-    .await?;
-    stream
-        .shutdown()
-        .await
-        .context("failed to finish local esp control response")?;
-    Ok(())
+            .context("failed to finish local esp control response")?;
+        Ok(())
+    })
+    .await
+    .context("timed out handling local esp control request")?
 }
 
 async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
@@ -1510,8 +1668,9 @@ async fn run_acceptor(
     endpoint: Endpoint,
     actor: ConfigActorHandle,
     allowed_ports: Vec<u16>,
+    max_connections_per_peer: usize,
 ) -> Result<()> {
-    let peer_quota = spawn_peer_quota_actor(MAX_CONNECTIONS_PER_PEER);
+    let peer_quota = spawn_peer_quota_actor(max_connections_per_peer);
     let mut incoming_queue = spawn_incoming_workers(actor, allowed_ports, peer_quota);
     info!("accepting esp control and TCP proxy connections");
     while let Some(incoming) = endpoint.accept().await {
@@ -1582,7 +1741,7 @@ async fn run_incoming_worker(
         if let Err(err) =
             handle_incoming_connection(incoming, actor.clone(), &allowed_ports, &peer_quota).await
         {
-            warn!(error = %err, "esp connection stopped");
+            warn!(error = %format_args!("{err:#}"), "esp connection stopped");
         }
     }
 }
@@ -1605,6 +1764,7 @@ async fn handle_incoming_connection(
         .await
         .context("timed out waiting for incoming esp handshake")?
         .context("incoming esp connection failed")?;
+    let _close = CloseConnectionOnDrop(conn.clone());
     let peer_id = conn.remote_id();
     let Some(_peer_permit) = peer_quota.try_acquire(peer_id).await? else {
         conn.close(GRACEFUL_CLOSE, b"quota exceeded");
@@ -1791,6 +1951,13 @@ async fn run_config_actor(
     let mut active_connections = HashMap::<EndpointId, HashMap<Uuid, oneshot::Sender<()>>>::new();
     while let Some(command) = receiver.recv().await {
         match command {
+            ConfigActorCommand::PrepareProxy {
+                target,
+                port,
+                respond,
+            } => {
+                let _ = respond.send(prepare_proxy_request(&cfg, &target, port));
+            }
             ConfigActorCommand::Status { respond } => {
                 let _ = respond.send(status_report_from_config(&cfg));
             }
@@ -1943,6 +2110,14 @@ fn commit_config_change<T>(
 }
 
 impl ConfigActorHandle {
+    async fn prepare_proxy(&self, target: String, port: u16) -> Result<(Peer, TcpProxyRequest)> {
+        self.request(|respond| ConfigActorCommand::PrepareProxy {
+            target,
+            port,
+            respond,
+        })
+        .await
+    }
     async fn status(&self) -> Result<StatusReport> {
         self.request(|respond| ConfigActorCommand::Status { respond })
             .await
@@ -2546,27 +2721,96 @@ fn ensure_peer_capacity(cfg: &Config, node_id: EndpointId) -> Result<()> {
 }
 
 async fn proxy(target: String, port: u16) -> Result<()> {
-    let path = config_path()?;
-    sync_pending_join_if_needed(&path).await?;
-    let cfg = Config::load(&path)?;
-    let peer = cfg.resolve_peer(&target)?.clone();
-    let hello = hello_from_config(&cfg)?;
-    let secret_key = cfg.secret_key()?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .relay_mode(RelayMode::Default)
-        .bind()
-        .await
-        .context("failed to bind iroh endpoint")?;
+    #[cfg(unix)]
+    {
+        let stream = open_local_proxy(&local_control_socket_path()?, target, port).await?;
+        proxy_stdio(io::stdin(), io::stdout(), stream).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, port);
+        bail!(
+            "esp proxy requires a local daemon over a Unix socket; this platform is not supported"
+        )
+    }
+}
 
-    let conn = endpoint
-        .connect(peer.node_id, TCP_ALPN)
-        .await
-        .with_context(|| format!("failed to connect to esp peer {}", peer.node_id))?;
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .context("failed to open TCP proxy stream")?;
+#[cfg(unix)]
+async fn open_local_proxy(path: &Path, target: String, port: u16) -> Result<UnixStream> {
+    let mut stream = UnixStream::connect(path).await.with_context(|| {
+        format!(
+            "failed to connect to local esp daemon at {}; start it with `esp daemon`",
+            path.display()
+        )
+    })?;
+    timeout(
+        LOCAL_CONTROL_SETUP_TIMEOUT + Duration::from_secs(5),
+        async {
+            write_cbor_frame(
+                &mut stream,
+                &LocalControlRequest::Proxy { target, port },
+                MAX_LOCAL_CONTROL_MESSAGE_LEN,
+                "local esp proxy request",
+            )
+            .await?;
+            let response: LocalProxyResponse = read_cbor_frame(
+                &mut stream,
+                MAX_LOCAL_CONTROL_MESSAGE_LEN,
+                "local esp proxy response",
+            )
+            .await
+            .context("failed to read proxy response; ensure the local esp daemon is up to date")?;
+            match response {
+                LocalProxyResponse::Ready => Ok(()),
+                LocalProxyResponse::Error(error) => {
+                    bail!("local esp daemon rejected proxy: {error}")
+                }
+            }
+        },
+    )
+    .await
+    .context("timed out waiting for local esp proxy setup")??;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+async fn proxy_stdio<R, W>(mut input: R, mut output: W, stream: UnixStream) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let (mut read, mut write) = stream.into_split();
+    let upload = async {
+        io::copy(&mut input, &mut write)
+            .await
+            .context("failed to copy stdin to esp daemon")?;
+        write
+            .shutdown()
+            .await
+            .context("failed to finish local esp send stream")
+    };
+    let download = async {
+        io::copy(&mut read, &mut output)
+            .await
+            .context("failed to copy esp daemon to stdout")?;
+        output.flush().await.context("failed to flush stdout")
+    };
+    tokio::pin!(upload, download);
+    tokio::select! {
+        result = &mut upload => {
+            result?;
+            // Preserve the response after stdin EOF (TCP half-close).
+            download.await
+        }
+        // A remote EOF must also let an interactive client with open stdin exit.
+        result = &mut download => result,
+    }
+}
+
+fn prepare_proxy_request(cfg: &Config, target: &str, port: u16) -> Result<(Peer, TcpProxyRequest)> {
+    ensure_completed_join(cfg)?;
+    let peer = cfg.resolve_peer(target)?.clone();
+    let hello = hello_from_config(cfg)?;
     let request = TcpProxyRequest {
         network_id: hello.network_id,
         network_policy: cfg.network_policy.clone(),
@@ -2579,38 +2823,141 @@ async fn proxy(target: String, port: u16) -> Result<()> {
         revocations: hello.revocations,
         port,
     };
-    write_proxy_request(&mut send, &request).await?;
+    Ok((peer, request))
+}
 
-    let mut stdin_to_peer = tokio::spawn(async move {
-        let mut stdin = io::stdin();
-        io::copy(&mut stdin, &mut send)
-            .await
-            .context("failed to copy stdin to esp peer")?;
+#[cfg(unix)]
+struct ProxyTunnel {
+    connection: CloseConnectionOnDrop,
+    send: SendStream,
+    recv: RecvStream,
+    active: ActiveConnectionGuard,
+}
+
+#[cfg(unix)]
+async fn open_proxy_tunnel(
+    endpoint: &Endpoint,
+    actor: &ConfigActorHandle,
+    target: String,
+    port: u16,
+) -> Result<ProxyTunnel> {
+    let (peer, request) = actor.prepare_proxy(target, port).await?;
+    let mut active = actor.register_connection(peer.node_id).await?;
+    let (connection, send, recv) = tokio::select! {
+        result = async {
+            let conn = endpoint.connect(peer.node_id, TCP_ALPN).await
+                .with_context(|| format!("failed to connect to esp peer {}", peer.node_id))?;
+            let connection = CloseConnectionOnDrop(conn);
+            let (mut send, recv) = connection.0.open_bi().await.context("failed to open TCP proxy stream")?;
+            write_proxy_request(&mut send, &request).await?;
+            Ok::<_, anyhow::Error>((connection, send, recv))
+        } => result?,
+        _ = active.cancelled() => bail!("peer {} has been revoked", peer.node_id),
+    };
+    info!(peer = %peer.node_id, peer_name = %peer.name, port, "opened outgoing TCP proxy");
+    Ok(ProxyTunnel {
+        connection,
+        send,
+        recv,
+        active,
+    })
+}
+
+#[cfg(unix)]
+async fn handle_local_proxy_connection(
+    mut stream: UnixStream,
+    actor: ConfigActorHandle,
+    endpoint: Endpoint,
+    target: String,
+    port: u16,
+) -> Result<()> {
+    let setup = timeout(
+        LOCAL_CONTROL_SETUP_TIMEOUT,
+        open_proxy_tunnel(&endpoint, &actor, target, port),
+    )
+    .await
+    .context("timed out opening esp proxy")
+    .and_then(|result| result);
+    let response = match &setup {
+        Ok(_) => LocalProxyResponse::Ready,
+        Err(err) => LocalProxyResponse::Error(format!("{err:#}")),
+    };
+    timeout(
+        LOCAL_CONTROL_SETUP_TIMEOUT,
+        write_cbor_frame(
+            &mut stream,
+            &response,
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "local esp proxy response",
+        ),
+    )
+    .await
+    .context("timed out writing local esp proxy response")??;
+    let ProxyTunnel {
+        connection,
+        send,
+        recv,
+        mut active,
+    } = setup?;
+    let (read, write) = stream.into_split();
+    let result = tokio::select! {
+        result = bridge_proxy(read, write, send, recv) => result,
+        _ = active.cancelled() => {
+            connection.0.close(GRACEFUL_CLOSE, b"revoked");
+            bail!("proxy peer has been revoked");
+        }
+    };
+    // The shared endpoint remains alive for the daemon and all other sessions.
+    drop(connection);
+    result
+}
+
+/// Forward both halves within this task so errors and cancellation drop both futures.
+/// A clean EOF only shuts down that direction, allowing the response to drain.
+async fn bridge_proxy<R, W>(
+    mut read: R,
+    mut write: W,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let upload = async {
+        copy_with_idle_timeout(
+            &mut read,
+            &mut send,
+            TCP_PROXY_IDLE_TIMEOUT,
+            "local socket to esp peer",
+        )
+        .await?;
         send.finish().context("failed to finish esp send stream")?;
-        Ok::<(), anyhow::Error>(())
-    });
-    let mut peer_to_stdout = tokio::spawn(async move {
-        let mut stdout = io::stdout();
-        io::copy(&mut recv, &mut stdout)
+        // Do not close the connection while its final bytes are still in flight.
+        let stopped = timeout(TCP_PROXY_IDLE_TIMEOUT, send.stopped())
             .await
-            .context("failed to copy esp peer to stdout")?;
-        stdout.flush().await.context("failed to flush stdout")?;
+            .context("timed out finishing esp send stream")?
+            .context("failed to finish delivery to esp peer")?;
+        if let Some(code) = stopped {
+            bail!("esp peer stopped receiving with code {code}");
+        }
         Ok::<(), anyhow::Error>(())
-    });
-
-    tokio::select! {
-        result = &mut stdin_to_peer => {
-            result.context("stdin proxy task failed")??;
-            peer_to_stdout.abort();
-        }
-        result = &mut peer_to_stdout => {
-            result.context("stdout proxy task failed")??;
-            stdin_to_peer.abort();
-        }
-    }
-
-    conn.close(GRACEFUL_CLOSE, b"bye");
-    endpoint.close().await;
+    };
+    let download = async {
+        copy_with_idle_timeout(
+            &mut recv,
+            &mut write,
+            TCP_PROXY_IDLE_TIMEOUT,
+            "esp peer to local socket",
+        )
+        .await?;
+        timeout(TCP_PROXY_IDLE_TIMEOUT, write.shutdown())
+            .await
+            .context("timed out shutting down local socket")?
+            .context("failed to shutdown local socket")?;
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::try_join!(upload, download)?;
     Ok(())
 }
 
@@ -2619,7 +2966,7 @@ async fn handle_tcp_proxy_connection(
     actor: ConfigActorHandle,
     allowed_ports: &[u16],
 ) -> Result<()> {
-    let (mut send, mut recv) = timeout(TCP_PROXY_SETUP_TIMEOUT, conn.accept_bi())
+    let (send, mut recv) = timeout(TCP_PROXY_SETUP_TIMEOUT, conn.accept_bi())
         .await
         .context("timed out waiting for TCP proxy stream")?
         .context("failed to accept TCP proxy stream")?;
@@ -2644,46 +2991,8 @@ async fn handle_tcp_proxy_connection(
     .await
     .with_context(|| format!("timed out connecting to 127.0.0.1:{port}"))?
     .with_context(|| format!("failed to connect to 127.0.0.1:{port}"))?;
-    let (mut tcp_read, mut tcp_write) = tcp.into_split();
-
-    let mut peer_to_tcp = tokio::spawn(async move {
-        copy_with_idle_timeout(
-            &mut recv,
-            &mut tcp_write,
-            TCP_PROXY_IDLE_TIMEOUT,
-            "esp peer to local TCP socket",
-        )
-        .await?;
-        tcp_write
-            .shutdown()
-            .await
-            .context("failed to shutdown local TCP write side")?;
-        Ok::<(), anyhow::Error>(())
-    });
-    let mut tcp_to_peer = tokio::spawn(async move {
-        copy_with_idle_timeout(
-            &mut tcp_read,
-            &mut send,
-            TCP_PROXY_IDLE_TIMEOUT,
-            "local TCP socket to esp peer",
-        )
-        .await?;
-        send.finish().context("failed to finish esp send stream")?;
-        Ok::<(), anyhow::Error>(())
-    });
-
-    tokio::select! {
-        result = &mut peer_to_tcp => {
-            result.context("peer-to-tcp proxy task failed")??;
-            tcp_to_peer.abort();
-        }
-        result = &mut tcp_to_peer => {
-            result.context("tcp-to-peer proxy task failed")??;
-            peer_to_tcp.abort();
-        }
-    }
-    conn.close(GRACEFUL_CLOSE, b"bye");
-    Ok(())
+    let (read, write) = tcp.into_split();
+    bridge_proxy(read, write, send, recv).await
 }
 
 async fn copy_with_idle_timeout<R, W>(
@@ -2772,33 +3081,33 @@ fn first_disallowed_port(requested_ports: &[u16], allowed_ports: &[u16]) -> Opti
 }
 
 async fn read_proxy_request(recv: &mut iroh::endpoint::RecvStream) -> Result<TcpProxyRequest> {
-    read_yaml_frame(recv, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
+    read_cbor_frame(recv, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
 }
 
 async fn write_proxy_request(
     send: &mut iroh::endpoint::SendStream,
     request: &TcpProxyRequest,
 ) -> Result<()> {
-    write_yaml_frame(send, request, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
+    write_cbor_frame(send, request, MAX_PROXY_REQUEST_LEN, "TCP proxy request").await
 }
 
 async fn read_control_hello(recv: &mut iroh::endpoint::RecvStream) -> Result<Hello> {
-    read_yaml_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
+    read_cbor_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
 }
 
 async fn write_control_hello(send: &mut iroh::endpoint::SendStream, hello: &Hello) -> Result<()> {
-    write_yaml_frame(send, hello, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
+    write_cbor_frame(send, hello, MAX_CONTROL_MESSAGE_LEN, "esp control hello").await
 }
 
 async fn read_control_response(recv: &mut iroh::endpoint::RecvStream) -> Result<ControlResponse> {
-    read_yaml_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control response").await
+    read_cbor_frame(recv, MAX_CONTROL_MESSAGE_LEN, "esp control response").await
 }
 
 async fn write_control_response(
     send: &mut iroh::endpoint::SendStream,
     response: &ControlResponse,
 ) -> Result<()> {
-    write_yaml_frame(
+    write_cbor_frame(
         send,
         response,
         MAX_CONTROL_MESSAGE_LEN,
@@ -2820,10 +3129,10 @@ async fn finish_control_send(send: &mut iroh::endpoint::SendStream) -> Result<()
     Ok(())
 }
 
-async fn read_yaml_frame<R, T>(recv: &mut R, max_len: usize, label: &str) -> Result<T>
+async fn read_cbor_frame<R, T>(recv: &mut R, max_len: usize, label: &str) -> Result<T>
 where
     R: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: for<'b> Decode<'b, ()>,
 {
     let mut len = [0u8; 2];
     recv.read_exact(&mut len)
@@ -2838,15 +3147,15 @@ where
     recv.read_exact(&mut data)
         .await
         .with_context(|| format!("failed to read {label}"))?;
-    serde_yaml::from_slice(&data).with_context(|| format!("invalid {label}"))
+    cbor::decode_exact(&data).with_context(|| format!("invalid {label}"))
 }
 
-async fn write_yaml_frame<W, T>(send: &mut W, value: &T, max_len: usize, label: &str) -> Result<()>
+async fn write_cbor_frame<W, T>(send: &mut W, value: &T, max_len: usize, label: &str) -> Result<()>
 where
     W: AsyncWrite + Unpin,
-    T: Serialize,
+    T: Encode<()>,
 {
-    let data = serde_yaml::to_string(value)?.into_bytes();
+    let data = minicbor::to_vec(value).with_context(|| format!("failed to encode {label}"))?;
     if data.len() > max_len || data.len() > usize::from(u16::MAX) {
         bail!("{label} is too large");
     }
@@ -3401,6 +3710,7 @@ impl Config {
         let Some(proof) = proof else {
             return Ok(None);
         };
+        validate_invite_secret(&proof.invite_secret)?;
         let secret_hash = hash_invite_secret(&proof.invite_secret);
         self.invites
             .iter()
@@ -3511,113 +3821,23 @@ impl MembershipCertificate {
 
     fn encode_compact(&self) -> Result<String> {
         self.signature_payload()?;
-        let network_id =
-            Uuid::parse_str(&self.network_id).context("membership network_id must be a UUID")?;
+        decode_signature(&self.signature)?;
         if !is_valid_connection_id(&self.subject_connection_id) {
             bail!("membership certificate has invalid connection id");
         }
-        let allowed_ports = self.allowed_ports()?;
-        let signature = decode_signature(&self.signature)
-            .context("membership certificate signature is invalid")?
-            .to_bytes();
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut certificate = message.init_root::<esp_capnp::membership_certificate::Builder>();
-            certificate.set_version(self.version);
-            certificate.set_network_id(network_id.as_bytes());
-            certificate.set_subject_node_id(self.subject_node_id.as_bytes());
-            certificate.set_subject_connection_id(&self.subject_connection_id);
-            certificate.set_role(self.role.to_capnp());
-            certificate.set_issuer_node_id(self.issuer_node_id.as_bytes());
-            certificate.set_signature(&signature);
-
-            let len: u32 = allowed_ports
-                .len()
-                .try_into()
-                .map_err(|_| anyhow!("membership certificate has too many allowed ports"))?;
-            let mut ports = certificate.init_allowed_ports(len);
-            for (index, port) in allowed_ports.into_iter().enumerate() {
-                ports.set(index as u32, port);
-            }
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize_packed::write_message(&mut bytes, &message)
-            .context("failed to encode membership certificate")?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        cbor::encode_compact(self).context("failed to encode membership certificate")
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(code.trim())
-            .context("membership certificate is not valid base64")?;
-        let reader = capnp::serialize_packed::read_message(
-            &mut &bytes[..],
-            capnp::message::ReaderOptions::new(),
-        )
-        .context("membership certificate is not a valid Cap'n Proto message")?;
-        let message = reader
-            .get_root::<esp_capnp::membership_certificate::Reader>()
-            .context("membership certificate is missing a message root")?;
-
-        let version = message.get_version();
-        if version != MEMBERSHIP_CERTIFICATE_VERSION {
-            bail!("unsupported membership certificate version {version}");
+        let mut value: Self =
+            cbor::decode_compact(code).context("invalid membership certificate")?;
+        value.signature_payload()?;
+        decode_signature(&value.signature)?;
+        if !is_valid_connection_id(&value.subject_connection_id) {
+            bail!("membership certificate has invalid connection id");
         }
-        let network_id = Uuid::from_bytes(read_capnp_array(
-            message
-                .get_network_id()
-                .context("membership network_id is missing or invalid")?,
-            "membership network_id",
-        )?)
-        .to_string();
-        let subject_node_id = decode_endpoint_id(
-            message
-                .get_subject_node_id()
-                .context("membership subject_node_id is missing or invalid")?,
-            "membership subject_node_id",
-        )?;
-        let subject_connection_id = decode_connection_id(
-            message
-                .get_subject_connection_id()
-                .context("membership connection id is missing or invalid")?
-                .to_str()
-                .context("membership connection id is not valid utf-8")?,
-            "membership connection id",
-        )?;
-        let role = MembershipRole::from_capnp(
-            message
-                .get_role()
-                .context("membership role is not defined in this schema")?,
-        );
-        let allowed_ports = message
-            .get_allowed_ports()
-            .context("membership allowed ports are missing or invalid")?
-            .into_iter()
-            .collect::<Vec<_>>();
-        let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
-        let issuer_node_id = decode_endpoint_id(
-            message
-                .get_issuer_node_id()
-                .context("membership issuer_node_id is missing or invalid")?,
-            "membership issuer_node_id",
-        )?;
-        let signature = encode_signature(&Signature::from_bytes(&read_capnp_array(
-            message
-                .get_signature()
-                .context("membership signature is missing or invalid")?,
-            "membership signature",
-        )?));
-
-        Ok(Self {
-            version,
-            network_id,
-            subject_node_id,
-            subject_connection_id,
-            role,
-            allowed_ports,
-            issuer_node_id,
-            signature,
-        })
+        value.allowed_ports = value.allowed_ports()?;
+        Ok(value)
     }
 
     fn matches_peer(&self, cfg: &Config, peer: &Peer) -> Result<()> {
@@ -3652,6 +3872,7 @@ impl MembershipCertificate {
                 self.version
             );
         }
+        validate_network_id(&self.network_id)?;
         let fields = [
             self.version.to_string(),
             self.network_id.clone(),
@@ -3706,80 +3927,15 @@ impl NetworkPolicyCertificate {
 
     fn encode_compact(&self) -> Result<String> {
         self.signature_payload()?;
-        let network_id = Uuid::parse_str(&self.network_id)
-            .context("network policy network_id must be a UUID")?;
-        let max_peers: u32 = self
-            .max_peers
-            .try_into()
-            .map_err(|_| anyhow!("network policy max_peers is too large"))?;
-        let signature = decode_signature(&self.signature)
-            .context("network policy signature is invalid")?
-            .to_bytes();
-
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut policy = message.init_root::<esp_capnp::network_policy_certificate::Builder>();
-            policy.set_version(self.version);
-            policy.set_network_id(network_id.as_bytes());
-            policy.set_max_peers(max_peers);
-            policy.set_issuer_node_id(self.issuer_node_id.as_bytes());
-            policy.set_issued_at_unix(self.issued_at_unix);
-            policy.set_signature(&signature);
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize_packed::write_message(&mut bytes, &message)
-            .context("failed to encode network policy")?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        decode_signature(&self.signature)?;
+        cbor::encode_compact(self).context("failed to encode network policy")
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(code.trim())
-            .context("network policy is not valid base64")?;
-        let reader = capnp::serialize_packed::read_message(
-            &mut &bytes[..],
-            capnp::message::ReaderOptions::new(),
-        )
-        .context("network policy is not a valid Cap'n Proto message")?;
-        let message = reader
-            .get_root::<esp_capnp::network_policy_certificate::Reader>()
-            .context("network policy is missing a message root")?;
-
-        let version = message.get_version();
-        if version != NETWORK_POLICY_VERSION {
-            bail!("unsupported network policy version {version}");
-        }
-        let network_id = Uuid::from_bytes(read_capnp_array(
-            message
-                .get_network_id()
-                .context("network policy network_id is missing or invalid")?,
-            "network policy network_id",
-        )?)
-        .to_string();
-        let max_peers = message.get_max_peers() as usize;
-        validate_max_known_peers(max_peers)?;
-        let issuer_node_id = decode_endpoint_id(
-            message
-                .get_issuer_node_id()
-                .context("network policy issuer_node_id is missing or invalid")?,
-            "network policy issuer_node_id",
-        )?;
-        let issued_at_unix = message.get_issued_at_unix();
-        let signature = encode_signature(&Signature::from_bytes(&read_capnp_array(
-            message
-                .get_signature()
-                .context("network policy signature is missing or invalid")?,
-            "network policy signature",
-        )?));
-
-        Ok(Self {
-            version,
-            network_id,
-            max_peers,
-            issuer_node_id,
-            issued_at_unix,
-            signature,
-        })
+        let value: Self = cbor::decode_compact(code).context("invalid network policy")?;
+        value.signature_payload()?;
+        decode_signature(&value.signature)?;
+        Ok(value)
     }
 
     fn verify_signature(&self) -> Result<()> {
@@ -3794,6 +3950,7 @@ impl NetworkPolicyCertificate {
         if self.version != NETWORK_POLICY_VERSION {
             bail!("unsupported network policy version {}", self.version);
         }
+        validate_network_id(&self.network_id)?;
         validate_max_known_peers(self.max_peers)?;
         let fields = [
             self.version.to_string(),
@@ -3828,80 +3985,15 @@ impl RevocationCertificate {
 
     fn encode_compact(&self) -> Result<String> {
         self.signature_payload()?;
-        let network_id =
-            Uuid::parse_str(&self.network_id).context("revocation network_id must be a UUID")?;
-        let signature = decode_signature(&self.signature)
-            .context("revocation signature is invalid")?
-            .to_bytes();
-
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut revocation = message.init_root::<esp_capnp::revocation_certificate::Builder>();
-            revocation.set_version(self.version);
-            revocation.set_network_id(network_id.as_bytes());
-            revocation.set_subject_node_id(self.subject_node_id.as_bytes());
-            revocation.set_issuer_node_id(self.issuer_node_id.as_bytes());
-            revocation.set_issued_at_unix(self.issued_at_unix);
-            revocation.set_signature(&signature);
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize_packed::write_message(&mut bytes, &message)
-            .context("failed to encode revocation")?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+        decode_signature(&self.signature)?;
+        cbor::encode_compact(self).context("failed to encode revocation")
     }
 
     fn decode_compact(code: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(code.trim())
-            .context("revocation is not valid base64")?;
-        let reader = capnp::serialize_packed::read_message(
-            &mut &bytes[..],
-            capnp::message::ReaderOptions::new(),
-        )
-        .context("revocation is not a valid Cap'n Proto message")?;
-        let message = reader
-            .get_root::<esp_capnp::revocation_certificate::Reader>()
-            .context("revocation is missing a message root")?;
-
-        let version = message.get_version();
-        if version != REVOCATION_CERTIFICATE_VERSION {
-            bail!("unsupported revocation version {version}");
-        }
-        let network_id = Uuid::from_bytes(read_capnp_array(
-            message
-                .get_network_id()
-                .context("revocation network_id is missing or invalid")?,
-            "revocation network_id",
-        )?)
-        .to_string();
-        let subject_node_id = decode_endpoint_id(
-            message
-                .get_subject_node_id()
-                .context("revocation subject_node_id is missing or invalid")?,
-            "revocation subject_node_id",
-        )?;
-        let issuer_node_id = decode_endpoint_id(
-            message
-                .get_issuer_node_id()
-                .context("revocation issuer_node_id is missing or invalid")?,
-            "revocation issuer_node_id",
-        )?;
-        let issued_at_unix = message.get_issued_at_unix();
-        let signature = encode_signature(&Signature::from_bytes(&read_capnp_array(
-            message
-                .get_signature()
-                .context("revocation signature is missing or invalid")?,
-            "revocation signature",
-        )?));
-
-        Ok(Self {
-            version,
-            network_id,
-            subject_node_id,
-            issuer_node_id,
-            issued_at_unix,
-            signature,
-        })
+        let value: Self = cbor::decode_compact(code).context("invalid revocation")?;
+        value.signature_payload()?;
+        decode_signature(&value.signature)?;
+        Ok(value)
     }
 
     fn verify_signature(&self) -> Result<()> {
@@ -3916,6 +4008,7 @@ impl RevocationCertificate {
         if self.version != REVOCATION_CERTIFICATE_VERSION {
             bail!("unsupported revocation version {}", self.version);
         }
+        validate_network_id(&self.network_id)?;
         let fields = [
             self.version.to_string(),
             self.network_id.clone(),
@@ -4397,10 +4490,10 @@ fn encode_signature(signature: &Signature) -> String {
 fn decode_signature(encoded: &str) -> Result<Signature> {
     let bytes = URL_SAFE_NO_PAD
         .decode(encoded.trim())
-        .context("membership signature is not valid base64")?;
+        .context("signature is not valid base64")?;
     let bytes: [u8; Signature::LENGTH] = bytes
         .try_into()
-        .map_err(|_| anyhow!("membership signature must decode to 64 bytes"))?;
+        .map_err(|_| anyhow!("signature must decode to 64 bytes"))?;
     Ok(Signature::from_bytes(&bytes))
 }
 
@@ -4467,8 +4560,23 @@ pub fn is_valid_connection_id(id: &str) -> bool {
     id.len() == 6 && id.chars().all(|ch| ch.is_ascii_alphanumeric())
 }
 
+fn validate_network_id(id: &str) -> Result<()> {
+    Uuid::parse_str(id).context("network id must be a UUID")?;
+    Ok(())
+}
+
 fn generate_invite_secret() -> String {
     URL_SAFE_NO_PAD.encode(Uuid::new_v4().as_bytes())
+}
+
+fn validate_invite_secret(secret: &str) -> Result<()> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(secret)
+        .context("invite secret is not valid base64")?;
+    if bytes.len() != 16 {
+        bail!("invite secret must decode to 16 bytes");
+    }
+    Ok(())
 }
 
 fn hash_invite_secret(secret: &str) -> String {
@@ -4490,123 +4598,39 @@ fn decode_secret_key(encoded: &str) -> Result<SecretKey> {
 }
 
 impl Invite {
-    pub fn encode(&self) -> Result<String> {
+    fn validate(&self) -> Result<()> {
         if self.version != INVITE_VERSION {
             bail!("unsupported invite version {}", self.version);
         }
-        let network_id =
-            Uuid::parse_str(&self.network_id).context("invite network_id must be a UUID")?;
         if !is_valid_connection_id(&self.invite_id) {
             bail!("invite id must be six base62 characters");
         }
-        let invite_secret = URL_SAFE_NO_PAD
-            .decode(self.invite_secret.trim())
-            .context("invite secret is not valid base64")?;
-        let invite_secret: [u8; INVITE_SECRET_BYTES] = invite_secret
-            .try_into()
-            .map_err(|_| anyhow!("invite secret must decode to {INVITE_SECRET_BYTES} bytes"))?;
+        validate_network_id(&self.network_id)?;
+        validate_invite_secret(&self.invite_secret)?;
+        Ok(())
+    }
 
-        let mut message = capnp::message::Builder::new_default();
-        {
-            let mut invite = message.init_root::<esp_capnp::invite::Builder>();
-            invite.set_version(self.version);
-            invite.set_network_id(network_id.as_bytes());
-            invite.set_invite_id(&self.invite_id);
-            invite.set_invite_secret(&invite_secret);
-            invite.set_creator_node_id(self.creator_node_id.as_bytes());
-            invite.set_inviter_node_id(self.inviter_node_id.as_bytes());
-        }
-        let mut bytes = Vec::new();
-        capnp::serialize_packed::write_message(&mut bytes, &message)
-            .context("failed to encode invite code")?;
-        Ok(URL_SAFE_NO_PAD.encode(bytes))
+    pub fn encode(&self) -> Result<String> {
+        self.validate()?;
+        cbor::encode_compact(self).context("failed to encode invite code")
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(code.trim())
-            .context("invite code is not valid base64")?;
-        let reader = capnp::serialize_packed::read_message(
-            &mut &bytes[..],
-            capnp::message::ReaderOptions::new(),
-        )
-        .context("invite code is not a valid Cap'n Proto message")?;
-        let invite = reader
-            .get_root::<esp_capnp::invite::Reader>()
-            .context("invite code is missing an invite message")?;
-
-        let version = invite.get_version();
-        if version != INVITE_VERSION {
-            bail!("unsupported invite version {version}");
-        }
-
-        let network_id = Uuid::from_bytes(read_capnp_array(
-            invite
-                .get_network_id()
-                .context("invite network_id is missing or invalid")?,
-            "invite network_id",
-        )?)
-        .to_string();
-        let creator_node_id = decode_endpoint_id(
-            invite
-                .get_creator_node_id()
-                .context("creator node id is missing or invalid")?,
-            "creator node id",
-        )?;
-        let inviter_node_id = decode_endpoint_id(
-            invite
-                .get_inviter_node_id()
-                .context("inviter node id is missing or invalid")?,
-            "inviter node id",
-        )?;
-        let invite_id = invite
-            .get_invite_id()
-            .context("invite id is missing or invalid")?
-            .to_str()
-            .context("invite id is not valid UTF-8")?
-            .to_string();
-        if !is_valid_connection_id(&invite_id) {
-            bail!("invite id must be six base62 characters");
-        }
-        let invite_secret = URL_SAFE_NO_PAD.encode(read_capnp_array::<INVITE_SECRET_BYTES>(
-            invite
-                .get_invite_secret()
-                .context("invite secret is missing or invalid")?,
-            "invite secret",
-        )?);
-        Ok(Self {
-            version,
-            network_id,
-            invite_id,
-            invite_secret,
-            creator_node_id,
-            inviter_node_id,
-        })
+        let invite: Self = cbor::decode_compact(code).context("invalid invite code")?;
+        invite.validate()?;
+        Ok(invite)
     }
-}
-
-fn decode_endpoint_id(bytes: &[u8], label: &str) -> Result<EndpointId> {
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow!("{label} must be 32 bytes"))?;
-    EndpointId::from_bytes(&bytes).with_context(|| format!("{label} is invalid"))
-}
-
-fn read_capnp_array<const N: usize>(bytes: &[u8], label: &str) -> Result<[u8; N]> {
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("{label} must be {N} bytes"))
-}
-
-fn decode_connection_id(id: &str, label: &str) -> Result<String> {
-    if !is_valid_connection_id(id) {
-        bail!("{label} must be six base62 characters");
-    }
-    Ok(id.to_string())
 }
 
 #[cfg(not(test))]
-#[tokio::main]
-async fn main() -> Result<()> {
-    run().await
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("failed to start async runtime")?;
+    let result = runtime.block_on(run());
+    // Tokio stdin uses an uncancellable blocking read. After remote EOF, SSH may
+    // still hold stdin open; do not let that read prevent the proxy from exiting.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    result
 }
