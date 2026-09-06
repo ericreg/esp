@@ -7,6 +7,10 @@ use iroh::{EndpointAddr, RelayConfig, address_lookup::memory::MemoryLookup};
 use iroh_relay::server::{Server, testing};
 use tokio::{net::TcpListener, task::JoinHandle};
 
+async fn open_local_proxy(path: &Path, target: String, port: u16) -> Result<UnixStream> {
+    request_local_proxy(UnixStream::connect(path).await?, target, port).await
+}
+
 /// Real daemon handlers and QUIC streams, with a private relay and no IP transport
 /// or public discovery services. Every byte must travel through the relay.
 struct ProxyFixture {
@@ -25,6 +29,10 @@ struct ProxyFixture {
 
 impl ProxyFixture {
     async fn new(max_connections: usize) -> Self {
+        Self::with_transport_idle(max_connections, None).await
+    }
+
+    async fn with_transport_idle(max_connections: usize, idle: Option<Duration>) -> Self {
         let dir = std::env::temp_dir().join(format!("esp-p-{}", Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         // Keep the path under macOS's Unix socket path length limit.
@@ -98,13 +106,17 @@ impl ProxyFixture {
         let remote_actor = spawn_config_actor(dir.join("remote.yml"), remote_cfg);
 
         let mut endpoints = Vec::new();
-        for key in [local_key, remote_key] {
+        for (index, key) in [local_key, remote_key].into_iter().enumerate() {
             lookup.add_endpoint_info(
                 EndpointAddr::new(key.public()).with_relay_url(relay_url.clone()),
             );
             let endpoint = Endpoint::builder(presets::Minimal)
                 .secret_key(key)
-                .alpns(vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()])
+                .alpns(if index == 0 && idle.is_some() {
+                    vec![CONTROL_ALPN.to_vec()]
+                } else {
+                    vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()]
+                })
                 .relay_mode(RelayMode::Custom(relay_map.clone()))
                 .address_lookup(lookup.clone())
                 .clear_ip_transports()
@@ -119,11 +131,28 @@ impl ProxyFixture {
         let remote = endpoints.pop().unwrap();
         let local = endpoints.pop().unwrap();
         let listener = bind_local_control_socket(&socket).unwrap();
-        let local_server = tokio::spawn(run_local_control_server(
-            listener,
-            actor.clone(),
-            local.clone(),
-        ));
+        let local_server = if let Some(idle) = idle {
+            let lock = transport::try_lock(&socket).unwrap().unwrap();
+            let guard = LocalControlSocket {
+                path: socket.clone(),
+            };
+            let actor = actor.clone();
+            let endpoint = local.clone();
+            tokio::spawn(async move {
+                let _lock = lock;
+                let _guard = guard;
+                transport::serve(listener, actor, endpoint, idle)
+                    .await
+                    .unwrap();
+            })
+        } else {
+            tokio::spawn(run_local_control_server(
+                listener,
+                actor.clone(),
+                local.clone(),
+                None,
+            ))
+        };
         let remote_server = tokio::spawn(run_acceptor(
             remote.clone(),
             remote_actor.clone(),
@@ -297,6 +326,113 @@ async fn proxy_preserves_response_after_stdin_eof() {
 }
 
 #[tokio::test]
+async fn shared_transport_survives_first_proxy_exit_and_closes_after_last_session() {
+    let idle = Duration::from_secs(1);
+    let mut fixture = ProxyFixture::with_transport_idle(8, Some(idle)).await;
+    // Keep the short test timer from expiring while macOS starts fresh binaries.
+    let startup_lease = UnixStream::connect(&fixture.socket).await.unwrap();
+    let replacement = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let echo = tokio::spawn(echo_server(std::mem::replace(
+        &mut fixture.tcp,
+        replacement,
+    )));
+    let start_proxy = || {
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_esp"))
+            .args(["proxy", "remote-host", &fixture.port.to_string()])
+            .env("HOME", &fixture.dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    };
+    let mut first = start_proxy();
+    let mut second = start_proxy();
+    async fn exchange_process(child: &mut tokio::process::Child, payload: &[u8]) {
+        timeout(Duration::from_secs(5), async {
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(payload)
+                .await
+                .unwrap();
+            let mut received = vec![0; payload.len()];
+            if let Err(err) = child
+                .stdout
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut received)
+                .await
+            {
+                let mut errors = String::new();
+                child
+                    .stderr
+                    .as_mut()
+                    .unwrap()
+                    .read_to_string(&mut errors)
+                    .await
+                    .unwrap();
+                panic!(
+                    "proxy read failed for {}: {err}: {errors}",
+                    String::from_utf8_lossy(payload)
+                );
+            }
+            assert_eq!(received, payload);
+        })
+        .await
+        .unwrap();
+    }
+    exchange_process(&mut first, b"first SSH session").await;
+    exchange_process(&mut second, b"second SSH session").await;
+    drop(startup_lease);
+
+    // Client transports do not expose localhost services to inbound peers.
+    assert!(
+        timeout(
+            Duration::from_secs(5),
+            fixture.remote.connect(fixture.local.id(), TCP_ALPN)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+
+    first.kill().await.unwrap();
+    tokio::time::sleep(idle * 2).await;
+    assert!(!fixture.local_server.is_finished());
+    exchange_process(&mut second, b"still connected after first process exited").await;
+    let mut third = start_proxy();
+    exchange_process(&mut third, b"later session shares the live endpoint").await;
+    third.kill().await.unwrap();
+    second.stdin.take();
+    assert!(
+        timeout(Duration::from_secs(5), second.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+
+    timeout(Duration::from_secs(5), async {
+        while !fixture.local_server.is_finished() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("transport did not exit after its final session");
+    assert!(!fixture.socket.exists());
+    assert!(transport::try_lock(&fixture.socket).unwrap().is_some());
+    assert_eq!(
+        fixture.relay.metrics().server.clients_inactive_added.get(),
+        0
+    );
+    echo.abort();
+    fixture.close().await;
+}
+
+#[tokio::test]
 async fn remote_eof_ends_proxy_with_stdin_still_open() {
     let fixture = ProxyFixture::new(8).await;
     let stream = fixture.connect().await;
@@ -415,8 +551,8 @@ async fn revocation_cancels_outgoing_proxy_connections() {
 }
 
 #[test]
-fn proxy_without_daemon_fails_without_creating_an_endpoint() {
-    let dir = std::env::temp_dir().join(format!("esp-no-daemon-{}", Uuid::new_v4()));
+fn proxy_without_config_fails_without_starting_a_transport() {
+    let dir = std::env::temp_dir().join(format!("esp-n-{}", Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_esp"))
         .args(["proxy", "remote-host", "22"])
@@ -426,7 +562,7 @@ fn proxy_without_daemon_fails_without_creating_an_endpoint() {
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(stderr.contains("start it with `esp daemon`"), "{stderr}");
+    assert!(stderr.contains("config.yml"), "{stderr}");
     assert!(!stderr.contains("Endpoint dropped"), "{stderr}");
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     fs::remove_dir(dir).unwrap();

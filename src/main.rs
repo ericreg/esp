@@ -56,6 +56,7 @@ const INCOMING_WORKER_QUEUE: usize = 1;
 const PEER_QUOTA_QUEUE: usize = 256;
 const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 8;
 const LOCAL_CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+const PROXY_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const INCOMING_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -77,6 +78,8 @@ const CONNECTION_ID_ALPHABET: &[u8; 62] =
 static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 mod cbor;
+#[cfg(unix)]
+mod transport;
 
 #[derive(Parser, Debug)]
 #[command(about = "A tiny iroh-backed SSH transport proxy")]
@@ -114,6 +117,10 @@ enum Command {
         /// TCP port to connect to on the peer's localhost.
         port: u16,
     },
+    /// Internal shared transport, started automatically by esp proxy.
+    #[cfg(unix)]
+    #[command(hide = true)]
+    ProxyTransport,
     /// Rename this host in esp.
     Rename { name: String },
     /// Revoke a peer by name, connection id, or node id.
@@ -780,6 +787,8 @@ pub async fn run() -> Result<()> {
         max_connections_per_peer: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS_PER_PEER).unwrap(),
     });
     let is_daemon = matches!(command, Command::Daemon { .. });
+    #[cfg(unix)]
+    let is_daemon = is_daemon || matches!(command, Command::ProxyTransport);
     let _logging_guard = init_logging(is_daemon)?;
 
     match command {
@@ -790,6 +799,8 @@ pub async fn run() -> Result<()> {
             max_connections_per_peer,
         } => daemon(ports, max_connections_per_peer.get()).await,
         Command::Proxy { target, port } => proxy(target, port).await,
+        #[cfg(unix)]
+        Command::ProxyTransport => transport::run().await,
         Command::Rename { name } => rename(&name).await,
         Command::Revoke { target } => revoke(&target).await,
         Command::Policy { max_peers } => update_policy(max_peers).await,
@@ -1216,11 +1227,11 @@ fn print_identity(identity: &HostIdentity) {
     println!("connection id: {}", identity.connection_id);
 }
 
-fn print_status_report(path: &Path, report: &StatusReport, daemon_running: bool) {
+fn print_status_report(path: &Path, report: &StatusReport, transport_running: bool) {
     println!("esp config: {}", path.display());
     println!(
-        "daemon: {}",
-        if daemon_running {
+        "transport: {}",
+        if transport_running {
             "running"
         } else {
             "not running"
@@ -1254,6 +1265,9 @@ fn print_policy_report(report: &NetworkPolicyReport) {
 
 async fn daemon(allowed_ports: Vec<u16>, max_connections_per_peer: usize) -> Result<()> {
     let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
+    #[cfg(unix)]
+    let _transport_lock = transport::try_lock(&local_control_socket_path()?)?
+        .ok_or_else(|| anyhow!("an esp daemon or proxy transport is already running; close active proxies and wait for the transport to become idle before starting a daemon"))?;
     #[cfg(unix)]
     let (local_control_listener, _local_control_socket) =
         prepare_local_control_socket().context("failed to start local esp control")?;
@@ -1333,7 +1347,7 @@ fn spawn_local_control_server(
     actor: ConfigActorHandle,
     endpoint: Endpoint,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_local_control_server(listener, actor, endpoint))
+    tokio::spawn(run_local_control_server(listener, actor, endpoint, None))
 }
 
 #[cfg(unix)]
@@ -1358,7 +1372,7 @@ fn bind_local_control_socket(path: &Path) -> Result<UnixListener> {
             }
             match std::os::unix::net::UnixStream::connect(path) {
                 Ok(_) => bail!(
-                    "esp daemon already appears to be running at {}",
+                    "esp transport already appears to be running at {}",
                     path.display()
                 ),
                 Err(err) if is_local_control_unavailable(&err) => {
@@ -1389,13 +1403,25 @@ async fn run_local_control_server(
     listener: UnixListener,
     actor: ConfigActorHandle,
     endpoint: Endpoint,
+    idle_timeout: Option<Duration>,
 ) {
     // Aborting the server also cancels its sessions instead of detaching them.
     let mut sessions = tokio::task::JoinSet::new();
+    let idle_duration = idle_timeout.unwrap_or(PROXY_TRANSPORT_IDLE_TIMEOUT);
+    let idle = tokio::time::sleep(idle_duration);
+    tokio::pin!(idle);
     loop {
         let accepted = tokio::select! {
+            biased;
             accepted = listener.accept() => accepted,
-            _ = sessions.join_next(), if !sessions.is_empty() => continue,
+            _ = sessions.join_next(), if !sessions.is_empty() => {
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_duration);
+                continue;
+            },
+            _ = &mut idle, if idle_timeout.is_some() && sessions.is_empty() => {
+                info!("shared proxy transport idle; shutting down");
+                return;
+            },
         };
         match accepted {
             Ok((stream, _addr)) => {
@@ -2723,26 +2749,31 @@ fn ensure_peer_capacity(cfg: &Config, node_id: EndpointId) -> Result<()> {
 async fn proxy(target: String, port: u16) -> Result<()> {
     #[cfg(unix)]
     {
-        let stream = open_local_proxy(&local_control_socket_path()?, target, port).await?;
+        let stream = transport::open_proxy(
+            &local_control_socket_path()?,
+            &config_path()?,
+            &std::env::current_exe().context("failed to locate esp executable")?,
+            target,
+            port,
+        )
+        .await?;
         proxy_stdio(io::stdin(), io::stdout(), stream).await
     }
     #[cfg(not(unix))]
     {
         let _ = (target, port);
         bail!(
-            "esp proxy requires a local daemon over a Unix socket; this platform is not supported"
+            "esp proxy requires a shared transport over a Unix socket; this platform is not supported"
         )
     }
 }
 
 #[cfg(unix)]
-async fn open_local_proxy(path: &Path, target: String, port: u16) -> Result<UnixStream> {
-    let mut stream = UnixStream::connect(path).await.with_context(|| {
-        format!(
-            "failed to connect to local esp daemon at {}; start it with `esp daemon`",
-            path.display()
-        )
-    })?;
+async fn request_local_proxy(
+    mut stream: UnixStream,
+    target: String,
+    port: u16,
+) -> Result<UnixStream> {
     timeout(
         LOCAL_CONTROL_SETUP_TIMEOUT + Duration::from_secs(5),
         async {
@@ -2759,11 +2790,13 @@ async fn open_local_proxy(path: &Path, target: String, port: u16) -> Result<Unix
                 "local esp proxy response",
             )
             .await
-            .context("failed to read proxy response; ensure the local esp daemon is up to date")?;
+            .context(
+                "failed to read proxy response; ensure the local esp transport is up to date",
+            )?;
             match response {
                 LocalProxyResponse::Ready => Ok(()),
                 LocalProxyResponse::Error(error) => {
-                    bail!("local esp daemon rejected proxy: {error}")
+                    bail!("local esp transport rejected proxy: {error}")
                 }
             }
         },
@@ -2792,7 +2825,7 @@ where
     let download = async {
         io::copy(&mut read, &mut output)
             .await
-            .context("failed to copy esp daemon to stdout")?;
+            .context("failed to copy esp transport to stdout")?;
         output.flush().await.context("failed to flush stdout")
     };
     tokio::pin!(upload, download);

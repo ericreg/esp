@@ -100,7 +100,8 @@ and its unique case-sensitive, six-character base62 connection id when it joins
 and when it initiates a proxy connection. Duplicate names are allowed but must
 be disambiguated by id.
 
-Once daemons are connected, SSH through esp to any learned peer:
+Keep `esp daemon` running on machines that should accept incoming connections.
+From a client, SSH through esp to any learned peer:
 
 ```sh
 ssh -o ProxyCommand='esp proxy %n %p' user@host
@@ -122,11 +123,17 @@ Then connect normally:
 ssh host
 ```
 
-The local daemon must also be running (`esp daemon`). Each `esp proxy` talks to
-that daemon through `~/.esp.sock`; the daemon uses its single iroh endpoint to
-open a separate connection for each SSH session. Multiple sessions can run at
-once, and closing one session leaves the others connected. If the local daemon
-is unavailable, `esp proxy` exits with instructions to start it.
+`esp proxy` automatically starts a shared background transport when needed and
+connects to it through `~/.esp.sock`. Other proxy processes reuse that transport;
+each SSH session gets its own connection through the same iroh endpoint. Closing
+the first session leaves the others connected. Once all local sessions have
+ended, the background transport exits after 30 seconds of inactivity. The next
+SSH session starts it again automatically.
+
+If a local daemon is already running, proxies use its endpoint. The automatic
+client transport handles outgoing sessions and control updates; incoming TCP
+forwarding requires `esp daemon` on the receiving host. To start a daemon while
+the client transport is running, close local proxy sessions and let it exit.
 
 By default, a daemon accepts up to eight concurrent incoming connections from
 each peer, including control syncs. To allow more, set the limit on the receiving
@@ -155,7 +162,7 @@ esp rename NAME       # rename this host
 esp revoke TARGET     # revoke a peer by name, connection id, or node id as an admin
 esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite --role peer --ports 22 # create and print an invite as an admin
-esp status            # show daemon state, local node, and peer details
+esp status            # show local transport state, local node, and peer details
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer
 ```
@@ -196,7 +203,8 @@ sudo loginctl enable-linger "$USER"
 
 ## Leaving
 
-There is no leave command. Stop the daemon and delete `~/.esp/config.yml`.
+There is no leave command. Stop any daemon, close local SSH sessions, wait for
+the automatic transport to exit, and delete `~/.esp/config.yml`.
 
 ## Security
 
@@ -225,11 +233,12 @@ local TCP connection.
 - Admins can revoke peers with `esp revoke TARGET`. Revocations are signed,
   persisted, shared during control/proxy sync, and cause the daemon to close
   active connections from the revoked node.
-- `esp status` asks the daemon first and shows whether it is running. If the
-  daemon is unavailable, it falls back to the local config so peers can still
-  inspect their node identity. When the daemon is running, local `esp invite`,
+- `esp status` asks the local transport (a daemon or automatic client helper)
+  first and shows whether it is running. If it is unavailable, it falls back to
+  the local config so peers can still inspect their node identity. While a
+  transport is running, local `esp invite`,
   `esp rename`, `esp revoke`, `esp policy`, and existing-config `esp init`
-  commands use the daemon's private local control socket instead of writing
+  commands use its private local control socket instead of writing
   `~/.esp/config.yml` directly.
 - Admins act as the peer directory. Generic hellos from peers carry only their
   self identity, membership chain, signed network policy, and revocations; only

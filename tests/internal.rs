@@ -1060,6 +1060,7 @@ async fn local_control_invite_uses_config_actor() {
         listener,
         actor.clone(),
         endpoint.clone(),
+        None,
     ));
 
     let response = send_local_control_request_to_path(
