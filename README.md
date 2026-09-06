@@ -7,10 +7,16 @@ It is an SSH transport helper, not a general VPN manager.
 
 ## Installation
 
-From this checkout:
+With Rust and `just` installed, run from this checkout:
 
 ```sh
-cargo install --path . --force
+just install
+```
+
+Or run Cargo directly:
+
+```sh
+cargo install --locked --path . --force
 ```
 
 This installs `esp` into Cargo's bin directory, usually `~/.cargo/bin`. Make
