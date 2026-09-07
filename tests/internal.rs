@@ -2,6 +2,8 @@
 
 include!("../src/main.rs");
 
+use std::collections::HashSet;
+
 const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 fn creator_config(secret_key: &SecretKey) -> Config {
@@ -1042,7 +1044,7 @@ async fn config_actor_revoke_cancels_active_connections() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn local_control_invite_uses_config_actor() {
+async fn local_control_invites_are_fresh_and_persisted_by_config_actor() {
     let creator_key = SecretKey::generate();
     let cfg = creator_config(&creator_key);
     let path = temp_config_path("local-control");
@@ -1063,25 +1065,39 @@ async fn local_control_invite_uses_config_actor() {
         None,
     ));
 
-    let response = send_local_control_request_to_path(
-        &socket_path,
-        LocalControlRequest::IssueInvite {
-            ports: vec![DEFAULT_ALLOWED_PORT],
-            role: MembershipRole::Admin,
-        },
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let LocalControlOk::Invite { code } = response else {
-        panic!("expected invite response");
-    };
-    let invite = Invite::decode(&code).unwrap();
+    let mut codes = HashSet::new();
+    let mut secrets = HashSet::new();
+    let mut invite_ids = Vec::new();
+    for _ in 0..3 {
+        let response = send_local_control_request_to_path(
+            &socket_path,
+            LocalControlRequest::IssueInvite {
+                ports: vec![DEFAULT_ALLOWED_PORT],
+                role: MembershipRole::Admin,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let LocalControlOk::Invite { code } = response else {
+            panic!("expected invite response");
+        };
+        let invite = Invite::decode(&code).unwrap();
+        assert_eq!(invite.creator_node_id, invite.inviter_node_id);
+        assert!(codes.insert(code));
+        assert!(!invite_ids.contains(&invite.invite_id));
+        invite_ids.push(invite.invite_id);
+        assert!(secrets.insert(invite.invite_secret));
+    }
     let report = actor.status().await.unwrap();
     let saved = Config::load(&path).unwrap();
 
-    assert_eq!(report.invites, vec![invite.invite_id]);
-    assert_eq!(saved.invites[0].role, MembershipRole::Admin);
+    assert_eq!(report.invites, invite_ids);
+    assert_eq!(saved.invites.len(), invite_ids.len());
+    for (saved_invite, invite_id) in saved.invites.iter().zip(&invite_ids) {
+        assert_eq!(&saved_invite.invite_id, invite_id);
+        assert_eq!(saved_invite.role, MembershipRole::Admin);
+    }
 
     server.abort();
     endpoint.close().await;

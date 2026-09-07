@@ -47,6 +47,11 @@ connection id. Create an invite explicitly:
 esp invite
 ```
 
+Each run creates a fresh, single-use invite, including on the network creator.
+Codes from the same host share a long prefix and suffix because they encode the
+same network and host identities; the random invite id and secret change in the
+middle of the code.
+
 Keep the daemon running on that machine:
 
 ```sh

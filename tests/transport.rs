@@ -3,6 +3,8 @@
 
 include!("../src/main.rs");
 
+use std::collections::HashSet;
+
 struct TransportHome {
     dir: PathBuf,
 }
@@ -109,6 +111,48 @@ fn assert_reached_transport(output: &std::process::Output) {
         "{stderr}"
     );
     assert!(!stderr.contains("Endpoint dropped"), "{stderr}");
+}
+
+#[tokio::test]
+async fn originator_invite_commands_issue_fresh_codes_without_transport() {
+    let home = TransportHome::new();
+    let path = home.dir.join(ESP_DIR).join(CONFIG_FILE);
+    let mut codes = HashSet::new();
+    let mut ids = HashSet::new();
+    let mut secrets = HashSet::new();
+
+    for count in 1..=3 {
+        let output = timeout(
+            Duration::from_secs(5),
+            home.command().arg("invite").output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let code = String::from_utf8(output.stdout).unwrap();
+        let invite = Invite::decode(&code).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(invite.creator_node_id, invite.inviter_node_id);
+        assert_eq!(invite.creator_node_id, cfg.creator_node_id);
+        assert_eq!(cfg.invites.len(), count);
+        assert!(
+            cfg.invite_grant_for_proof(Some(&InviteProof {
+                invite_id: invite.invite_id.clone(),
+                invite_secret: invite.invite_secret.clone(),
+            }))
+            .unwrap()
+            .is_some()
+        );
+        assert!(codes.insert(code));
+        assert!(ids.insert(invite.invite_id));
+        assert!(secrets.insert(invite.invite_secret));
+        assert!(!home.socket().exists());
+    }
 }
 
 #[tokio::test]
