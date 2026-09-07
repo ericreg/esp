@@ -129,7 +129,8 @@ ssh host
 ```
 
 `esp proxy` automatically starts a shared background transport when needed and
-connects to it through `~/.esp.sock`. Other proxy processes reuse that transport;
+connects to it through `~/.esp/.esp.sock`, with its transport lock stored at
+`~/.esp/.esp.lock`. Other proxy processes reuse that transport;
 each SSH session gets its own connection through the same iroh endpoint. Closing
 the first session leaves the others connected. Once all local sessions have
 ended, the background transport exits after 30 seconds of inactivity. The next
@@ -201,7 +202,9 @@ esp rename NAME       # rename this host
 esp revoke TARGET     # revoke a peer by name, connection id, or node id as an admin
 esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite "laptop" --role peer --ports 22 # create and print an invite as an admin
-esp status            # show local transport state, local node, and peer details
+esp status            # show transport, local node, and peers as highlighted JSON
+esp status --no-color # plain JSON for scripts (same as --format json --no-color)
+esp status --format text # original text output, always without color
 esp admin             # interactive two-pane administration (admin members only)
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer

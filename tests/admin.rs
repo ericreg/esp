@@ -270,6 +270,49 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
             .iter()
             .any(|cell| cell.fg == Color::Green && cell.symbol() == "E")
     );
+    // Inspect the details pane independently of the bold selected peer row.
+    for label in [
+        "Admin label:",
+        "Hostname:",
+        "Connection ID:",
+        "Node ID:",
+        "Status:",
+        "Role:",
+        "Allowed ports:",
+        "Invite ID:",
+        "Inviter:",
+        "Joined:",
+        "Active connections:",
+        "Last connected:",
+    ] {
+        let row = (0..30)
+            .find(|&y| {
+                (43..119)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .starts_with(label)
+            })
+            .unwrap_or_else(|| panic!("missing detail label {label}"));
+        for x in 43..43 + label.len() as u16 {
+            assert!(
+                buffer[(x, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::BOLD),
+                "{label}"
+            );
+        }
+        let value = &buffer[(44 + label.len() as u16, row)];
+        if label == "Status:" {
+            assert_eq!(value.symbol(), "C");
+            assert_eq!(value.fg, Color::Green);
+            assert!(value.modifier.contains(ratatui::style::Modifier::BOLD));
+        } else {
+            assert!(
+                !value.modifier.contains(ratatui::style::Modifier::BOLD),
+                "value for {label}"
+            );
+        }
+    }
     app.stale("transport stopped".into());
     let (text, buffer) = screen(&mut app, 80, 24);
     assert!(text.contains("Unknown"));

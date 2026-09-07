@@ -956,6 +956,7 @@ dependencies = [
  "minicbor",
  "ratatui",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "time",

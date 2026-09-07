@@ -79,6 +79,7 @@ static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 mod admin;
 mod cbor;
+mod status_output;
 #[cfg(unix)]
 mod transport;
 
@@ -149,7 +150,14 @@ enum Command {
     /// Browse the network and revoke peers in an interactive terminal.
     Admin,
     /// Print local esp information.
-    Status,
+    Status {
+        /// Output format (text is always uncolored).
+        #[arg(long, value_enum, default_value = "json")]
+        format: status_output::Format,
+        /// Disable JSON syntax highlighting.
+        #[arg(long)]
+        no_color: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -484,7 +492,7 @@ struct HostIdentity {
     connection_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, Serialize)]
 #[cbor(array)]
 struct StatusReport {
     #[n(0)]
@@ -863,7 +871,7 @@ pub async fn run() -> Result<()> {
         Command::Policy { max_peers } => update_policy(max_peers).await,
         Command::Invite { name, ports, role } => print_invite(&name, &ports, role).await,
         Command::Admin => admin::run().await,
-        Command::Status => status().await,
+        Command::Status { format, no_color } => status(format, no_color).await,
     }
 }
 
@@ -1059,16 +1067,22 @@ async fn update_policy(max_peers: usize) -> Result<()> {
     Ok(())
 }
 
-async fn status() -> Result<()> {
+async fn status(format: status_output::Format, no_color: bool) -> Result<()> {
     let path = config_path()?;
     if let Some(report) = request_daemon_status().await? {
-        print_status_report(&path, &report, true);
+        println!(
+            "{}",
+            status_output::render(&path, &report, true, format, no_color)?
+        );
         return Ok(());
     }
 
     let cfg = Config::load(&path)?;
     let report = status_report_from_config(&cfg)?;
-    print_status_report(&path, &report, false);
+    println!(
+        "{}",
+        status_output::render(&path, &report, false, format, no_color)?
+    );
     Ok(())
 }
 
@@ -1292,32 +1306,6 @@ fn print_identity(identity: &HostIdentity) {
     println!("connection id: {}", identity.connection_id);
 }
 
-fn print_status_report(path: &Path, report: &StatusReport, transport_running: bool) {
-    println!("esp config: {}", path.display());
-    println!(
-        "transport: {}",
-        if transport_running {
-            "running"
-        } else {
-            "not running"
-        }
-    );
-    println!("network: {}", report.network_id);
-    println!("max peers: {}", report.max_peers);
-    println!("name: {}", report.name);
-    println!("connection id: {}", report.connection_id);
-    println!("node id: {}", report.node_id);
-    for invite in &report.invites {
-        println!("issued invite: {invite}");
-    }
-    for peer in &report.peers {
-        println!("peer: {} {}", peer.display_name(), peer.node_id);
-    }
-    for revocation in &report.revocations {
-        println!("revoked: {revocation}");
-    }
-}
-
 fn print_revocation_report(report: &RevocationReport) {
     println!("revoked: {} {}", report.display_name, report.node_id);
 }
@@ -1417,8 +1405,7 @@ fn spawn_local_control_server(
 
 #[cfg(unix)]
 fn local_control_socket_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
-    Ok(PathBuf::from(home).join(LOCAL_CONTROL_SOCKET_FILE))
+    Ok(esp_dir()?.join(LOCAL_CONTROL_SOCKET_FILE))
 }
 
 #[cfg(unix)]

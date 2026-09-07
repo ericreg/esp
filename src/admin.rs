@@ -506,7 +506,7 @@ impl App {
             );
         }
         let text = match self.selected() {
-            None => "Select a peer to view its details.".to_string(),
+            None => vec![Line::from("Select a peer to view its details.")],
             Some(peer) => {
                 let status = if !self.view.online {
                     "Unknown"
@@ -515,20 +515,55 @@ impl App {
                 } else {
                     "Disconnected"
                 };
-                let mut text = format!(
-                    "Admin label: {}\nHostname: {}\nConnection ID: {}\nNode ID: {}\nStatus: {}\n",
-                    peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, status
-                );
+                let mut status_value = Span::raw(status);
+                if self.view.online && peer.active_connections > 0 {
+                    status_value = status_value.style(
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                let mut text = vec![
+                    detail_line("Admin label", peer.admin_label.clone()),
+                    detail_line("Hostname", peer.hostname.clone()),
+                    detail_line("Connection ID", peer.connection_id.clone()),
+                    detail_line("Node ID", peer.node_id.to_string()),
+                    detail_line("Status", status_value),
+                ];
                 if let Some(detail) = self
                     .detail
                     .as_ref()
                     .filter(|detail| detail.peer.node_id == peer.node_id)
                 {
-                    text.push_str(&format!("Role: {}\nAllowed ports: {}\nInvite ID: {}\nInviter: {}\nJoined: {}\nActive connections: {}\nLast connected: {}\n\nConnection status and history are observed by this host.",
-                        detail.role, format_ports(&detail.allowed_ports), detail.invite_id.as_deref().unwrap_or(if detail.inviter == peer.node_id { "None (network creator)" } else { "Not recorded" }), detail.inviter,
-                        timestamp(Some(detail.joined_at)), if self.view.online { peer.active_connections.to_string() } else { "Unknown".into() }, timestamp(detail.last_connected)));
+                    text.extend([
+                        detail_line("Role", detail.role.to_string()),
+                        detail_line("Allowed ports", format_ports(&detail.allowed_ports)),
+                        detail_line(
+                            "Invite ID",
+                            detail.invite_id.clone().unwrap_or_else(|| {
+                                if detail.inviter == peer.node_id {
+                                    "None (network creator)".into()
+                                } else {
+                                    "Not recorded".into()
+                                }
+                            }),
+                        ),
+                        detail_line("Inviter", detail.inviter.to_string()),
+                        detail_line("Joined", timestamp(Some(detail.joined_at))),
+                        detail_line(
+                            "Active connections",
+                            if self.view.online {
+                                peer.active_connections.to_string()
+                            } else {
+                                "Unknown".into()
+                            },
+                        ),
+                        detail_line("Last connected", timestamp(detail.last_connected)),
+                        Line::default(),
+                        Line::from("Connection status and history are observed by this host."),
+                    ]);
                 } else {
-                    text.push_str("\nLoading details...");
+                    text.extend([Line::default(), Line::from("Loading details...")]);
                 }
                 text
             }
@@ -570,6 +605,17 @@ impl App {
                 .wrap(Wrap { trim: false }).block(Block::bordered().title(" Confirm revocation ")), dialog);
         }
     }
+}
+
+fn detail_line(label: &str, value: impl Into<Span<'static>>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label}:"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        value.into(),
+    ])
 }
 
 pub(super) fn timestamp(value: Option<u64>) -> String {

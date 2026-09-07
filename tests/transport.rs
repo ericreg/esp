@@ -9,7 +9,11 @@ struct TransportHome {
 
 impl TransportHome {
     fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("esp-t-{}", Uuid::new_v4()));
+        // Leave room for ~/.esp/.esp.sock within macOS's Unix socket path limit.
+        let dir = std::env::temp_dir().join(format!(
+            "esp-t-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ));
         fs::create_dir(&dir).unwrap();
         let key = SecretKey::generate();
         let cfg = create_creator_config(
@@ -25,7 +29,7 @@ impl TransportHome {
     }
 
     fn socket(&self) -> PathBuf {
-        self.dir.join(LOCAL_CONTROL_SOCKET_FILE)
+        self.dir.join(ESP_DIR).join(LOCAL_CONTROL_SOCKET_FILE)
     }
 
     fn pid(&self) -> i32 {
@@ -179,6 +183,8 @@ async fn simultaneous_proxy_processes_start_and_reuse_one_background_transport()
         1
     );
     let pid = home.pid();
+    assert!(!home.dir.join(".esp.sock").exists());
+    assert!(!home.dir.join(".esp.lock").exists());
     let socket_inode = fs::metadata(home.socket()).unwrap().ino();
     assert!(transport::try_lock(&home.socket()).unwrap().is_none());
     for path in [home.socket(), home.socket().with_extension("lock")] {

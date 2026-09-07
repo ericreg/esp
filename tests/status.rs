@@ -1,0 +1,163 @@
+#![allow(dead_code)]
+
+include!("../src/main.rs");
+
+use status_output::{Format, render};
+
+fn report() -> StatusReport {
+    StatusReport {
+        network_id: "test-network".into(),
+        max_peers: 100,
+        name: "laptop \"雪\" \\ path\nnext".into(),
+        connection_id: "LOCAL1".into(),
+        node_id: SecretKey::generate().public(),
+        invites: vec!["invite-1".into()],
+        peers: vec![Peer {
+            node_id: SecretKey::generate().public(),
+            name: "peer".into(),
+            connection_id: "REMOTE".into(),
+        }],
+        revocations: vec![SecretKey::generate().public()],
+    }
+}
+
+fn strip_colors(value: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            assert_eq!(chars.next(), Some('['));
+            for code in chars.by_ref() {
+                if code == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(ch);
+        }
+    }
+    plain
+}
+
+#[test]
+fn json_preserves_status_fields_and_escaping_with_or_without_color() {
+    let report = report();
+    for running in [false, true] {
+        let plain = render(
+            Path::new("/tmp/config.yml"),
+            &report,
+            running,
+            Format::Json,
+            true,
+        )
+        .unwrap();
+        assert!(!plain.contains('\x1b'));
+        let json: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert_eq!(json["config"], "/tmp/config.yml");
+        assert_eq!(
+            json["transport"],
+            if running { "running" } else { "not running" }
+        );
+        assert_eq!(json["network_id"], report.network_id);
+        assert_eq!(json["max_peers"], 100);
+        assert_eq!(json["name"], report.name);
+        assert_eq!(json["connection_id"], report.connection_id);
+        assert_eq!(json["node_id"], report.node_id.to_string());
+        assert_eq!(json["invites"][0], "invite-1");
+        assert_eq!(json["peers"][0]["name"], "peer");
+        assert_eq!(json["peers"][0]["connection_id"], "REMOTE");
+        assert_eq!(
+            json["peers"][0]["node_id"],
+            report.peers[0].node_id.to_string()
+        );
+        assert_eq!(json["revocations"][0], report.revocations[0].to_string());
+        let colored = render(
+            Path::new("/tmp/config.yml"),
+            &report,
+            running,
+            Format::Json,
+            false,
+        )
+        .unwrap();
+        assert!(colored.contains("\x1b[1;36m\"config\"\x1b[0m"));
+        assert!(colored.contains("\x1b[33m100\x1b[0m"));
+        assert_eq!(strip_colors(&colored), plain);
+    }
+}
+
+#[test]
+fn text_preserves_legacy_output_without_added_color() {
+    let mut report = report();
+    report.name = "local".into();
+    let expected = format!(
+        "esp config: /tmp/config.yml\ntransport: running\nnetwork: test-network\nmax peers: 100\nname: local\nconnection id: LOCAL1\nnode id: {}\nissued invite: invite-1\npeer: peer (REMOTE) {}\nrevoked: {}",
+        report.node_id, report.peers[0].node_id, report.revocations[0],
+    );
+    for no_color in [false, true] {
+        assert_eq!(
+            render(
+                Path::new("/tmp/config.yml"),
+                &report,
+                true,
+                Format::Text,
+                no_color
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
+    // Keep the control socket path within macOS's Unix socket path limit.
+    let home = std::env::temp_dir().join(format!(
+        "esp-s-{}",
+        &Uuid::new_v4().simple().to_string()[..12]
+    ));
+    std::fs::create_dir(&home).unwrap();
+    let config = home.join(".esp/config.yml");
+    create_creator_config(
+        &SecretKey::generate(),
+        Uuid::new_v4().to_string(),
+        "local".into(),
+        "LOCAL1".into(),
+        100,
+    )
+    .unwrap()
+    .save(&config)
+    .unwrap();
+    for args in [
+        vec![],
+        vec!["--format", "json"],
+        vec!["--no-color"],
+        vec!["--format", "json", "--no-color"],
+        vec!["--format", "text"],
+        vec!["--format", "text", "--no-color"],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_esp"))
+            .env("HOME", &home)
+            .arg("status")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if args.contains(&"text") {
+            assert!(stdout.starts_with("esp config: "));
+            assert!(stdout.contains("transport: not running\n"));
+            assert!(!stdout.contains('\x1b'));
+        } else {
+            assert_eq!(stdout.contains('\x1b'), !args.contains(&"--no-color"));
+            let json: serde_json::Value = serde_json::from_str(&strip_colors(&stdout)).unwrap();
+            assert_eq!(json["transport"], "not running");
+            assert_eq!(json["peers"], serde_json::json!([]));
+        }
+    }
+    assert!(Cli::try_parse_from(["esp", "status", "--format", "yaml"]).is_err());
+    std::fs::remove_dir_all(home).unwrap();
+}
