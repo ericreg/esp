@@ -2,7 +2,8 @@
 
 include!("../src/main.rs");
 
-use status_output::{Format, render};
+use output::Format;
+use status_output::render;
 
 fn report() -> StatusReport {
     StatusReport {

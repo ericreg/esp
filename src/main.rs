@@ -79,6 +79,7 @@ static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 mod admin;
 mod cbor;
+mod output;
 mod status_output;
 #[cfg(unix)]
 mod transport;
@@ -97,11 +98,15 @@ enum Command {
         /// Maximum number of remote peers this network should remember.
         #[arg(long, default_value_t = DEFAULT_MAX_KNOWN_PEERS)]
         max_peers: usize,
+        #[command(flatten)]
+        output: output::Options,
     },
     /// Join an esp network from an invite code.
     Join {
         /// Invite code printed by the creator.
         invite: String,
+        #[command(flatten)]
+        output: output::Options,
     },
     /// Run the TCP proxy daemon. This is also the default command.
     Daemon {
@@ -124,17 +129,25 @@ enum Command {
     #[command(hide = true)]
     ProxyTransport,
     /// Rename this host in esp.
-    Rename { name: String },
+    Rename {
+        name: String,
+        #[command(flatten)]
+        output: output::Options,
+    },
     /// Revoke a peer by name, connection id, or node id.
     Revoke {
         /// Peer name, six-character connection id, or full node id to revoke.
         target: String,
+        #[command(flatten)]
+        output: output::Options,
     },
     /// Update signed network policy as an admin.
     Policy {
         /// Maximum number of remote peers this network should remember.
         #[arg(long)]
         max_peers: usize,
+        #[command(flatten)]
+        output: output::Options,
     },
     /// Print a fresh invite code for the configured network.
     Invite {
@@ -146,17 +159,15 @@ enum Command {
         /// Role this invite grants to the joined member.
         #[arg(long, value_enum, default_value = "peer")]
         role: MembershipRole,
+        #[command(flatten)]
+        output: output::Options,
     },
     /// Browse the network and revoke peers in an interactive terminal.
     Admin,
     /// Print local esp information.
     Status {
-        /// Output format (text is always uncolored).
-        #[arg(long, value_enum, default_value = "json")]
-        format: status_output::Format,
-        /// Disable JSON syntax highlighting.
-        #[arg(long)]
-        no_color: bool,
+        #[command(flatten)]
+        output: output::Options,
         /// Include the full peer list in addition to the connected peer count.
         #[arg(long)]
         peers: bool,
@@ -864,8 +875,8 @@ pub async fn run() -> Result<()> {
     let _logging_guard = init_logging(is_daemon)?;
 
     match command {
-        Command::Init { max_peers } => init(max_peers).await,
-        Command::Join { invite } => join(&invite).await,
+        Command::Init { max_peers, output } => init(max_peers, output).await,
+        Command::Join { invite, output } => join(&invite, output).await,
         Command::Daemon {
             ports,
             max_connections_per_peer,
@@ -873,16 +884,17 @@ pub async fn run() -> Result<()> {
         Command::Proxy { target, port } => proxy(target, port).await,
         #[cfg(unix)]
         Command::ProxyTransport => transport::run().await,
-        Command::Rename { name } => rename(&name).await,
-        Command::Revoke { target } => revoke(&target).await,
-        Command::Policy { max_peers } => update_policy(max_peers).await,
-        Command::Invite { name, ports, role } => print_invite(&name, &ports, role).await,
+        Command::Rename { name, output } => rename(&name, output).await,
+        Command::Revoke { target, output } => revoke(&target, output).await,
+        Command::Policy { max_peers, output } => update_policy(max_peers, output).await,
+        Command::Invite {
+            name,
+            ports,
+            role,
+            output,
+        } => print_invite(&name, &ports, role, output).await,
         Command::Admin => admin::run().await,
-        Command::Status {
-            format,
-            no_color,
-            peers,
-        } => status(format, no_color, peers).await,
+        Command::Status { output, peers } => status(output, peers).await,
     }
 }
 
@@ -917,13 +929,13 @@ fn env_filter_with_default(default_level: LevelFilter) -> EnvFilter {
         .from_env_lossy()
 }
 
-async fn init(max_peers: usize) -> Result<()> {
+async fn init(max_peers: usize, output: output::Options) -> Result<()> {
     validate_max_known_peers(max_peers)?;
     let path = config_path()?;
     if path.exists()
         && let Some(report) = request_daemon_status().await?
     {
-        print_init_report(&path, &report);
+        print_init_report(&path, &report, output)?;
         return Ok(());
     }
 
@@ -944,11 +956,11 @@ async fn init(max_peers: usize) -> Result<()> {
     cfg.validate_local_config()?;
 
     let report = status_report_from_config(&cfg)?;
-    print_init_report(&path, &report);
+    print_init_report(&path, &report, output)?;
     Ok(())
 }
 
-async fn join(invite_code: &str) -> Result<()> {
+async fn join(invite_code: &str, output: output::Options) -> Result<()> {
     let path = config_path()?;
     if path.exists() {
         bail!(
@@ -997,27 +1009,33 @@ async fn join(invite_code: &str) -> Result<()> {
     }
     save_completed_join(&path, &cfg)?;
 
-    println!("esp config: {}", path.display());
-    println!("name: {}", cfg.name);
-    println!("connection id: {}", cfg.connection_id);
-    println!("node id: {}", secret_key.public());
-    println!("peer: {}", cfg.peers[0].display_name());
+    output.print(&join_report(&path, &cfg)?)
+}
+
+fn join_report(path: &Path, cfg: &Config) -> Result<serde_json::Value> {
     let membership = cfg
         .membership
         .as_ref()
         .ok_or_else(|| anyhow!("join completed without local membership"))?;
-    println!("role: {}", membership.role);
-    println!(
-        "allowed ports: {}",
-        format_ports(&membership.allowed_ports()?)
-    );
-    println!("join sync: complete");
-    Ok(())
+    let peer = cfg
+        .peers
+        .first()
+        .ok_or_else(|| anyhow!("join completed without inviter"))?;
+    Ok(serde_json::json!({
+        "esp_config": path.display().to_string(),
+        "name": cfg.name,
+        "connection_id": cfg.connection_id,
+        "node_id": cfg.secret_key()?.public().to_string(),
+        "peer": peer.display_name(),
+        "role": membership.role,
+        "allowed_ports": membership.allowed_ports()?,
+        "join_sync": "complete",
+    }))
 }
 
-async fn rename(name: &str) -> Result<()> {
+async fn rename(name: &str, output: output::Options) -> Result<()> {
     if let Some(identity) = request_daemon_rename(name).await? {
-        print_identity(&identity);
+        print_identity(&identity, output)?;
         return Ok(());
     }
 
@@ -1026,14 +1044,19 @@ async fn rename(name: &str) -> Result<()> {
     cfg.name = normalize_connection_name(name)?;
     cfg.save(&path)?;
     let identity = host_identity_from_config(&cfg);
-    print_identity(&identity);
+    print_identity(&identity, output)?;
     Ok(())
 }
 
-async fn print_invite(name: &str, ports: &[u16], role: MembershipRole) -> Result<()> {
+async fn print_invite(
+    name: &str,
+    ports: &[u16],
+    role: MembershipRole,
+    output: output::Options,
+) -> Result<()> {
     let allowed_ports = normalize_allowed_ports(ports)?;
     if let Some(code) = request_daemon_invite(name, &allowed_ports, role).await? {
-        println!("{code}");
+        output.print(&serde_json::json!({ "invite_code": code }))?;
         return Ok(());
     }
 
@@ -1041,13 +1064,13 @@ async fn print_invite(name: &str, ports: &[u16], role: MembershipRole) -> Result
     let mut cfg = Config::load(&path)?;
     let invite = cfg.issue_invite(name, &allowed_ports, role)?;
     cfg.save(&path)?;
-    println!("{}", invite.code);
+    output.print(&serde_json::json!({ "invite_code": invite.code }))?;
     Ok(())
 }
 
-async fn revoke(target: &str) -> Result<()> {
+async fn revoke(target: &str, output: output::Options) -> Result<()> {
     if let Some(report) = request_daemon_revoke(target).await? {
-        print_revocation_report(&report);
+        print_revocation_report(&report, output)?;
         return Ok(());
     }
 
@@ -1056,15 +1079,15 @@ async fn revoke(target: &str) -> Result<()> {
     let report = cfg.issue_revocation(target)?;
     let peers = report.peers.clone();
     cfg.save(&path)?;
-    print_revocation_report(&report);
+    print_revocation_report(&report, output)?;
     broadcast_control_sync_from_file(&path, peers).await;
     Ok(())
 }
 
-async fn update_policy(max_peers: usize) -> Result<()> {
+async fn update_policy(max_peers: usize, output: output::Options) -> Result<()> {
     validate_max_known_peers(max_peers)?;
     if let Some(report) = request_daemon_policy_update(max_peers).await? {
-        print_policy_report(&report);
+        print_policy_report(&report, output)?;
         return Ok(());
     }
 
@@ -1073,17 +1096,17 @@ async fn update_policy(max_peers: usize) -> Result<()> {
     let report = cfg.issue_network_policy(max_peers)?;
     let peers = report.peers.clone();
     cfg.save(&path)?;
-    print_policy_report(&report);
+    print_policy_report(&report, output)?;
     broadcast_control_sync_from_file(&path, peers).await;
     Ok(())
 }
 
-async fn status(format: status_output::Format, no_color: bool, peers: bool) -> Result<()> {
+async fn status(output: output::Options, peers: bool) -> Result<()> {
     let path = config_path()?;
     if let Some(report) = request_daemon_status().await? {
         println!(
             "{}",
-            status_output::render(&path, &report, true, format, no_color, peers)?
+            status_output::render(&path, &report, true, output.format, output.no_color, peers)?
         );
         return Ok(());
     }
@@ -1092,7 +1115,7 @@ async fn status(format: status_output::Format, no_color: bool, peers: bool) -> R
     let report = status_report_from_config(&cfg)?;
     println!(
         "{}",
-        status_output::render(&path, &report, false, format, no_color, peers)?
+        status_output::render(&path, &report, false, output.format, output.no_color, peers)?
     );
     Ok(())
 }
@@ -1305,27 +1328,36 @@ fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
     })
 }
 
-fn print_init_report(path: &Path, report: &StatusReport) {
-    println!("esp config: {}", path.display());
-    println!("name: {}", report.name);
-    println!("connection id: {}", report.connection_id);
-    println!("node id: {}", report.node_id);
-    println!("run `esp invite \"name\"` to create a named invite");
+fn print_init_report(path: &Path, report: &StatusReport, output: output::Options) -> Result<()> {
+    output.print(&serde_json::json!({
+        "esp_config": path.display().to_string(),
+        "name": report.name,
+        "connection_id": report.connection_id,
+        "node_id": report.node_id.to_string(),
+        "next_step": "run `esp invite \"name\"` to create a named invite",
+    }))
 }
 
-fn print_identity(identity: &HostIdentity) {
-    println!("name: {}", identity.name);
-    println!("connection id: {}", identity.connection_id);
+fn print_identity(identity: &HostIdentity, output: output::Options) -> Result<()> {
+    output.print(&serde_json::json!({
+        "name": identity.name,
+        "connection_id": identity.connection_id,
+    }))
 }
 
-fn print_revocation_report(report: &RevocationReport) {
-    println!("revoked: {} {}", report.display_name, report.node_id);
+fn print_revocation_report(report: &RevocationReport, output: output::Options) -> Result<()> {
+    output.print(&serde_json::json!({
+        "revoked": report.node_id.to_string(),
+        "name": report.display_name,
+    }))
 }
 
-fn print_policy_report(report: &NetworkPolicyReport) {
-    println!("max peers: {}", report.max_peers);
-    println!("policy issuer: {}", report.issuer_node_id);
-    println!("policy issued at: {}", report.issued_at_unix);
+fn print_policy_report(report: &NetworkPolicyReport, output: output::Options) -> Result<()> {
+    output.print(&serde_json::json!({
+        "max_peers": report.max_peers,
+        "policy_issuer": report.issuer_node_id.to_string(),
+        "policy_issued_at": report.issued_at_unix,
+    }))
 }
 
 async fn daemon(allowed_ports: Vec<u16>, max_connections_per_peer: usize) -> Result<()> {

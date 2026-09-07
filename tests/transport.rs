@@ -126,7 +126,9 @@ async fn originator_invite_commands_issue_fresh_codes_without_transport() {
     for count in 1..=3 {
         let output = timeout(
             Duration::from_secs(5),
-            home.command().args(["invite", "Test peer"]).output(),
+            home.command()
+                .args(["invite", "Test peer", "--no-color"])
+                .output(),
         )
         .await
         .unwrap()
@@ -136,7 +138,8 @@ async fn originator_invite_commands_issue_fresh_codes_without_transport() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let code = String::from_utf8(output.stdout).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let code = report["invite_code"].as_str().unwrap().to_owned();
         let invite = Invite::decode(&code).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(invite.creator_node_id, invite.inviter_node_id);

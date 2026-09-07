@@ -47,7 +47,8 @@ connection id. Create an invite explicitly:
 esp invite "laptop"
 ```
 
-Each run creates a fresh, single-use invite, including on the network creator.
+Copy the `invite_code` value from the JSON report for `esp join`. Each run
+creates a fresh, single-use invite, including on the network creator.
 Codes from the same host share a long prefix and suffix because they encode the
 same network and host identities; the random invite id and secret change in the
 middle of the code.
@@ -210,6 +211,21 @@ esp admin             # interactive two-pane administration (admin members only)
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer
 ```
+
+The report commands (`init`, `join`, `rename`, `invite`, `revoke`, `policy`, and
+`status`) default to syntax-highlighted JSON. Each accepts `--format json`,
+`--format text`, and `--no-color`. Text reports use snake_case keys and never add
+color. Use `--no-color` when passing JSON to scripts:
+
+```sh
+esp join CODE --format text
+esp init --no-color
+esp invite "laptop" --no-color | jq -r .invite_code
+```
+
+`invite` now returns an `invite_code` field rather than a bare code. The interactive
+admin screen, proxy byte stream, daemon logs, and command help retain their own
+formats.
 
 ## Linux systemd
 
