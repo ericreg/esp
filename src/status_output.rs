@@ -1,4 +1,4 @@
-use super::StatusReport;
+use super::{Peer, StatusReport};
 use anyhow::Result;
 use clap::ValueEnum;
 use serde::Serialize;
@@ -16,6 +16,7 @@ pub(super) fn render(
     transport_running: bool,
     format: Format,
     no_color: bool,
+    peers: bool,
 ) -> Result<String> {
     let transport = if transport_running {
         "running"
@@ -24,7 +25,7 @@ pub(super) fn render(
     };
     if format == Format::Text {
         let mut text = format!(
-            "esp config: {}\ntransport: {}\nnetwork: {}\nmax peers: {}\nname: {}\nconnection id: {}\nnode id: {}",
+            "esp_config: {}\ntransport: {}\nnetwork: {}\nmax_peers: {}\nname: {}\nconnection_id: {}\nnode_id: {}\nconnected_peers: {}",
             path.display(),
             transport,
             report.network_id,
@@ -32,12 +33,17 @@ pub(super) fn render(
             report.name,
             report.connection_id,
             report.node_id,
+            report
+                .connected_peers
+                .map_or_else(|| "unknown".into(), |count| count.to_string()),
         );
         for invite in &report.invites {
-            write!(text, "\nissued invite: {invite}")?;
+            write!(text, "\nissued_invite: {invite}")?;
         }
-        for peer in &report.peers {
-            write!(text, "\npeer: {} {}", peer.display_name(), peer.node_id)?;
+        if peers {
+            for peer in &report.peers {
+                write!(text, "\npeer: {} {}", peer.display_name(), peer.node_id)?;
+            }
         }
         for revocation in &report.revocations {
             write!(text, "\nrevoked: {revocation}")?;
@@ -51,11 +57,14 @@ pub(super) fn render(
         transport: &'a str,
         #[serde(flatten)]
         report: &'a StatusReport,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peers: Option<&'a [Peer]>,
     }
     let json = serde_json::to_string_pretty(&Output {
         config: path.display().to_string(),
         transport,
         report,
+        peers: peers.then_some(report.peers.as_slice()),
     })?;
     Ok(if no_color {
         json

@@ -157,6 +157,9 @@ enum Command {
         /// Disable JSON syntax highlighting.
         #[arg(long)]
         no_color: bool,
+        /// Include the full peer list in addition to the connected peer count.
+        #[arg(long)]
+        peers: bool,
     },
 }
 
@@ -509,10 +512,14 @@ struct StatusReport {
     #[n(5)]
     invites: Vec<String>,
     #[n(6)]
+    #[serde(skip_serializing)]
     peers: Vec<Peer>,
     #[n(7)]
     #[cbor(with = "cbor::endpoint_ids")]
     revocations: Vec<EndpointId>,
+    /// None when an older transport does not report live presence.
+    #[n(8)]
+    connected_peers: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -871,7 +878,11 @@ pub async fn run() -> Result<()> {
         Command::Policy { max_peers } => update_policy(max_peers).await,
         Command::Invite { name, ports, role } => print_invite(&name, &ports, role).await,
         Command::Admin => admin::run().await,
-        Command::Status { format, no_color } => status(format, no_color).await,
+        Command::Status {
+            format,
+            no_color,
+            peers,
+        } => status(format, no_color, peers).await,
     }
 }
 
@@ -1067,12 +1078,12 @@ async fn update_policy(max_peers: usize) -> Result<()> {
     Ok(())
 }
 
-async fn status(format: status_output::Format, no_color: bool) -> Result<()> {
+async fn status(format: status_output::Format, no_color: bool, peers: bool) -> Result<()> {
     let path = config_path()?;
     if let Some(report) = request_daemon_status().await? {
         println!(
             "{}",
-            status_output::render(&path, &report, true, format, no_color)?
+            status_output::render(&path, &report, true, format, no_color, peers)?
         );
         return Ok(());
     }
@@ -1081,7 +1092,7 @@ async fn status(format: status_output::Format, no_color: bool) -> Result<()> {
     let report = status_report_from_config(&cfg)?;
     println!(
         "{}",
-        status_output::render(&path, &report, false, format, no_color)?
+        status_output::render(&path, &report, false, format, no_color, peers)?
     );
     Ok(())
 }
@@ -1274,6 +1285,7 @@ fn create_creator_config(
 
 fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
     Ok(StatusReport {
+        connected_peers: Some(0),
         network_id: cfg.network_id.clone(),
         max_peers: cfg.max_known_peers()?,
         name: cfg.name.clone(),
@@ -2104,7 +2116,21 @@ async fn run_config_actor(
                 let _ = respond.send(result);
             }
             ConfigActorCommand::Status { respond } => {
-                let _ = respond.send(status_report_from_config(&cfg));
+                let report = status_report_from_config(&cfg).map(|mut report| {
+                    report.connected_peers = Some(
+                        report
+                            .peers
+                            .iter()
+                            .filter(|peer| {
+                                established
+                                    .get(&peer.node_id)
+                                    .is_some_and(|connections| !connections.is_empty())
+                            })
+                            .count(),
+                    );
+                    report
+                });
+                let _ = respond.send(report);
             }
             ConfigActorCommand::Rename { name, respond } => {
                 let result = commit_config_change(&path, &mut cfg, |next| {

@@ -244,21 +244,36 @@ fn admin_pages_cover_maximum_network_and_detect_directory_changes() {
 
 #[test]
 fn render_two_panes_connection_colors_offline_and_small_terminals() {
+    let assert_transport_style = |buffer: &ratatui::buffer::Buffer, value: &str, color| {
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 2)].symbol())
+            .collect();
+        let start = row[..row.find(value).expect("transport status in header")]
+            .chars()
+            .count() as u16;
+        for x in start..start + value.len() as u16 {
+            let cell = &buffer[(x, 2)];
+            assert_eq!(cell.fg, color);
+            assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+        }
+    };
     let (cfg, _, peer) = fixture();
     let mut app = App::new(view(&cfg, true));
     app.view.peers[0].active_connections = 2;
     app.view.overview.connected = 1;
     app.detail = Some(get_detail(&cfg, &peer));
     let (text, buffer) = screen(&mut app, 120, 30);
+    assert_transport_style(&buffer, "transport: running", Color::Green);
     for text_part in [
         "esp admin",
-        "Network",
+        "network_id:",
+        "transport: running",
         "Peers",
         "Peer details",
         "Eric laptop",
         "laptop-host",
-        "Invite ID:",
-        "Last connected:",
+        "invite_id:",
+        "last_connected:",
         "Never observed",
         "Connected",
     ] {
@@ -272,18 +287,18 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     );
     // Inspect the details pane independently of the bold selected peer row.
     for label in [
-        "Admin label:",
-        "Hostname:",
-        "Connection ID:",
-        "Node ID:",
-        "Status:",
-        "Role:",
-        "Allowed ports:",
-        "Invite ID:",
-        "Inviter:",
-        "Joined:",
-        "Active connections:",
-        "Last connected:",
+        "admin_label:",
+        "hostname:",
+        "connection_id:",
+        "node_id:",
+        "status:",
+        "role:",
+        "allowed_ports:",
+        "invite_id:",
+        "inviter:",
+        "joined:",
+        "active_connections:",
+        "last_connected:",
     ] {
         let row = (0..30)
             .find(|&y| {
@@ -302,11 +317,12 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
             );
         }
         let value = &buffer[(44 + label.len() as u16, row)];
-        if label == "Status:" {
+        if label == "status:" {
             assert_eq!(value.symbol(), "C");
             assert_eq!(value.fg, Color::Green);
             assert!(value.modifier.contains(ratatui::style::Modifier::BOLD));
         } else {
+            assert_eq!(value.fg, Color::LightBlue, "value for {label}");
             assert!(
                 !value.modifier.contains(ratatui::style::Modifier::BOLD),
                 "value for {label}"
@@ -315,8 +331,10 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     }
     app.stale("transport stopped".into());
     let (text, buffer) = screen(&mut app, 80, 24);
+    assert_transport_style(&buffer, "transport: not running", Color::Red);
     assert!(text.contains("Unknown"));
     assert!(text.contains("view only"));
+    assert!(text.contains("transport: not running"));
     assert!(!buffer.content.iter().any(|cell| cell.fg == Color::Green));
     assert!(screen(&mut app, 50, 10).0.contains("Resize terminal"));
     assert!(screen(&mut app, 120, 30).0.contains("Peer details"));
@@ -408,6 +426,34 @@ async fn actor_detail(actor: &ConfigActorHandle, node_id: EndpointId) -> PeerDet
         panic!()
     };
     detail
+}
+
+#[tokio::test]
+async fn status_counts_distinct_established_peers_and_excludes_revoked_peers() {
+    let (mut cfg, _, peer) = fixture();
+    let other = Peer {
+        node_id: SecretKey::generate().public(),
+        name: "other-host".into(),
+        connection_id: "OTHER1".into(),
+    };
+    enroll(&mut cfg, &other, "Other peer");
+    let saved = SavedFixture::new(&cfg);
+    let actor = spawn_config_actor(saved.path.clone(), cfg);
+    let first = actor.register_connection(peer.node_id).await.unwrap();
+    let second = actor.register_connection(peer.node_id).await.unwrap();
+    let third = actor.register_connection(other.node_id).await.unwrap();
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(0));
+    first.connected().await.unwrap();
+    second.connected().await.unwrap();
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(1));
+    third.connected().await.unwrap();
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(2));
+    drop(first);
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(2));
+    actor.revoke(other.connection_id).await.unwrap();
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(1));
+    drop(second);
+    assert_eq!(actor.status().await.unwrap().connected_peers, Some(0));
 }
 
 #[tokio::test]

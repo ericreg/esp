@@ -202,9 +202,10 @@ esp rename NAME       # rename this host
 esp revoke TARGET     # revoke a peer by name, connection id, or node id as an admin
 esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite "laptop" --role peer --ports 22 # create and print an invite as an admin
-esp status            # show transport, local node, and peers as highlighted JSON
+esp status            # show transport, local node, and connected peer count as highlighted JSON
 esp status --no-color # plain JSON for scripts (same as --format json --no-color)
-esp status --format text # original text output, always without color
+esp status --format text # snake_case text output, always without color
+esp status --peers     # include the full peer list (also works with --format text)
 esp admin             # interactive two-pane administration (admin members only)
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
 esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer
@@ -278,7 +279,11 @@ local TCP connection.
   active connections from the revoked node.
 - `esp status` asks the local transport (a daemon or automatic client helper)
   first and shows whether it is running. If it is unavailable, it falls back to
-  the local config so peers can still inspect their node identity. While a
+  the local config so peers can still inspect their node identity. The
+  `connected_peers` count measures distinct peers with established connections
+  observed by this host (zero without a running transport). Use `--peers` to
+  include the full known peer list. Older transports that do not report presence
+  show `null` in JSON or `unknown` in text until restarted. While a
   transport is running, local `esp invite`,
   `esp rename`, `esp revoke`, `esp policy`, and existing-config `esp init`
   commands use its private local control socket instead of writing

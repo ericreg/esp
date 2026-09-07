@@ -437,19 +437,32 @@ impl App {
                 self.view.peers.len()
             )
         };
-        let header = format!(
-            "Network {}\nLocal host: {} | {} | {}",
-            self.view.overview.network_id,
-            self.view.overview.local_name,
-            if self.view.online {
-                "Transport running"
-            } else {
-                "Offline / stale - view only"
-            },
-            counts
-        );
+        let mut network = detail_line("network_id", self.view.overview.network_id.clone());
+        if !self.view.online {
+            network.spans.push(Span::raw(" | view only"));
+        }
+        let mut host = detail_line("local_host", self.view.overview.local_name.clone());
+        host.spans.extend([
+            Span::raw(" | "),
+            Span::styled(
+                if self.view.online {
+                    "transport: running"
+                } else {
+                    "transport: not running"
+                },
+                Style::default()
+                    .fg(if self.view.online {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | "),
+            Span::styled(counts, Style::default().fg(Color::LightBlue)),
+        ]);
         frame.render_widget(
-            Paragraph::new(header).block(Block::bordered().title(" esp admin ")),
+            Paragraph::new(vec![network, host]).block(Block::bordered().title(" esp admin ")),
             sections[0],
         );
         let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -524,11 +537,11 @@ impl App {
                     );
                 }
                 let mut text = vec![
-                    detail_line("Admin label", peer.admin_label.clone()),
-                    detail_line("Hostname", peer.hostname.clone()),
-                    detail_line("Connection ID", peer.connection_id.clone()),
-                    detail_line("Node ID", peer.node_id.to_string()),
-                    detail_line("Status", status_value),
+                    detail_line("admin_label", peer.admin_label.clone()),
+                    detail_line("hostname", peer.hostname.clone()),
+                    detail_line("connection_id", peer.connection_id.clone()),
+                    detail_line("node_id", peer.node_id.to_string()),
+                    detail_line("status", status_value),
                 ];
                 if let Some(detail) = self
                     .detail
@@ -536,10 +549,10 @@ impl App {
                     .filter(|detail| detail.peer.node_id == peer.node_id)
                 {
                     text.extend([
-                        detail_line("Role", detail.role.to_string()),
-                        detail_line("Allowed ports", format_ports(&detail.allowed_ports)),
+                        detail_line("role", detail.role.to_string()),
+                        detail_line("allowed_ports", format_ports(&detail.allowed_ports)),
                         detail_line(
-                            "Invite ID",
+                            "invite_id",
                             detail.invite_id.clone().unwrap_or_else(|| {
                                 if detail.inviter == peer.node_id {
                                     "None (network creator)".into()
@@ -548,17 +561,17 @@ impl App {
                                 }
                             }),
                         ),
-                        detail_line("Inviter", detail.inviter.to_string()),
-                        detail_line("Joined", timestamp(Some(detail.joined_at))),
+                        detail_line("inviter", detail.inviter.to_string()),
+                        detail_line("joined", timestamp(Some(detail.joined_at))),
                         detail_line(
-                            "Active connections",
+                            "active_connections",
                             if self.view.online {
                                 peer.active_connections.to_string()
                             } else {
                                 "Unknown".into()
                             },
                         ),
-                        detail_line("Last connected", timestamp(detail.last_connected)),
+                        detail_line("last_connected", timestamp(detail.last_connected)),
                         Line::default(),
                         Line::from("Connection status and history are observed by this host."),
                     ]);
@@ -601,20 +614,22 @@ impl App {
             } else {
                 "[ Cancel ]     Revoke"
             };
-            frame.render_widget(Paragraph::new(format!("Revoke {}?\nHost: {} ({})\nNode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\nTab/arrows: choose | Enter: confirm | Esc: cancel", peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, buttons))
+            frame.render_widget(Paragraph::new(format!("Revoke {}?\nhost: {} ({})\nnode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\nTab/arrows: choose | Enter: confirm | Esc: cancel", peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, buttons))
                 .wrap(Wrap { trim: false }).block(Block::bordered().title(" Confirm revocation ")), dialog);
         }
     }
 }
 
 fn detail_line(label: &str, value: impl Into<Span<'static>>) -> Line<'static> {
+    let mut value = value.into();
+    value.style = Style::default().fg(Color::LightBlue).patch(value.style);
     Line::from(vec![
         Span::styled(
             format!("{label}:"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        value.into(),
+        value,
     ])
 }
 
