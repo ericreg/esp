@@ -80,6 +80,7 @@ impl ProxyFixture {
             MembershipCertificate::issue(&cfg, &local_key, &peer, &[port], MembershipRole::Peer)
                 .unwrap();
         let remote_cfg = Config {
+            format: output::Format::default(),
             version: CONFIG_VERSION,
             network_id: cfg.network_id.clone(),
             secret_key: encode_secret_key(&remote_key),
@@ -673,6 +674,7 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
         connection_id: String::new(),
     };
     let mut cfg = Config {
+        format: output::Format::default(),
         version: CONFIG_VERSION,
         network_id: invite.network_id.clone(),
         network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),

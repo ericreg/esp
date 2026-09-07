@@ -35,11 +35,20 @@ fn every_report_command_accepts_the_same_format_options() {
         vec!["status"],
     ] {
         for (args, format, no_color) in [
-            (vec![], Format::Json, false),
-            (vec!["--format", "json"], Format::Json, false),
-            (vec!["--no-color"], Format::Json, true),
-            (vec!["--format", "text"], Format::Text, false),
-            (vec!["--format", "text", "--no-color"], Format::Text, true),
+            (vec![], None, false),
+            (vec!["--format", "json"], Some(Format::Json), false),
+            (vec!["--no-color"], None, true),
+            (
+                vec!["--format", "json_colorized"],
+                Some(Format::JsonColorized),
+                false,
+            ),
+            (vec!["--format", "text"], Some(Format::Text), false),
+            (
+                vec!["--format", "text", "--no-color"],
+                Some(Format::Text),
+                true,
+            ),
         ] {
             let cli = Cli::try_parse_from(
                 ["esp"]
@@ -88,7 +97,7 @@ impl Home {
         self.0.join(ESP_DIR).join(CONFIG_FILE)
     }
 
-    fn report(&self, command: &[&str], flags: &[&str]) -> Value {
+    fn run(&self, command: &[&str], flags: &[&str]) -> String {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_esp"))
             .env("HOME", &self.0)
             .args(command)
@@ -100,7 +109,11 @@ impl Home {
             "{command:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let stdout = String::from_utf8(output.stdout).unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn report(&self, command: &[&str], flags: &[&str]) -> Value {
+        let stdout = self.run(command, flags);
         if flags.contains(&"text") {
             assert!(!stdout.contains('\x1b'));
             let fields = stdout
@@ -116,7 +129,10 @@ impl Home {
                 .collect();
             Value::Object(fields)
         } else {
-            assert_eq!(stdout.contains('\x1b'), !flags.contains(&"--no-color"));
+            assert_eq!(
+                stdout.contains('\x1b'),
+                !flags.contains(&"--no-color") && !flags.contains(&"json")
+            );
             serde_json::from_str(&strip_colors(&stdout)).unwrap()
         }
     }
@@ -240,5 +256,130 @@ fn join_report_contains_all_fields_and_formats_ports_and_identity() {
         assert!(text.contains("allowed_ports: 22\n"));
         assert!(text.contains("connection_id: JOIN01\n"));
         assert!(text.contains("join_sync: complete\n"));
+    }
+}
+
+#[test]
+fn config_format_defaults_and_roundtrips_without_changing_network_identity() {
+    let home = Home::new();
+    assert_eq!(output::read_format(&home.config()).unwrap(), None);
+    home.report(&["init"], &[]);
+    let mut cfg = Config::load(&home.config()).unwrap();
+    assert_eq!(cfg.format, Format::JsonColorized);
+    let mut yaml = serde_yaml::to_value(&cfg).unwrap();
+    yaml.as_mapping_mut()
+        .unwrap()
+        .remove(serde_yaml::Value::String("format".into()));
+    write_private_config(
+        &home.config(),
+        serde_yaml::to_string(&yaml).unwrap().as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load(&home.config()).unwrap().format,
+        Format::JsonColorized
+    );
+    assert!(home.run(&["status"], &[]).contains('\x1b'));
+    for (format, name) in [
+        (Format::Json, "json"),
+        (Format::JsonColorized, "json_colorized"),
+        (Format::Text, "text"),
+    ] {
+        cfg.format = format;
+        cfg.save(&home.config()).unwrap();
+        assert!(
+            fs::read_to_string(home.config())
+                .unwrap()
+                .contains(&format!("format: {name}\n"))
+        );
+        assert_eq!(Config::load(&home.config()).unwrap().format, format);
+        assert_eq!(output::read_format(&home.config()).unwrap(), Some(format));
+    }
+    yaml["format"] = serde_yaml::Value::String("invalid".into());
+    write_private_config(
+        &home.config(),
+        serde_yaml::to_string(&yaml).unwrap().as_bytes(),
+    )
+    .unwrap();
+    assert!(Config::load(&home.config()).is_err());
+    assert!(output::read_format(&home.config()).is_err());
+}
+
+fn assert_report_format(stdout: &str, format: Format, no_color: bool) {
+    assert_eq!(
+        stdout.contains('\x1b'),
+        format == Format::JsonColorized && !no_color
+    );
+    if format == Format::Text {
+        assert!(!stdout.starts_with('{'));
+        assert!(stdout.lines().all(|line| line.contains(": ")));
+    } else {
+        assert!(
+            serde_json::from_str::<Value>(&strip_colors(stdout))
+                .unwrap()
+                .is_object()
+        );
+    }
+}
+
+#[test]
+fn command_line_overrides_config_format_without_persisting_overrides() {
+    let home = Home::new();
+    home.report(&["init"], &[]);
+    for configured in [Format::Json, Format::JsonColorized, Format::Text] {
+        let mut cfg = Config::load(&home.config()).unwrap();
+        cfg.format = configured;
+        cfg.save(&home.config()).unwrap();
+        for (flags, expected, no_color) in [
+            (vec![], configured, false),
+            (vec!["--no-color"], configured, true),
+            (vec!["--format", "json"], Format::Json, false),
+            (
+                vec!["--format", "json_colorized"],
+                Format::JsonColorized,
+                false,
+            ),
+            (vec!["--format", "text"], Format::Text, false),
+            (
+                vec!["--format", "json_colorized", "--no-color"],
+                Format::JsonColorized,
+                true,
+            ),
+        ] {
+            assert_report_format(&home.run(&["status"], &flags), expected, no_color);
+        }
+        for command in [
+            vec!["init"],
+            vec!["rename", "configured-host"],
+            vec!["invite", "Laptop"],
+            vec!["policy", "--max-peers", "100"],
+        ] {
+            assert_report_format(&home.run(&command, &[]), configured, false);
+        }
+        home.report(&["rename", "cli-override"], &["--format", "json"]);
+        assert_eq!(Config::load(&home.config()).unwrap().format, configured);
+    }
+}
+
+#[tokio::test]
+async fn running_transport_preserves_format_edits_on_disk() {
+    let home = Home::new();
+    let mut cfg = create_creator_config(
+        &SecretKey::generate(),
+        Uuid::new_v4().to_string(),
+        "local".into(),
+        "LOCAL1".into(),
+        100,
+    )
+    .unwrap();
+    cfg.save(&home.config()).unwrap();
+    let actor = spawn_config_actor(home.config(), cfg.clone());
+    for format in [Format::Text, Format::Json, Format::JsonColorized] {
+        cfg.format = format;
+        cfg.save(&home.config()).unwrap();
+        actor.rename("renamed".into()).await.unwrap();
+        cfg = Config::load(&home.config()).unwrap();
+        assert_eq!(cfg.format, format);
+        assert_eq!(cfg.name, "renamed");
     }
 }

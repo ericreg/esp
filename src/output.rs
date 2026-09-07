@@ -1,23 +1,75 @@
 //! Shared formatting for command reports. Proxy streams and the TUI bypass this module.
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub(super) enum Format {
-    #[default]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[value(rename_all = "snake_case")]
+pub enum Format {
     Json,
+    #[default]
+    JsonColorized,
     Text,
 }
 
 #[derive(Args, Debug, Clone, Copy, Default)]
-pub(super) struct Options {
-    /// Output format (text is always uncolored).
-    #[arg(long, value_enum, default_value = "json")]
-    pub(super) format: Format,
-    /// Disable JSON syntax highlighting.
+pub(super) struct Arguments {
+    /// Override the config format (default: json_colorized).
+    #[arg(long, value_enum)]
+    pub(super) format: Option<Format>,
+    /// Disable JSON syntax highlighting, overriding the config.
     #[arg(long)]
+    pub(super) no_color: bool,
+}
+
+impl Arguments {
+    pub(super) fn resolve(&self, configured: Format) -> Options {
+        Options {
+            format: self.format.unwrap_or(configured),
+            no_color: self.no_color,
+        }
+    }
+
+    pub(super) fn resolve_from_config(&self) -> Result<Options> {
+        let configured = if self.format.is_some() {
+            Format::default()
+        } else {
+            read_format(&super::config_path()?)?.unwrap_or_default()
+        };
+        Ok(self.resolve(configured))
+    }
+}
+
+/// Read only the local output preference, including while the transport owns the config.
+/// A missing config is normal for init and join.
+pub(super) fn read_format(path: &Path) -> Result<Option<Format>> {
+    let text = match super::read_private_config(path) {
+        Ok(text) => text,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    #[derive(Deserialize)]
+    struct Preferences {
+        #[serde(default)]
+        format: Format,
+    }
+    let preferences: Preferences = serde_yaml::from_str(&text)
+        .with_context(|| format!("failed to parse output format in {}", path.display()))?;
+    Ok(Some(preferences.format))
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Options {
+    pub(super) format: Format,
     pub(super) no_color: bool,
 }
 
@@ -28,7 +80,7 @@ impl Options {
     }
 
     pub(super) fn render(&self, report: &Value) -> Result<String> {
-        if self.format == Format::Json {
+        if self.format != Format::Text {
             return self.render_json(report);
         }
         let fields = report
@@ -43,7 +95,7 @@ impl Options {
 
     pub(super) fn render_json(&self, report: &impl Serialize) -> Result<String> {
         let json = serde_json::to_string_pretty(report)?;
-        Ok(if self.no_color {
+        Ok(if self.no_color || self.format == Format::Json {
             json
         } else {
             highlight_json(&json)

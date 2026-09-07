@@ -442,22 +442,28 @@ impl App {
             network.spans.push(Span::raw(" | view only"));
         }
         let mut host = detail_line("local_host", self.view.overview.local_name.clone());
-        host.spans.extend([
-            Span::raw(" | "),
-            Span::styled(
-                if self.view.online {
-                    "transport: running"
-                } else {
-                    "transport: not running"
-                },
-                Style::default()
-                    .fg(if self.view.online {
-                        Color::Green
+        host.spans.push(Span::raw(" | "));
+        host.spans.extend(
+            detail_line(
+                "transport",
+                Span::styled(
+                    if self.view.online {
+                        "running"
                     } else {
-                        Color::Red
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
+                        "not_running"
+                    },
+                    Style::default()
+                        .fg(if self.view.online {
+                            Color::Green
+                        } else {
+                            Color::Red
+                        })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .spans,
+        );
+        host.spans.extend([
             Span::raw(" | "),
             Span::styled(counts, Style::default().fg(Color::LightBlue)),
         ]);
@@ -522,11 +528,11 @@ impl App {
             None => vec![Line::from("Select a peer to view its details.")],
             Some(peer) => {
                 let status = if !self.view.online {
-                    "Unknown"
+                    "unknown"
                 } else if peer.active_connections > 0 {
-                    "Connected"
+                    "connected"
                 } else {
-                    "Disconnected"
+                    "disconnected"
                 };
                 let mut status_value = Span::raw(status);
                 if self.view.online && peer.active_connections > 0 {

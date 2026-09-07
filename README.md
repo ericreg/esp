@@ -204,7 +204,7 @@ esp revoke TARGET     # revoke a peer by name, connection id, or node id as an a
 esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite "laptop" --role peer --ports 22 # create and print an invite as an admin
 esp status            # show transport, local node, and connected peer count as highlighted JSON
-esp status --no-color # plain JSON for scripts (same as --format json --no-color)
+esp status --format json # plain JSON for scripts
 esp status --format text # snake_case text output, always without color
 esp status --peers     # include the full peer list (also works with --format text)
 esp admin             # interactive two-pane administration (admin members only)
@@ -213,14 +213,29 @@ esp daemon --max-connections-per-peer 32 # allow more concurrent connections per
 ```
 
 The report commands (`init`, `join`, `rename`, `invite`, `revoke`, `policy`, and
-`status`) default to syntax-highlighted JSON. Each accepts `--format json`,
-`--format text`, and `--no-color`. Text reports use snake_case keys and never add
-color. Use `--no-color` when passing JSON to scripts:
+`status`) use the top-level `format` setting in `~/.esp/config.yml`:
+
+```yaml
+format: json_colorized
+```
+
+| Value | Output |
+| --- | --- |
+| `json` | Plain JSON |
+| `json_colorized` | Syntax-highlighted JSON (default when omitted) |
+| `text` | Plain text with snake_case keys |
+
+Each command accepts `--format json`, `--format json_colorized`, and `--format text`
+to override the config for that invocation. `--no-color` disables highlighting
+without changing the selected format; it also takes precedence over
+`--format json_colorized`. CLI overrides do not modify the saved preference.
+Changes to the setting take effect on the next command, including with a running
+transport. For example:
 
 ```sh
 esp join CODE --format text
-esp init --no-color
-esp invite "laptop" --no-color | jq -r .invite_code
+esp status --format json_colorized
+esp invite "laptop" --format json | jq -r .invite_code
 ```
 
 `invite` now returns an `invite_code` field rather than a bare code. The interactive

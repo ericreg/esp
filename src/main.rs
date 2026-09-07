@@ -99,14 +99,14 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_MAX_KNOWN_PEERS)]
         max_peers: usize,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Join an esp network from an invite code.
     Join {
         /// Invite code printed by the creator.
         invite: String,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Run the TCP proxy daemon. This is also the default command.
     Daemon {
@@ -132,14 +132,14 @@ enum Command {
     Rename {
         name: String,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Revoke a peer by name, connection id, or node id.
     Revoke {
         /// Peer name, six-character connection id, or full node id to revoke.
         target: String,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Update signed network policy as an admin.
     Policy {
@@ -147,7 +147,7 @@ enum Command {
         #[arg(long)]
         max_peers: usize,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Print a fresh invite code for the configured network.
     Invite {
@@ -160,14 +160,14 @@ enum Command {
         #[arg(long, value_enum, default_value = "peer")]
         role: MembershipRole,
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
     },
     /// Browse the network and revoke peers in an interactive terminal.
     Admin,
     /// Print local esp information.
     Status {
         #[command(flatten)]
-        output: output::Options,
+        output: output::Arguments,
         /// Include the full peer list in addition to the connected peer count.
         #[arg(long)]
         peers: bool,
@@ -178,6 +178,8 @@ enum Command {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u8,
+    #[serde(default)]
+    pub format: output::Format,
     pub network_id: String,
     pub secret_key: String,
     pub network_policy: NetworkPolicyCertificate,
@@ -875,8 +877,8 @@ pub async fn run() -> Result<()> {
     let _logging_guard = init_logging(is_daemon)?;
 
     match command {
-        Command::Init { max_peers, output } => init(max_peers, output).await,
-        Command::Join { invite, output } => join(&invite, output).await,
+        Command::Init { max_peers, output } => init(max_peers, output.resolve_from_config()?).await,
+        Command::Join { invite, output } => join(&invite, output.resolve_from_config()?).await,
         Command::Daemon {
             ports,
             max_connections_per_peer,
@@ -884,17 +886,19 @@ pub async fn run() -> Result<()> {
         Command::Proxy { target, port } => proxy(target, port).await,
         #[cfg(unix)]
         Command::ProxyTransport => transport::run().await,
-        Command::Rename { name, output } => rename(&name, output).await,
-        Command::Revoke { target, output } => revoke(&target, output).await,
-        Command::Policy { max_peers, output } => update_policy(max_peers, output).await,
+        Command::Rename { name, output } => rename(&name, output.resolve_from_config()?).await,
+        Command::Revoke { target, output } => revoke(&target, output.resolve_from_config()?).await,
+        Command::Policy { max_peers, output } => {
+            update_policy(max_peers, output.resolve_from_config()?).await
+        }
         Command::Invite {
             name,
             ports,
             role,
             output,
-        } => print_invite(&name, &ports, role, output).await,
+        } => print_invite(&name, &ports, role, output.resolve_from_config()?).await,
         Command::Admin => admin::run().await,
-        Command::Status { output, peers } => status(output, peers).await,
+        Command::Status { output, peers } => status(output.resolve_from_config()?, peers).await,
     }
 }
 
@@ -974,6 +978,7 @@ async fn join(invite_code: &str, output: output::Options) -> Result<()> {
     let creator_node_id = invite.creator_node_id;
     let connection_id = generate_connection_id();
     let mut cfg = Config {
+        format: output::Format::default(),
         version: CONFIG_VERSION,
         network_id: invite.network_id.clone(),
         network_policy: pending_join_network_policy(&invite.network_id, creator_node_id),
@@ -1287,6 +1292,7 @@ fn create_creator_config(
     let network_policy =
         NetworkPolicyCertificate::issue_for_network(&network_id, secret_key, max_peers)?;
     let cfg = Config {
+        format: output::Format::default(),
         version: CONFIG_VERSION,
         network_id,
         secret_key: encode_secret_key(secret_key),
@@ -2314,6 +2320,10 @@ fn commit_config_change<T>(
     let mut next = cfg.clone();
     let (output, changed) = apply(&mut next)?;
     if changed {
+        // Preserve local presentation edits made while this actor was running.
+        if let Some(format) = output::read_format(path)? {
+            next.format = format;
+        }
         next.save(path)?;
     }
     *cfg = next;

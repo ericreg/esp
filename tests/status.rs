@@ -79,7 +79,7 @@ fn json_preserves_status_fields_and_escaping_with_or_without_color() {
             Path::new("/tmp/config.yml"),
             &report,
             running,
-            Format::Json,
+            Format::JsonColorized,
             false,
             true,
         )
@@ -136,6 +136,8 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
     for args in [
         vec![],
         vec!["--format", "json"],
+        vec!["--format", "json_colorized"],
+        vec!["--format", "json_colorized", "--no-color"],
         vec!["--no-color"],
         vec!["--format", "json", "--no-color"],
         vec!["--format", "text"],
@@ -161,7 +163,10 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
             assert!(stdout.contains("transport: not running\n"));
             assert!(!stdout.contains('\x1b'));
         } else {
-            assert_eq!(stdout.contains('\x1b'), !args.contains(&"--no-color"));
+            assert_eq!(
+                stdout.contains('\x1b'),
+                !args.contains(&"--no-color") && !args.contains(&"json")
+            );
             let json: serde_json::Value = serde_json::from_str(&strip_colors(&stdout)).unwrap();
             assert_eq!(json["transport"], "not running");
             assert_eq!(json["connected_peers"], 0);

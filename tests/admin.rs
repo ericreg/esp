@@ -248,9 +248,16 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
         let row: String = (0..buffer.area.width)
             .map(|x| buffer[(x, 2)].symbol())
             .collect();
-        let start = row[..row.find(value).expect("transport status in header")]
+        let phrase = format!("transport: {value}");
+        let start = row[..row.find(&phrase).expect("transport status in header")]
             .chars()
             .count() as u16;
+        for x in start..start + "transport:".len() as u16 {
+            let cell = &buffer[(x, 2)];
+            assert_eq!(cell.fg, Color::Reset);
+            assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
+        }
+        let start = start + "transport: ".len() as u16;
         for x in start..start + value.len() as u16 {
             let cell = &buffer[(x, 2)];
             assert_eq!(cell.fg, color);
@@ -263,7 +270,7 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     app.view.overview.connected = 1;
     app.detail = Some(get_detail(&cfg, &peer));
     let (text, buffer) = screen(&mut app, 120, 30);
-    assert_transport_style(&buffer, "transport: running", Color::Green);
+    assert_transport_style(&buffer, "running", Color::Green);
     for text_part in [
         "esp admin",
         "network_id:",
@@ -275,7 +282,7 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
         "invite_id:",
         "last_connected:",
         "Never observed",
-        "Connected",
+        "status: connected",
     ] {
         assert!(text.contains(text_part), "missing {text_part}:\n{text}");
     }
@@ -318,7 +325,7 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
         }
         let value = &buffer[(44 + label.len() as u16, row)];
         if label == "status:" {
-            assert_eq!(value.symbol(), "C");
+            assert_eq!(value.symbol(), "c");
             assert_eq!(value.fg, Color::Green);
             assert!(value.modifier.contains(ratatui::style::Modifier::BOLD));
         } else {
@@ -331,10 +338,10 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     }
     app.stale("transport stopped".into());
     let (text, buffer) = screen(&mut app, 80, 24);
-    assert_transport_style(&buffer, "transport: not running", Color::Red);
+    assert_transport_style(&buffer, "not_running", Color::Red);
     assert!(text.contains("Unknown"));
     assert!(text.contains("view only"));
-    assert!(text.contains("transport: not running"));
+    assert!(text.contains("transport: not_running"));
     assert!(!buffer.content.iter().any(|cell| cell.fg == Color::Green));
     assert!(screen(&mut app, 50, 10).0.contains("Resize terminal"));
     assert!(screen(&mut app, 120, 30).0.contains("Peer details"));

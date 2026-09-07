@@ -556,7 +556,8 @@ async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
         endpoint.clone(),
         None,
     ));
-    pty.until("transport: running").await;
+    // The unchanged transport key is not repainted when the status changes.
+    pty.until("0 connected").await;
     pty.master.write_all(b"r").unwrap();
     pty.until("Confirm revocation").await;
     pty.master.write_all(b"\r").unwrap(); // Default is Cancel.
