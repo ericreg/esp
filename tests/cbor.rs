@@ -39,7 +39,7 @@ where
 fn message_schema_has_stable_cbor_bytes() {
     assert_eq!(
         minicbor::to_vec(LocalControlRequest::Status).unwrap(),
-        [0x82, 0x01, 0x80]
+        [0x82, 0x11, 0x80]
     );
     assert_eq!(
         minicbor::to_vec(LocalControlRequest::Proxy {
@@ -47,7 +47,7 @@ fn message_schema_has_stable_cbor_bytes() {
             port: 22
         })
         .unwrap(),
-        [0x82, 0x00, 0x82, 0x63, b'a', b'm', b'd', 0x16]
+        [0x82, 0x10, 0x82, 0x63, b'a', b'm', b'd', 0x16]
     );
     assert_eq!(minicbor::to_vec(MembershipRole::Admin).unwrap(), [0]);
     assert_eq!(minicbor::to_vec(MembershipRole::Peer).unwrap(), [1]);
@@ -56,8 +56,12 @@ fn message_schema_has_stable_cbor_bytes() {
 #[test]
 fn all_message_variants_roundtrip_through_cbor() {
     let (mut cfg, peer, membership, revocation) = records();
-    let invite =
-        Invite::decode(&cfg.issue_invite(&[22], MembershipRole::Peer).unwrap().code).unwrap();
+    let invite = Invite::decode(
+        &cfg.issue_invite("Test peer", &[22], MembershipRole::Peer)
+            .unwrap()
+            .code,
+    )
+    .unwrap();
     let proof = InviteProof {
         invite_id: invite.invite_id.clone(),
         invite_secret: invite.invite_secret.clone(),
@@ -85,6 +89,7 @@ fn all_message_variants_roundtrip_through_cbor() {
             name: "renamed".to_string(),
         },
         LocalControlRequest::IssueInvite {
+            name: "Test peer".to_string(),
             ports: vec![22, 8080],
             role: MembershipRole::Admin,
         },
@@ -132,7 +137,10 @@ fn all_message_variants_roundtrip_through_cbor() {
 #[test]
 fn compact_records_use_cbor_strings_and_preserve_valid_signatures() {
     let (mut cfg, _, membership, revocation) = records();
-    let code = cfg.issue_invite(&[22], MembershipRole::Peer).unwrap().code;
+    let code = cfg
+        .issue_invite("Test peer", &[22], MembershipRole::Peer)
+        .unwrap()
+        .code;
     let invite = Invite::decode(&code).unwrap();
     let bytes = URL_SAFE_NO_PAD.decode(&code).unwrap();
     let mut d = minicbor::Decoder::new(&bytes);
@@ -163,7 +171,7 @@ fn compact_records_use_cbor_strings_and_preserve_valid_signatures() {
         .decode(membership.encode_compact().unwrap())
         .unwrap();
     let mut d = minicbor::Decoder::new(&bytes);
-    assert_eq!(d.array().unwrap(), Some(8));
+    assert_eq!(d.array().unwrap(), Some(11));
     d.skip().unwrap(); // version
     assert_eq!(d.str().unwrap(), membership.network_id);
     assert_eq!(d.bytes().unwrap().len(), 32);
@@ -173,6 +181,9 @@ fn compact_records_use_cbor_strings_and_preserve_valid_signatures() {
     assert_eq!(d.u16().unwrap(), 22);
     assert_eq!(d.bytes().unwrap().len(), 32);
     assert_eq!(d.str().unwrap(), membership.signature);
+    assert_eq!(d.str().unwrap(), membership.admin_label);
+    d.null().unwrap();
+    assert_eq!(d.u64().unwrap(), membership.joined_at_unix);
     assert_eq!(d.position(), bytes.len());
 }
 
@@ -201,7 +212,10 @@ fn invalid_record_versions_and_policy_limits_are_rejected() {
 #[test]
 fn invalid_invite_fields_are_rejected_at_record_boundaries() {
     let (mut cfg, _, _, _) = records();
-    let code = cfg.issue_invite(&[22], MembershipRole::Peer).unwrap().code;
+    let code = cfg
+        .issue_invite("Test peer", &[22], MembershipRole::Peer)
+        .unwrap()
+        .code;
     let invite = Invite::decode(&code).unwrap();
     for (version, network_id, invite_id, secret) in [
         (
@@ -304,7 +318,10 @@ fn invalid_certificate_strings_are_rejected_at_record_boundaries() {
 #[test]
 fn invite_proofs_validate_secret_strings_before_granting_access() {
     let (mut cfg, _, _, _) = records();
-    let code = cfg.issue_invite(&[22], MembershipRole::Peer).unwrap().code;
+    let code = cfg
+        .issue_invite("Test peer", &[22], MembershipRole::Peer)
+        .unwrap()
+        .code;
     let invite = Invite::decode(&code).unwrap();
     let mut proof = InviteProof {
         invite_id: invite.invite_id,
@@ -328,7 +345,10 @@ fn invite_proofs_validate_secret_strings_before_granting_access() {
 #[test]
 fn endpoint_id_adapter_rejects_invalid_key_lengths() {
     let (mut cfg, _, _, _) = records();
-    let code = cfg.issue_invite(&[22], MembershipRole::Peer).unwrap().code;
+    let code = cfg
+        .issue_invite("Test peer", &[22], MembershipRole::Peer)
+        .unwrap()
+        .code;
     let invite = Invite::decode(&code).unwrap();
     for (creator_len, inviter_len) in [(31, 32), (32, 31)] {
         let mut e = minicbor::Encoder::new(Vec::new());

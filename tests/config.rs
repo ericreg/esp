@@ -24,7 +24,7 @@ fn issue_policy(network_id: &str, issuer_key: &SecretKey) -> NetworkPolicyCertif
 fn invite_round_trips() {
     let key = SecretKey::generate();
     let invite = Invite {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         invite_id: "ABC123".to_string(),
         invite_secret: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
@@ -52,7 +52,7 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         connection_id: "DEF456".to_string(),
     };
     let mut cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &creator_key),
         secret_key: encode_secret_key(&secret_key),
@@ -66,6 +66,7 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         name: "joined".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![creator_peer.clone()],
         revocations: Vec::new(),
     };
@@ -79,10 +80,10 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         .push(issue_membership(&cfg, &creator_key, &creator_peer));
 
     let first = cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
     let second = cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
 
     assert_ne!(first.invite_id, second.invite_id);
@@ -107,7 +108,7 @@ fn resolving_duplicate_names_requires_connection_id() {
     let first_peer_key = SecretKey::generate();
     let second_peer_key = SecretKey::generate();
     let cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
@@ -118,6 +119,7 @@ fn resolving_duplicate_names_requires_connection_id() {
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![
             Peer {
                 node_id: first_peer_key.public(),
@@ -148,7 +150,7 @@ fn connection_ids_are_case_sensitive_base62() {
     let secret_key = SecretKey::generate();
     let peer_key = SecretKey::generate();
     let cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
@@ -159,6 +161,7 @@ fn connection_ids_are_case_sensitive_base62() {
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![Peer {
             node_id: peer_key.public(),
             name: "amd".to_string(),
@@ -176,7 +179,7 @@ fn advertised_peer_lists_are_bounded() {
     let secret_key = SecretKey::generate();
     let remote_key = SecretKey::generate();
     let mut cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
@@ -187,6 +190,7 @@ fn advertised_peer_lists_are_bounded() {
         name: "creator".to_string(),
         connection_id: "ABC123".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: Vec::new(),
         revocations: Vec::new(),
     };

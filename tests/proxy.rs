@@ -91,6 +91,7 @@ impl ProxyFixture {
             name: peer.name.clone(),
             connection_id: peer.connection_id.clone(),
             invites: Vec::new(),
+            peer_last_connected: HashMap::new(),
             peers: vec![Peer {
                 node_id: local_key.public(),
                 name: cfg.name.clone(),
@@ -656,7 +657,11 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     ));
     let code = fixture
         .actor
-        .issue_invite(vec![fixture.port], MembershipRole::Peer)
+        .issue_invite(
+            "Test peer".to_string(),
+            vec![fixture.port],
+            MembershipRole::Peer,
+        )
         .await
         .unwrap()
         .code;
@@ -682,6 +687,7 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
         name: "joined-host".to_string(),
         connection_id: "XYZ789".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![inviter.clone()],
         revocations: Vec::new(),
     };
@@ -729,4 +735,99 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     endpoint.close().await;
     acceptor.abort();
     fixture.close().await;
+}
+
+#[tokio::test]
+async fn admin_presence_tracks_authorized_incoming_and_outgoing_tunnels() {
+    timeout(Duration::from_secs(20), async {
+        let mut fixture = ProxyFixture::new(8).await;
+        let local_acceptor = tokio::spawn(run_acceptor(
+            fixture.local.clone(),
+            fixture.actor.clone(),
+            vec![fixture.port],
+            8,
+        ));
+        let replacement = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let echo = tokio::spawn(echo_server(std::mem::replace(
+            &mut fixture.tcp,
+            replacement,
+        )));
+        async fn detail(fixture: &ProxyFixture) -> admin::PeerDetail {
+            let response = fixture
+                .actor
+                .request(|respond| ConfigActorCommand::Admin {
+                    request: admin::Request::Detail {
+                        node_id: fixture.remote.id(),
+                    },
+                    respond,
+                })
+                .await
+                .unwrap();
+            let admin::Response::Detail(detail) = response else {
+                panic!()
+            };
+            detail
+        }
+        let rejected_port = if fixture.port == 22 { 23 } else { 22 };
+        assert!(
+            open_local_proxy(&fixture.socket, "remote-host".into(), rejected_port)
+                .await
+                .is_err()
+        );
+        let initial = detail(&fixture).await;
+        assert_eq!(initial.peer.active_connections, 0);
+        assert_eq!(initial.last_connected, None);
+        assert!(
+            Config::load(&fixture.dir.join("remote.yml"))
+                .unwrap()
+                .peer_last_connected
+                .is_empty()
+        );
+
+        let mut outgoing = fixture.connect().await;
+        exchange(&mut outgoing, b"outgoing session").await.unwrap();
+        assert_eq!(detail(&fixture).await.peer.active_connections, 1);
+        let mut incoming = open_proxy_tunnel(
+            &fixture.remote,
+            &fixture.remote_actor,
+            "local".into(),
+            fixture.port,
+        )
+        .await
+        .unwrap();
+        incoming.send.write_all(b"incoming session").await.unwrap();
+        let mut bytes = [0; 16];
+        incoming.recv.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"incoming session");
+        assert_eq!(detail(&fixture).await.peer.active_connections, 2);
+        assert!(detail(&fixture).await.last_connected.is_some());
+        drop(incoming);
+        timeout(Duration::from_secs(5), async {
+            while detail(&fixture).await.peer.active_connections != 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(outgoing);
+        timeout(Duration::from_secs(5), async {
+            while detail(&fixture).await.peer.active_connections != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(detail(&fixture).await.last_connected.is_some());
+        assert!(
+            Config::load(&fixture.dir.join("remote.yml"))
+                .unwrap()
+                .peer_last_connected
+                .contains_key(&fixture.local.id().to_string())
+        );
+        local_acceptor.abort();
+        echo.abort();
+        fixture.close().await;
+    })
+    .await
+    .unwrap();
 }

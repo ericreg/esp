@@ -3,8 +3,6 @@
 
 include!("../src/main.rs");
 
-use std::collections::HashSet;
-
 struct TransportHome {
     dir: PathBuf,
 }
@@ -124,7 +122,7 @@ async fn originator_invite_commands_issue_fresh_codes_without_transport() {
     for count in 1..=3 {
         let output = timeout(
             Duration::from_secs(5),
-            home.command().arg("invite").output(),
+            home.command().args(["invite", "Test peer"]).output(),
         )
         .await
         .unwrap()
@@ -348,4 +346,261 @@ async fn setup_retries_when_transport_closes_before_ready() {
     stream.read_to_string(&mut banner).await.unwrap();
     assert_eq!(banner, "SSH-2.0-retry\r\n");
     server.await.unwrap();
+}
+
+/// A real controlling terminal, isolated from the developer's terminal and config.
+struct AdminPty {
+    master: fs::File,
+    slave: fs::File,
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    cursor: usize,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AdminPty {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl AdminPty {
+    fn new() -> Self {
+        use std::os::fd::FromRawFd;
+        let mut master = -1;
+        let mut slave = -1;
+        let mut size = libc::winsize {
+            ws_row: 30,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty initializes both owned descriptors; the optional name/termios are null.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &raw mut size,
+                )
+            },
+            0
+        );
+        // SAFETY: fcntl operates on the valid master descriptor, preserving its existing flags.
+        unsafe {
+            let flags = libc::fcntl(master, libc::F_GETFL);
+            assert!(flags >= 0);
+            assert_eq!(
+                libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK),
+                0
+            );
+        }
+        // SAFETY: the descriptors were created above and transferred to File exactly once.
+        let (master, slave) =
+            unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let mut input = master.try_clone().unwrap();
+        // Keep draining even while assertions wait for child state. Otherwise the
+        // terminal's small output buffer can block rendering before input is read.
+        let reader = tokio::spawn(async move {
+            loop {
+                let mut bytes = [0; 8192];
+                match input.read(&mut bytes) {
+                    Ok(count) => captured.lock().unwrap().extend_from_slice(&bytes[..count]),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        Self {
+            master,
+            slave,
+            output,
+            cursor: 0,
+            reader,
+        }
+    }
+
+    fn flags(&self) -> libc::tcflag_t {
+        use std::os::fd::AsRawFd;
+        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr initializes the output on success.
+        assert_eq!(
+            unsafe { libc::tcgetattr(self.master.as_raw_fd(), attributes.as_mut_ptr()) },
+            0
+        );
+        unsafe { attributes.assume_init() }.c_lflag
+    }
+
+    fn spawn(&self, fixture: &TransportHome) -> tokio::process::Child {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        let mut command = fixture.command();
+        command
+            .env("TERM", "xterm-256color")
+            .arg("admin")
+            .stdin(self.slave.try_clone().unwrap())
+            .stdout(self.slave.try_clone().unwrap())
+            .stderr(self.slave.try_clone().unwrap());
+        let slave_fd = self.slave.as_raw_fd();
+        // SAFETY: only async-signal-safe syscalls are called in the forked child.
+        unsafe {
+            command.as_std_mut().pre_exec(move || {
+                if libc::setsid() == -1 || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    async fn until(&mut self, expected: &str) -> String {
+        let mut output = Vec::new();
+        let result = timeout(Duration::from_secs(10), async {
+            loop {
+                output = self.output.lock().unwrap()[self.cursor..].to_vec();
+                let text = String::from_utf8_lossy(&output);
+                let mut state = 0;
+                let plain: String = text
+                    .chars()
+                    .filter(|&ch| match state {
+                        0 if ch == '\x1b' => {
+                            state = 1;
+                            false
+                        }
+                        1 => {
+                            state = if ch == '[' { 2 } else { 0 };
+                            false
+                        }
+                        2 => {
+                            if ('@'..='~').contains(&ch) {
+                                state = 0;
+                            }
+                            false
+                        }
+                        _ => !ch.is_whitespace(),
+                    })
+                    .collect();
+                let found = if expected.starts_with('\x1b') {
+                    text.contains(expected)
+                } else {
+                    plain.contains(
+                        &expected
+                            .chars()
+                            .filter(|ch| !ch.is_whitespace())
+                            .collect::<String>(),
+                    )
+                };
+                if found {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "missing {expected:?} in PTY output: {}",
+            String::from_utf8_lossy(&output)
+        );
+        self.cursor += output.len();
+        String::from_utf8_lossy(&output).into_owned()
+    }
+}
+
+#[tokio::test]
+async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
+    let fixture = TransportHome::new();
+    let path = fixture.dir.join(ESP_DIR).join(CONFIG_FILE);
+    let mut cfg = Config::load(&path).unwrap();
+    let peer = Peer {
+        node_id: SecretKey::generate().public(),
+        name: "test-host".into(),
+        connection_id: "OTHER1".into(),
+    };
+    let key = cfg.secret_key().unwrap();
+    cfg.memberships.push(
+        MembershipCertificate::issue(&cfg, &key, &peer, &[22], MembershipRole::Peer).unwrap(),
+    );
+    cfg.peers.push(peer.clone());
+    cfg.save(&path).unwrap();
+    let mut pty = AdminPty::new();
+    let original_flags = pty.flags();
+    let mut child = pty.spawn(&fixture);
+    pty.until("view only").await;
+    assert_eq!(pty.flags() & (libc::ECHO | libc::ICANON), 0);
+
+    let actor = spawn_config_actor(path.clone(), cfg);
+    let endpoint = Endpoint::builder(presets::Minimal)
+        .secret_key(key)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let listener = bind_local_control_socket(&fixture.socket()).unwrap();
+    let server = tokio::spawn(run_local_control_server(
+        listener,
+        actor,
+        endpoint.clone(),
+        None,
+    ));
+    pty.until("Transport running").await;
+    pty.master.write_all(b"r").unwrap();
+    pty.until("Confirm revocation").await;
+    pty.master.write_all(b"\r").unwrap(); // Default is Cancel.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(Config::load(&path).unwrap().peers.len(), 1);
+    pty.master.write_all(b"r").unwrap();
+    pty.until("Confirm revocation").await;
+    pty.master.write_all(b"\t\r").unwrap();
+    timeout(Duration::from_secs(5), async {
+        while !Config::load(&path).unwrap().peers.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(is_node_revoked(&Config::load(&path).unwrap(), peer.node_id));
+    server.abort();
+    endpoint.close().await;
+    fs::remove_file(fixture.socket()).unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    pty.master.write_all(b"r").unwrap();
+    pty.until("disabled:").await;
+    pty.master.write_all(b"q").unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    pty.until("\x1b[?1049l").await;
+    assert_eq!(pty.flags(), original_flags);
+}
+
+#[tokio::test]
+async fn admin_requires_a_terminal_and_ctrl_c_restores_it() {
+    let fixture = TransportHome::new();
+    let output = fixture.command().arg("admin").output().await.unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+    assert!(output.stdout.is_empty());
+    let mut pty = AdminPty::new();
+    let original_flags = pty.flags();
+    let mut child = pty.spawn(&fixture);
+    pty.until("esp admin").await;
+    pty.master.write_all(&[3]).unwrap();
+    assert!(
+        timeout(Duration::from_secs(5), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+    pty.until("\x1b[?1049l").await;
+    assert_eq!(pty.flags(), original_flags);
 }

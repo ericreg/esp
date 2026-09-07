@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
     num::NonZeroUsize,
@@ -34,8 +34,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
-const CONTROL_ALPN: &[u8] = b"esp/control/cbor/1";
-const TCP_ALPN: &[u8] = b"esp/tcp/cbor/1";
+const CONTROL_ALPN: &[u8] = b"esp/control/cbor/2";
+const TCP_ALPN: &[u8] = b"esp/tcp/cbor/2";
 const ESP_DIR: &str = ".esp";
 const CONFIG_FILE: &str = "config.yml";
 const LOG_DIR: &str = "logs";
@@ -64,10 +64,10 @@ pub const MAX_SHARED_PEERS: usize = 100;
 pub const DEFAULT_MAX_KNOWN_PEERS: usize = 100;
 const ABSOLUTE_MAX_KNOWN_PEERS: usize = 1000;
 const GRACEFUL_CLOSE: VarInt = VarInt::from_u32(0);
-const CONFIG_VERSION: u8 = 1;
-const INVITE_VERSION: u8 = 1;
-const MEMBERSHIP_CERTIFICATE_VERSION: u8 = 1;
-const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/1";
+const CONFIG_VERSION: u8 = 2;
+const INVITE_VERSION: u8 = 2;
+const MEMBERSHIP_CERTIFICATE_VERSION: u8 = 2;
+const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/2";
 const NETWORK_POLICY_VERSION: u8 = 1;
 const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
 const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
@@ -77,6 +77,7 @@ const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+mod admin;
 mod cbor;
 #[cfg(unix)]
 mod transport;
@@ -136,6 +137,8 @@ enum Command {
     },
     /// Print a fresh invite code for the configured network.
     Invite {
+        /// Admin label assigned to the invited peer (separate from its hostname).
+        name: String,
         /// Localhost ports this invited peer may connect to on esp daemons.
         #[arg(long, value_delimiter = ',', default_value = "22")]
         ports: Vec<u16>,
@@ -143,6 +146,8 @@ enum Command {
         #[arg(long, value_enum, default_value = "peer")]
         role: MembershipRole,
     },
+    /// Browse the network and revoke peers in an interactive terminal.
+    Admin,
     /// Print local esp information.
     Status,
 }
@@ -161,6 +166,8 @@ pub struct Config {
     pub name: String,
     pub connection_id: String,
     pub invites: Vec<IssuedInvite>,
+    #[serde(default)]
+    pub peer_last_connected: HashMap<String, u64>,
     pub peers: Vec<Peer>,
     pub revocations: Vec<RevocationCertificate>,
 }
@@ -181,6 +188,7 @@ pub struct Peer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IssuedInvite {
+    pub admin_label: String,
     pub invite_id: String,
     pub secret_hash: String,
     pub allowed_ports: Vec<u16>,
@@ -225,6 +233,8 @@ pub struct InviteProof {
 
 #[derive(Debug, Clone)]
 struct InviteGrant {
+    admin_label: String,
+    invite_id: String,
     allowed_ports: Vec<u16>,
     role: MembershipRole,
 }
@@ -279,6 +289,12 @@ pub struct MembershipCertificate {
     pub issuer_node_id: EndpointId,
     #[n(7)]
     pub signature: String,
+    #[n(8)]
+    pub admin_label: String,
+    #[n(9)]
+    pub invite_id: Option<String>,
+    #[n(10)]
+    pub joined_at_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -531,11 +547,21 @@ enum ConfigActorCommand {
     Status {
         respond: oneshot::Sender<Result<StatusReport>>,
     },
+    Admin {
+        request: admin::Request,
+        respond: oneshot::Sender<Result<admin::Response>>,
+    },
+    Connected {
+        node_id: EndpointId,
+        connection_id: Uuid,
+        respond: oneshot::Sender<Result<()>>,
+    },
     Rename {
         name: String,
         respond: oneshot::Sender<Result<HostIdentity>>,
     },
     IssueInvite {
+        name: String,
         allowed_ports: Vec<u16>,
         role: MembershipRole,
         respond: oneshot::Sender<Result<InviteCode>>,
@@ -606,37 +632,46 @@ enum PeerQuotaCommand {
 
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
+// Version 2 uses new discriminants so old daemons cannot accept named-invite
+// requests while silently ignoring the new label field.
 enum LocalControlRequest {
-    #[n(0)]
+    #[n(16)]
     Proxy {
         #[n(0)]
         target: String,
         #[n(1)]
         port: u16,
     },
-    #[n(1)]
+    #[n(17)]
     Status,
-    #[n(2)]
+    #[n(18)]
     Rename {
         #[n(0)]
         name: String,
     },
-    #[n(3)]
+    #[n(19)]
     IssueInvite {
+        #[n(2)]
+        name: String,
         #[n(0)]
         ports: Vec<u16>,
         #[n(1)]
         role: MembershipRole,
     },
-    #[n(4)]
+    #[n(20)]
     Revoke {
         #[n(0)]
         target: String,
     },
-    #[n(5)]
+    #[n(21)]
     UpdatePolicy {
         #[n(0)]
         max_peers: usize,
+    },
+    #[n(22)]
+    Admin {
+        #[n(0)]
+        request: admin::Request,
     },
 }
 
@@ -673,6 +708,8 @@ struct LocalControlResponse {
     revoked: Option<RevocationReport>,
     #[n(5)]
     policy: Option<NetworkPolicyReport>,
+    #[n(6)]
+    admin: Option<admin::Response>,
 }
 
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
@@ -691,11 +728,21 @@ enum LocalControlOk {
     Invite { code: String },
     Revoked { report: RevocationReport },
     PolicyUpdated { report: NetworkPolicyReport },
+    Admin { report: admin::Response },
 }
 
 impl LocalControlResponse {
     fn ok(ok: LocalControlOk) -> Self {
         match ok {
+            LocalControlOk::Admin { report } => Self {
+                error: None,
+                status: None,
+                renamed: None,
+                invite_code: None,
+                revoked: None,
+                policy: None,
+                admin: Some(report),
+            },
             LocalControlOk::Status { report } => Self {
                 error: None,
                 status: Some(report),
@@ -703,6 +750,7 @@ impl LocalControlResponse {
                 invite_code: None,
                 revoked: None,
                 policy: None,
+                admin: None,
             },
             LocalControlOk::Renamed {
                 name,
@@ -717,6 +765,7 @@ impl LocalControlResponse {
                 invite_code: None,
                 revoked: None,
                 policy: None,
+                admin: None,
             },
             LocalControlOk::Invite { code } => Self {
                 error: None,
@@ -725,6 +774,7 @@ impl LocalControlResponse {
                 invite_code: Some(code),
                 revoked: None,
                 policy: None,
+                admin: None,
             },
             LocalControlOk::Revoked { report } => Self {
                 error: None,
@@ -733,6 +783,7 @@ impl LocalControlResponse {
                 invite_code: None,
                 revoked: Some(report),
                 policy: None,
+                admin: None,
             },
             LocalControlOk::PolicyUpdated { report } => Self {
                 error: None,
@@ -741,6 +792,7 @@ impl LocalControlResponse {
                 invite_code: None,
                 revoked: None,
                 policy: Some(report),
+                admin: None,
             },
         }
     }
@@ -753,6 +805,7 @@ impl LocalControlResponse {
             invite_code: None,
             revoked: None,
             policy: None,
+            admin: None,
         }
     }
 
@@ -766,15 +819,19 @@ impl LocalControlResponse {
             self.invite_code,
             self.revoked,
             self.policy,
+            self.admin,
         ) {
-            (Some(report), None, None, None, None) => Ok(LocalControlOk::Status { report }),
-            (None, Some(renamed), None, None, None) => Ok(LocalControlOk::Renamed {
+            (Some(report), None, None, None, None, None) => Ok(LocalControlOk::Status { report }),
+            (None, Some(renamed), None, None, None, None) => Ok(LocalControlOk::Renamed {
                 name: renamed.name,
                 connection_id: renamed.connection_id,
             }),
-            (None, None, Some(code), None, None) => Ok(LocalControlOk::Invite { code }),
-            (None, None, None, Some(report), None) => Ok(LocalControlOk::Revoked { report }),
-            (None, None, None, None, Some(report)) => Ok(LocalControlOk::PolicyUpdated { report }),
+            (None, None, Some(code), None, None, None) => Ok(LocalControlOk::Invite { code }),
+            (None, None, None, Some(report), None, None) => Ok(LocalControlOk::Revoked { report }),
+            (None, None, None, None, Some(report), None) => {
+                Ok(LocalControlOk::PolicyUpdated { report })
+            }
+            (None, None, None, None, None, Some(report)) => Ok(LocalControlOk::Admin { report }),
             _ => bail!("invalid local esp control response"),
         }
     }
@@ -786,7 +843,7 @@ pub async fn run() -> Result<()> {
         ports: vec![DEFAULT_ALLOWED_PORT],
         max_connections_per_peer: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS_PER_PEER).unwrap(),
     });
-    let is_daemon = matches!(command, Command::Daemon { .. });
+    let is_daemon = matches!(command, Command::Daemon { .. } | Command::Admin);
     #[cfg(unix)]
     let is_daemon = is_daemon || matches!(command, Command::ProxyTransport);
     let _logging_guard = init_logging(is_daemon)?;
@@ -804,7 +861,8 @@ pub async fn run() -> Result<()> {
         Command::Rename { name } => rename(&name).await,
         Command::Revoke { target } => revoke(&target).await,
         Command::Policy { max_peers } => update_policy(max_peers).await,
-        Command::Invite { ports, role } => print_invite(&ports, role).await,
+        Command::Invite { name, ports, role } => print_invite(&name, &ports, role).await,
+        Command::Admin => admin::run().await,
         Command::Status => status().await,
     }
 }
@@ -899,6 +957,7 @@ async fn join(invite_code: &str) -> Result<()> {
         name: default_connection_name(),
         connection_id: connection_id.clone(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![Peer {
             node_id: invite.inviter_node_id,
             name: String::new(),
@@ -952,16 +1011,16 @@ async fn rename(name: &str) -> Result<()> {
     Ok(())
 }
 
-async fn print_invite(ports: &[u16], role: MembershipRole) -> Result<()> {
+async fn print_invite(name: &str, ports: &[u16], role: MembershipRole) -> Result<()> {
     let allowed_ports = normalize_allowed_ports(ports)?;
-    if let Some(code) = request_daemon_invite(&allowed_ports, role).await? {
+    if let Some(code) = request_daemon_invite(name, &allowed_ports, role).await? {
         println!("{code}");
         return Ok(());
     }
 
     let path = config_path()?;
     let mut cfg = Config::load(&path)?;
-    let invite = cfg.issue_invite(&allowed_ports, role)?;
+    let invite = cfg.issue_invite(name, &allowed_ports, role)?;
     cfg.save(&path)?;
     println!("{}", invite.code);
     Ok(())
@@ -1043,8 +1102,13 @@ async fn request_daemon_rename(name: &str) -> Result<Option<HostIdentity>> {
     }
 }
 
-async fn request_daemon_invite(ports: &[u16], role: MembershipRole) -> Result<Option<String>> {
+async fn request_daemon_invite(
+    name: &str,
+    ports: &[u16],
+    role: MembershipRole,
+) -> Result<Option<String>> {
     let Some(response) = send_local_control_request(LocalControlRequest::IssueInvite {
+        name: normalize_connection_name(name)?,
         ports: ports.to_vec(),
         role,
     })
@@ -1124,7 +1188,7 @@ async fn send_local_control_request_to_path(
         let response: LocalControlResponse = read_cbor_frame(
             &mut stream,
             MAX_LOCAL_CONTROL_MESSAGE_LEN,
-            "local esp control response",
+            "local esp control response (restart the transport if it uses an older esp version)",
         )
         .await?;
         response.into_result().map(Some)
@@ -1186,6 +1250,7 @@ fn create_creator_config(
         name,
         connection_id,
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: Vec::new(),
         revocations: Vec::new(),
     };
@@ -1219,7 +1284,7 @@ fn print_init_report(path: &Path, report: &StatusReport) {
     println!("name: {}", report.name);
     println!("connection id: {}", report.connection_id);
     println!("node id: {}", report.node_id);
-    println!("run `esp invite` to create an invite");
+    println!("run `esp invite \"name\"` to create a named invite");
 }
 
 fn print_identity(identity: &HostIdentity) {
@@ -1463,6 +1528,10 @@ async fn handle_local_control_connection(
     }
     timeout(LOCAL_CONTROL_SETUP_TIMEOUT, async {
         let result = match request {
+            LocalControlRequest::Admin { request } => actor
+                .request(|respond| ConfigActorCommand::Admin { request, respond })
+                .await
+                .map(|report| LocalControlOk::Admin { report }),
             LocalControlRequest::Status => actor
                 .status()
                 .await
@@ -1476,8 +1545,8 @@ async fn handle_local_control_connection(
                         connection_id: identity.connection_id,
                     })
             }
-            LocalControlRequest::IssueInvite { ports, role } => actor
-                .issue_invite(ports, role)
+            LocalControlRequest::IssueInvite { name, ports, role } => actor
+                .issue_invite(name, ports, role)
                 .await
                 .map(|invite| LocalControlOk::Invite { code: invite.code }),
             LocalControlRequest::Revoke { target } => {
@@ -1485,7 +1554,12 @@ async fn handle_local_control_connection(
                 if let Ok(report) = &result {
                     spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
                 }
-                result.map(|report| LocalControlOk::Revoked { report })
+                result.map(|mut report| {
+                    // The transport broadcasts to peers; clients only need the outcome.
+                    // Avoid returning the complete directory in a bounded local frame.
+                    report.peers.clear();
+                    LocalControlOk::Revoked { report }
+                })
             }
             LocalControlRequest::UpdatePolicy { max_peers } => {
                 let result = actor.update_policy(max_peers).await;
@@ -1506,7 +1580,7 @@ async fn handle_local_control_connection(
             &mut stream,
             &response,
             MAX_LOCAL_CONTROL_MESSAGE_LEN,
-            "local esp control response",
+            "local esp control response (restart the transport if it uses an older esp version)",
         )
         .await?;
         stream
@@ -1619,11 +1693,16 @@ async fn sync_known_peer_from_actor(
     actor: ConfigActorHandle,
     expected_peer: &Peer,
 ) -> Result<()> {
+    let mut active = actor.register_connection(expected_peer.node_id).await?;
     let conn = endpoint
         .connect(expected_peer.node_id, CONTROL_ALPN)
         .await
         .with_context(|| format!("failed to connect to esp peer {}", expected_peer.node_id))?;
-    let result = timeout(Duration::from_secs(15), async {
+    let _close = CloseConnectionOnDrop(conn.clone());
+    let presence_id = active.connection_id;
+    let result = tokio::select! {
+        _ = active.cancelled() => bail!("peer has been revoked"),
+        result = timeout(Duration::from_secs(15), async {
         let (mut send, mut recv) = conn
             .open_bi()
             .await
@@ -1637,10 +1716,11 @@ async fn sync_known_peer_from_actor(
         actor
             .control_sync(conn.remote_id(), remote, Some(expected_peer.clone()))
             .await?;
+        actor.connected(expected_peer.node_id, presence_id).await?;
         Ok::<(), anyhow::Error>(())
     })
-    .await
-    .context("timed out waiting for esp control sync")?;
+        => result.context("timed out waiting for esp control sync")?,
+    };
     conn.close(GRACEFUL_CLOSE, b"synced");
     result
 }
@@ -1805,6 +1885,7 @@ async fn handle_incoming_connection(
             return Err(err);
         }
     };
+    let presence_id = active_connection.connection_id;
     let alpn = conn.alpn().to_vec();
     info!(
         peer = %peer_id,
@@ -1816,9 +1897,9 @@ async fn handle_incoming_connection(
     tokio::select! {
         result = async {
             if alpn == CONTROL_ALPN {
-                handle_control_connection(conn, actor).await
+                handle_control_connection(conn, actor, presence_id).await
             } else if alpn == TCP_ALPN {
-                handle_tcp_proxy_connection(conn, actor, allowed_ports).await
+                handle_tcp_proxy_connection(conn, actor, allowed_ports, presence_id).await
             } else {
                 conn.close(GRACEFUL_CLOSE, b"unknown alpn");
                 Ok(())
@@ -1831,8 +1912,12 @@ async fn handle_incoming_connection(
     }
 }
 
-async fn handle_control_connection(conn: Connection, actor: ConfigActorHandle) -> Result<()> {
-    sync_control_server(&conn, actor).await?;
+async fn handle_control_connection(
+    conn: Connection,
+    actor: ConfigActorHandle,
+    presence_id: Uuid,
+) -> Result<()> {
+    sync_control_server(&conn, actor, presence_id).await?;
     conn.close(GRACEFUL_CLOSE, b"synced");
     Ok(())
 }
@@ -1877,7 +1962,10 @@ async fn sync_control_config(
             remote,
             expected_peer,
             granted_membership,
-        )
+        )?;
+        cfg.peer_last_connected
+            .insert(conn.remote_id().to_string(), current_unix_time()?);
+        Ok(true)
     })
     .await
     .context("timed out waiting for esp control sync")?
@@ -1937,7 +2025,11 @@ fn apply_control_response_to_config(
     Ok(changed)
 }
 
-async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Result<()> {
+async fn sync_control_server(
+    conn: &Connection,
+    actor: ConfigActorHandle,
+    presence_id: Uuid,
+) -> Result<()> {
     timeout(Duration::from_secs(15), async {
         let (mut send, mut recv) = conn
             .accept_bi()
@@ -1945,7 +2037,10 @@ async fn sync_control_server(conn: &Connection, actor: ConfigActorHandle) -> Res
             .context("failed to accept esp control stream")?;
         let remote = read_control_hello(&mut recv).await?;
         let response = match actor.control_sync(conn.remote_id(), remote, None).await {
-            Ok(response) => response,
+            Ok(response) => {
+                actor.connected(conn.remote_id(), presence_id).await?;
+                response
+            }
             Err(err) => {
                 warn!(
                     peer = %conn.remote_id(),
@@ -1975,6 +2070,7 @@ async fn run_config_actor(
     mut receiver: mpsc::Receiver<ConfigActorCommand>,
 ) {
     let mut active_connections = HashMap::<EndpointId, HashMap<Uuid, oneshot::Sender<()>>>::new();
+    let mut established = HashMap::<EndpointId, HashSet<Uuid>>::new();
     while let Some(command) = receiver.recv().await {
         match command {
             ConfigActorCommand::PrepareProxy {
@@ -1983,6 +2079,42 @@ async fn run_config_actor(
                 respond,
             } => {
                 let _ = respond.send(prepare_proxy_request(&cfg, &target, port));
+            }
+            ConfigActorCommand::Admin { request, respond } => {
+                let _ = respond.send(admin::respond(&cfg, &established, request));
+            }
+            ConfigActorCommand::Connected {
+                node_id,
+                connection_id,
+                respond,
+            } => {
+                let result = (|| {
+                    if is_node_revoked(&cfg, node_id) || cfg.peer_by_id(node_id).is_none() {
+                        bail!("cannot record an unknown or revoked peer as connected");
+                    }
+                    if !active_connections
+                        .get(&node_id)
+                        .is_some_and(|connections| connections.contains_key(&connection_id))
+                    {
+                        bail!("connection is no longer registered");
+                    }
+                    if !established
+                        .get(&node_id)
+                        .is_some_and(|connections| connections.contains(&connection_id))
+                    {
+                        let now = current_unix_time()?;
+                        commit_config_change(&path, &mut cfg, |next| {
+                            next.peer_last_connected.insert(node_id.to_string(), now);
+                            Ok(((), true))
+                        })?;
+                        established
+                            .entry(node_id)
+                            .or_default()
+                            .insert(connection_id);
+                    }
+                    Ok(())
+                })();
+                let _ = respond.send(result);
             }
             ConfigActorCommand::Status { respond } => {
                 let _ = respond.send(status_report_from_config(&cfg));
@@ -1995,12 +2127,13 @@ async fn run_config_actor(
                 let _ = respond.send(result);
             }
             ConfigActorCommand::IssueInvite {
+                name,
                 allowed_ports,
                 role,
                 respond,
             } => {
                 let result = commit_config_change(&path, &mut cfg, |next| {
-                    let invite = next.issue_invite(&allowed_ports, role)?;
+                    let invite = next.issue_invite(&name, &allowed_ports, role)?;
                     Ok((invite, true))
                 });
                 let _ = respond.send(result);
@@ -2060,6 +2193,12 @@ async fn run_config_actor(
                 connection_id,
             } => {
                 unregister_active_connection(&mut active_connections, node_id, connection_id);
+                if let Some(connections) = established.get_mut(&node_id) {
+                    connections.remove(&connection_id);
+                    if connections.is_empty() {
+                        established.remove(&node_id);
+                    }
+                }
             }
             ConfigActorCommand::ProxyRequest {
                 node_id,
@@ -2085,6 +2224,7 @@ async fn run_config_actor(
                 let _ = respond.send(hello_from_config(&cfg));
             }
         }
+        established.retain(|node, _| !is_node_revoked(&cfg, *node));
     }
 }
 
@@ -2136,6 +2276,15 @@ fn commit_config_change<T>(
 }
 
 impl ConfigActorHandle {
+    async fn connected(&self, node_id: EndpointId, connection_id: Uuid) -> Result<()> {
+        self.request(|respond| ConfigActorCommand::Connected {
+            node_id,
+            connection_id,
+            respond,
+        })
+        .await
+    }
+
     async fn prepare_proxy(&self, target: String, port: u16) -> Result<(Peer, TcpProxyRequest)> {
         self.request(|respond| ConfigActorCommand::PrepareProxy {
             target,
@@ -2156,10 +2305,12 @@ impl ConfigActorHandle {
 
     async fn issue_invite(
         &self,
+        name: String,
         allowed_ports: Vec<u16>,
         role: MembershipRole,
     ) -> Result<InviteCode> {
         self.request(|respond| ConfigActorCommand::IssueInvite {
+            name,
             allowed_ports,
             role,
             respond,
@@ -2232,6 +2383,18 @@ impl ConfigActorHandle {
 }
 
 impl ActiveConnectionGuard {
+    async fn connected(&self) -> Result<()> {
+        ConfigActorHandle {
+            sender: self.sender.clone(),
+        }
+        .request(|respond| ConfigActorCommand::Connected {
+            node_id: self.node_id,
+            connection_id: self.connection_id,
+            respond,
+        })
+        .await
+    }
+
     async fn cancelled(&mut self) {
         let _ = (&mut self.cancel).await;
     }
@@ -2881,12 +3044,18 @@ async fn open_proxy_tunnel(
             let conn = endpoint.connect(peer.node_id, TCP_ALPN).await
                 .with_context(|| format!("failed to connect to esp peer {}", peer.node_id))?;
             let connection = CloseConnectionOnDrop(conn);
-            let (mut send, recv) = connection.0.open_bi().await.context("failed to open TCP proxy stream")?;
+            let (mut send, mut recv) = connection.0.open_bi().await.context("failed to open TCP proxy stream")?;
             write_proxy_request(&mut send, &request).await?;
+            let response: LocalProxyResponse = read_cbor_frame(&mut recv, MAX_PROXY_REQUEST_LEN, "remote proxy setup response").await?;
+            match response {
+                LocalProxyResponse::Ready => {},
+                LocalProxyResponse::Error(message) => bail!("remote esp proxy rejected request: {message}"),
+            }
             Ok::<_, anyhow::Error>((connection, send, recv))
         } => result?,
         _ = active.cancelled() => bail!("peer {} has been revoked", peer.node_id),
     };
+    active.connected().await?;
     info!(peer = %peer.node_id, peer_name = %peer.name, port, "opened outgoing TCP proxy");
     Ok(ProxyTunnel {
         connection,
@@ -2998,32 +3167,48 @@ async fn handle_tcp_proxy_connection(
     conn: Connection,
     actor: ConfigActorHandle,
     allowed_ports: &[u16],
+    presence_id: Uuid,
 ) -> Result<()> {
-    let (send, mut recv) = timeout(TCP_PROXY_SETUP_TIMEOUT, conn.accept_bi())
+    let (mut send, mut recv) = timeout(TCP_PROXY_SETUP_TIMEOUT, conn.accept_bi())
         .await
-        .context("timed out waiting for TCP proxy stream")?
-        .context("failed to accept TCP proxy stream")?;
-    let request = timeout(TCP_PROXY_SETUP_TIMEOUT, read_proxy_request(&mut recv))
-        .await
-        .context("timed out waiting for TCP proxy request")??;
-    ensure_port_allowed(request.port, allowed_ports)?;
-    let port = request.port;
-    let peer = actor.proxy_request(conn.remote_id(), request).await?;
-    info!(
-        peer = %peer.node_id,
-        peer_name = %peer.name,
-        peer_id = %peer.connection_id,
-        port = port,
-        "opening localhost TCP proxy"
-    );
-
-    let tcp = timeout(
+        .context("timed out waiting for TCP proxy stream")??;
+    let setup = timeout(TCP_PROXY_SETUP_TIMEOUT, async {
+        let request = read_proxy_request(&mut recv).await?;
+        ensure_port_allowed(request.port, allowed_ports)?;
+        let port = request.port;
+        let peer = actor.proxy_request(conn.remote_id(), request).await?;
+        let tcp = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("failed to connect to 127.0.0.1:{port}"))?;
+        actor.connected(peer.node_id, presence_id).await?;
+        info!(peer = %peer.node_id, peer_name = %peer.name, port, "opened localhost TCP proxy");
+        Ok::<_, anyhow::Error>(tcp)
+    })
+    .await
+    .context("timed out setting up TCP proxy")
+    .and_then(|result| result);
+    let response = match &setup {
+        Ok(_) => LocalProxyResponse::Ready,
+        Err(err) => LocalProxyResponse::Error(format!("{err:#}")),
+    };
+    timeout(
         TCP_PROXY_SETUP_TIMEOUT,
-        TcpStream::connect(("127.0.0.1", port)),
+        write_cbor_frame(
+            &mut send,
+            &response,
+            MAX_PROXY_REQUEST_LEN,
+            "remote proxy setup response",
+        ),
     )
     .await
-    .with_context(|| format!("timed out connecting to 127.0.0.1:{port}"))?
-    .with_context(|| format!("failed to connect to 127.0.0.1:{port}"))?;
+    .context("timed out writing TCP proxy setup response")??;
+    let tcp = match setup {
+        Ok(tcp) => tcp,
+        Err(err) => {
+            finish_control_send(&mut send).await?;
+            return Err(err);
+        }
+    };
     let (read, write) = tcp.into_split();
     bridge_proxy(read, write, send, recv).await
 }
@@ -3464,6 +3649,13 @@ fn sync_parent_dir(parent: &Path) {
 impl Config {
     fn load(path: &Path) -> Result<Self> {
         let text = read_private_config(path)?;
+        let header: serde_yaml::Value = serde_yaml::from_str(&text)?;
+        if header.get("version").and_then(serde_yaml::Value::as_u64) != Some(CONFIG_VERSION as u64)
+        {
+            bail!(
+                "unsupported esp config version; upgrade all hosts, restart transports, and recreate the network with named invites (existing state has not been modified)"
+            );
+        }
         let cfg: Self = serde_yaml::from_str(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?;
         cfg.validate_local_config()?;
@@ -3657,6 +3849,7 @@ impl Config {
 
     pub fn issue_invite(
         &mut self,
+        name: &str,
         allowed_ports: &[u16],
         role: MembershipRole,
     ) -> Result<InviteCode> {
@@ -3664,6 +3857,7 @@ impl Config {
         let allowed_ports = normalize_allowed_ports(allowed_ports)?;
         self.ensure_can_issue_invite(&allowed_ports)?;
         let secret_key = self.secret_key()?;
+        let admin_label = normalize_connection_name(name)?;
         let invite_id = generate_connection_id();
         let invite_secret = generate_invite_secret();
         let invite = Invite {
@@ -3679,6 +3873,7 @@ impl Config {
             code: invite.encode()?,
         };
         self.invites.push(IssuedInvite {
+            admin_label,
             invite_id,
             secret_hash: hash_invite_secret(&invite_secret),
             allowed_ports,
@@ -3750,6 +3945,8 @@ impl Config {
             .find(|invite| invite.invite_id == proof.invite_id && invite.secret_hash == secret_hash)
             .map(|invite| {
                 normalize_allowed_ports(&invite.allowed_ports).map(|allowed_ports| InviteGrant {
+                    admin_label: invite.admin_label.clone(),
+                    invite_id: invite.invite_id.clone(),
                     allowed_ports,
                     role: invite.role,
                 })
@@ -3839,6 +4036,9 @@ impl MembershipCertificate {
         let allowed_ports = normalize_allowed_ports(allowed_ports)?;
         let mut membership = Self {
             version: MEMBERSHIP_CERTIFICATE_VERSION,
+            admin_label: normalize_connection_name(&subject.name)?,
+            invite_id: None,
+            joined_at_unix: current_unix_time()?,
             network_id: network_id.to_string(),
             subject_node_id: subject.node_id,
             subject_connection_id: subject.connection_id.clone(),
@@ -3906,6 +4106,16 @@ impl MembershipCertificate {
             );
         }
         validate_network_id(&self.network_id)?;
+        if normalize_connection_name(&self.admin_label)? != self.admin_label {
+            bail!("membership admin label is not normalized");
+        }
+        if self
+            .invite_id
+            .as_ref()
+            .is_some_and(|id| !is_valid_connection_id(id))
+        {
+            bail!("membership invite id must be six base62 characters");
+        }
         let fields = [
             self.version.to_string(),
             self.network_id.clone(),
@@ -3914,6 +4124,9 @@ impl MembershipCertificate {
             self.role.to_string(),
             format_ports(&self.allowed_ports()?),
             self.issuer_node_id.to_string(),
+            self.admin_label.clone(),
+            self.invite_id.clone().unwrap_or_default(),
+            self.joined_at_unix.to_string(),
         ];
         let mut payload = Vec::new();
         append_signed_field(&mut payload, MEMBERSHIP_SIGNATURE_CONTEXT);
@@ -4148,7 +4361,12 @@ fn consume_invite_and_issue_membership(
         return Ok(None);
     }
     let secret_key = cfg.secret_key()?;
-    MembershipCertificate::issue(cfg, &secret_key, peer, &grant.allowed_ports, grant.role).map(Some)
+    let mut membership =
+        MembershipCertificate::issue(cfg, &secret_key, peer, &grant.allowed_ports, grant.role)?;
+    membership.admin_label = normalize_connection_name(&grant.admin_label)?;
+    membership.invite_id = Some(grant.invite_id);
+    membership.signature = encode_signature(&secret_key.sign(&membership.signature_payload()?));
+    Ok(Some(membership))
 }
 
 fn verified_membership_for_peer(

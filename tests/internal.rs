@@ -2,8 +2,6 @@
 
 include!("../src/main.rs");
 
-use std::collections::HashSet;
-
 const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 fn creator_config(secret_key: &SecretKey) -> Config {
@@ -70,7 +68,11 @@ fn invite_grants_are_signed_into_membership() {
     let creator_key = SecretKey::generate();
     let mut cfg = creator_config(&creator_key);
     let invite = cfg
-        .issue_invite(&[8080, DEFAULT_ALLOWED_PORT, 8080], MembershipRole::Admin)
+        .issue_invite(
+            "Test peer",
+            &[8080, DEFAULT_ALLOWED_PORT, 8080],
+            MembershipRole::Admin,
+        )
         .unwrap();
     let invite = Invite::decode(&invite.code).unwrap();
     let proof = InviteProof {
@@ -109,7 +111,7 @@ fn invite_proof_is_consumed_when_membership_is_granted() {
     let creator_key = SecretKey::generate();
     let mut cfg = creator_config(&creator_key);
     let invite = cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
     let invite = Invite::decode(&invite.code).unwrap();
     let proof = InviteProof {
@@ -142,7 +144,7 @@ fn consumed_invite_regrants_existing_membership_to_same_node() {
     let creator_key = SecretKey::generate();
     let mut cfg = creator_config(&creator_key);
     let invite = cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
     let invite = Invite::decode(&invite.code).unwrap();
     let proof = InviteProof {
@@ -185,7 +187,7 @@ fn incomplete_join_is_not_saved() {
     let creator_cfg = creator_config(&creator_key);
     let member_key = SecretKey::generate();
     let pending = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -199,6 +201,7 @@ fn incomplete_join_is_not_saved() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![Peer {
             node_id: creator_key.public(),
             name: "creator".to_string(),
@@ -221,12 +224,12 @@ fn short_invite_join_bootstraps_policy_issuer_membership() {
     let creator_key = SecretKey::generate();
     let mut inviter_cfg = creator_config(&creator_key);
     let invite = inviter_cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
     let invite = Invite::decode(&invite.code).unwrap();
     let member_key = SecretKey::generate();
     let mut join_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: invite.network_id.clone(),
         network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),
         secret_key: encode_secret_key(&member_key),
@@ -240,6 +243,7 @@ fn short_invite_join_bootstraps_policy_issuer_membership() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![Peer {
             node_id: invite.inviter_node_id,
             name: String::new(),
@@ -290,7 +294,7 @@ fn config_schema_requires_current_policy_field() {
     let secret_key = SecretKey::generate();
     let yaml = format!(
         "\
-version: 1
+version: 2
 network_id: net
 secret_key: {}
 creator_node_id: {}
@@ -346,7 +350,7 @@ fn joined_admin_cannot_issue_invite_for_ungranted_port() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -366,12 +370,13 @@ fn joined_admin_cannot_issue_invite_for_ungranted_port() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![creator_peer],
         revocations: Vec::new(),
     };
 
     let err = member_cfg
-        .issue_invite(&[8080], MembershipRole::Peer)
+        .issue_invite("Test peer", &[8080], MembershipRole::Peer)
         .unwrap_err()
         .to_string();
 
@@ -394,7 +399,7 @@ fn joined_peer_cannot_issue_invites() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -414,12 +419,13 @@ fn joined_peer_cannot_issue_invites() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![creator_peer],
         revocations: Vec::new(),
     };
 
     let err = member_cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap_err()
         .to_string();
 
@@ -576,7 +582,7 @@ fn joined_peer_cannot_revoke() {
         connection_id: "FED654".to_string(),
     };
     let mut member_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -596,6 +602,7 @@ fn joined_peer_cannot_revoke() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![creator_peer, target_peer],
         revocations: Vec::new(),
     };
@@ -762,7 +769,7 @@ fn non_admin_hello_does_not_advertise_directory() {
         connection_id: "FED654".to_string(),
     };
     let member_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -792,6 +799,7 @@ fn non_admin_hello_does_not_advertise_directory() {
         name: "member".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: vec![creator_peer, advertised_peer.clone()],
         revocations: Vec::new(),
     };
@@ -917,7 +925,7 @@ fn joined_admin_can_update_network_policy() {
     )
     .unwrap();
     let mut admin_cfg = Config {
-        version: 1,
+        version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&admin_key),
@@ -928,6 +936,7 @@ fn joined_admin_can_update_network_policy() {
         name: "admin".to_string(),
         connection_id: "DEF456".to_string(),
         invites: Vec::new(),
+        peer_last_connected: HashMap::new(),
         peers: Vec::new(),
         revocations: Vec::new(),
     };
@@ -952,7 +961,7 @@ async fn config_actor_serializes_invite_consumption() {
     let creator_key = SecretKey::generate();
     let mut cfg = creator_config(&creator_key);
     let invite = cfg
-        .issue_invite(&[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
+        .issue_invite("Test peer", &[DEFAULT_ALLOWED_PORT], MembershipRole::Peer)
         .unwrap();
     let invite = Invite::decode(&invite.code).unwrap();
     let proof = InviteProof {
@@ -1072,6 +1081,7 @@ async fn local_control_invites_are_fresh_and_persisted_by_config_actor() {
         let response = send_local_control_request_to_path(
             &socket_path,
             LocalControlRequest::IssueInvite {
+                name: "Test peer".to_string(),
                 ports: vec![DEFAULT_ALLOWED_PORT],
                 role: MembershipRole::Admin,
             },
