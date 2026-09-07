@@ -9,43 +9,101 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum Format {
-    Json,
     #[default]
+    Json,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "FormatConfigInput")]
+pub struct FormatConfig {
+    #[serde(rename = "type")]
+    pub kind: Format,
+    pub colorize: bool,
+}
+
+impl Default for FormatConfig {
+    fn default() -> Self {
+        Self {
+            kind: Format::Json,
+            colorize: true,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum FormatConfigInput {
+    Structured {
+        #[serde(default, rename = "type")]
+        kind: Format,
+        #[serde(default = "default_colorize")]
+        colorize: bool,
+    },
+    Legacy(LegacyFormat),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyFormat {
+    Json,
     JsonColorized,
     Text,
 }
 
+fn default_colorize() -> bool {
+    true
+}
+
+impl From<FormatConfigInput> for FormatConfig {
+    fn from(input: FormatConfigInput) -> Self {
+        match input {
+            FormatConfigInput::Structured { kind, colorize } => Self { kind, colorize },
+            FormatConfigInput::Legacy(legacy) => match legacy {
+                LegacyFormat::Json => Self {
+                    kind: Format::Json,
+                    colorize: false,
+                },
+                LegacyFormat::JsonColorized => Self::default(),
+                LegacyFormat::Text => Self {
+                    kind: Format::Text,
+                    colorize: false,
+                },
+            },
+        }
+    }
+}
+
 #[derive(Args, Debug, Clone, Copy, Default)]
 pub(super) struct Arguments {
-    /// Override the config format (default: json_colorized).
+    /// Override format.type in the config (default: json).
     #[arg(long, value_enum)]
     pub(super) format: Option<Format>,
-    /// Disable JSON syntax highlighting, overriding the config.
+    /// Disable colorization, overriding the config.
     #[arg(long)]
     pub(super) no_color: bool,
+    /// Enable colorization, overriding the config.
+    #[arg(long, conflicts_with = "no_color")]
+    pub(super) color: bool,
 }
 
 impl Arguments {
-    pub(super) fn resolve(&self, configured: Format) -> Options {
+    pub(super) fn resolve(&self, configured: FormatConfig) -> Options {
         Options {
-            format: self.format.unwrap_or(configured),
-            no_color: self.no_color,
+            format: self.format.unwrap_or(configured.kind),
+            no_color: self.no_color || (!self.color && !configured.colorize),
         }
     }
 
     pub(super) fn resolve_from_config(&self) -> Result<Options> {
-        let configured = if self.format.is_some() {
-            Format::default()
-        } else {
-            read_format(&super::config_path()?)?.unwrap_or_default()
-        };
+        let configured = read_format(&super::config_path()?)?.unwrap_or_default();
         Ok(self.resolve(configured))
     }
 }
 
 /// Read only the local output preference, including while the transport owns the config.
 /// A missing config is normal for init and join.
-pub(super) fn read_format(path: &Path) -> Result<Option<Format>> {
+pub(super) fn read_format(path: &Path) -> Result<Option<FormatConfig>> {
     let text = match super::read_private_config(path) {
         Ok(text) => text,
         Err(error)
@@ -60,7 +118,7 @@ pub(super) fn read_format(path: &Path) -> Result<Option<Format>> {
     #[derive(Deserialize)]
     struct Preferences {
         #[serde(default)]
-        format: Format,
+        format: FormatConfig,
     }
     let preferences: Preferences = serde_yaml::from_str(&text)
         .with_context(|| format!("failed to parse output format in {}", path.display()))?;
@@ -86,16 +144,30 @@ impl Options {
         let fields = report
             .as_object()
             .ok_or_else(|| anyhow!("command report must be an object"))?;
-        Ok(fields
+        let mut text = fields
             .iter()
-            .map(|(key, value)| format!("{key}: {}", text_value(value)))
+            .filter(|(key, _)| key.as_str() != "next_step")
+            .map(|(key, value)| self.text_field(key, &text_value(value)))
             .collect::<Vec<_>>()
-            .join("\n"))
+            .join("\n");
+        if let Some(next_step) = fields.get("next_step") {
+            text.push_str("\n\n");
+            text.push_str(&text_value(next_step));
+        }
+        Ok(text)
+    }
+
+    pub(super) fn text_field(&self, key: &str, value: &str) -> String {
+        if self.no_color {
+            format!("{key}: {value}")
+        } else {
+            format!("\x1b[1;37m{key}:\x1b[0m \x1b[94m{value}\x1b[0m")
+        }
     }
 
     pub(super) fn render_json(&self, report: &impl Serialize) -> Result<String> {
         let json = serde_json::to_string_pretty(report)?;
-        Ok(if self.no_color || self.format == Format::Json {
+        Ok(if self.no_color {
             json
         } else {
             highlight_json(&json)

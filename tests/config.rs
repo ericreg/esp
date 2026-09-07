@@ -52,7 +52,7 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         connection_id: "DEF456".to_string(),
     };
     let mut cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &creator_key),
@@ -109,7 +109,7 @@ fn resolving_duplicate_names_requires_connection_id() {
     let first_peer_key = SecretKey::generate();
     let second_peer_key = SecretKey::generate();
     let cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
@@ -152,7 +152,7 @@ fn connection_ids_are_case_sensitive_base62() {
     let secret_key = SecretKey::generate();
     let peer_key = SecretKey::generate();
     let cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
@@ -182,7 +182,7 @@ fn advertised_peer_lists_are_bounded() {
     let secret_key = SecretKey::generate();
     let remote_key = SecretKey::generate();
     let mut cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: 2,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),

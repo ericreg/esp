@@ -61,6 +61,8 @@ pub(super) struct Overview {
     pub(super) total: usize,
     #[n(4)]
     pub(super) connected: usize,
+    #[n(5)]
+    pub(super) network_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -132,6 +134,7 @@ fn overview(cfg: &Config, rows: &[PeerRow]) -> Result<Overview> {
     hash.update(minicbor::to_vec(&cfg.peers)?);
     hash.update(minicbor::to_vec(&cfg.memberships)?);
     Ok(Overview {
+        network_label: cfg.network_policy.admin_label.clone(),
         network_id: cfg.network_id.clone(),
         local_name: cfg.name.clone(),
         revision: URL_SAFE_NO_PAD.encode(hash.finalize()),
@@ -354,13 +357,16 @@ impl App {
         }
         if let Some(peer) = self.confirmation.clone() {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.confirmation = None,
+                KeyCode::Esc | KeyCode::Char('q' | 'n' | 'N') => self.confirmation = None,
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                     self.confirm_yes = !self.confirm_yes
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                     self.confirmation = None;
-                    if self.confirm_yes && self.view.online && !self.revoking {
+                    if (self.confirm_yes || matches!(key.code, KeyCode::Char('y' | 'Y')))
+                        && self.view.online
+                        && !self.revoking
+                    {
                         self.revoking = true;
                         self.message = format!("Revoking {}...", peer.admin_label);
                         return Action::Revoke(peer.node_id);
@@ -420,7 +426,7 @@ impl App {
             return;
         }
         let sections = Layout::vertical([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
@@ -432,10 +438,7 @@ impl App {
                 self.view.peers.len()
             )
         } else {
-            format!(
-                "{} peers | connection status Unknown",
-                self.view.peers.len()
-            )
+            format!("{} peers", self.view.peers.len())
         };
         let mut network = detail_line("network_id", self.view.overview.network_id.clone());
         if !self.view.online {
@@ -467,8 +470,33 @@ impl App {
             Span::raw(" | "),
             Span::styled(counts, Style::default().fg(Color::LightBlue)),
         ]);
+        if !self.view.online {
+            host.spans.extend([
+                Span::raw(" | "),
+                Span::styled(
+                    "connection_status:",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::styled("unknown", Style::default().fg(Color::Gray)),
+            ]);
+        }
         frame.render_widget(
-            Paragraph::new(vec![network, host]).block(Block::bordered().title(" esp admin ")),
+            Paragraph::new(vec![
+                detail_line(
+                    "network_label",
+                    self.view
+                        .overview
+                        .network_label
+                        .clone()
+                        .unwrap_or_else(|| "not_recorded".into()),
+                ),
+                network,
+                host,
+            ])
+            .block(Block::bordered().title(" esp admin ")),
             sections[0],
         );
         let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -616,11 +644,11 @@ impl App {
             );
             frame.render_widget(Clear, dialog);
             let buttons = if self.confirm_yes {
-                "  Cancel     [ Revoke ]"
+                "  n     [ y ]"
             } else {
-                "[ Cancel ]     Revoke"
+                "[ n ]     y"
             };
-            frame.render_widget(Paragraph::new(format!("Revoke {}?\nhost: {} ({})\nnode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\nTab/arrows: choose | Enter: confirm | Esc: cancel", peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, buttons))
+            frame.render_widget(Paragraph::new(format!("remove peer {} from network? y/n\nhost: {} ({})\nnode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\ny: remove | n/Esc: cancel | Tab/arrows: choose | Enter: confirm", peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, buttons))
                 .wrap(Wrap { trim: false }).block(Block::bordered().title(" Confirm revocation ")), dialog);
         }
     }

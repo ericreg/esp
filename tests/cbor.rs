@@ -96,7 +96,10 @@ fn all_message_variants_roundtrip_through_cbor() {
         LocalControlRequest::Revoke {
             target: peer.connection_id.clone(),
         },
-        LocalControlRequest::UpdatePolicy { max_peers: 250 },
+        LocalControlRequest::UpdatePolicy {
+            max_peers: 250,
+            network_label: None,
+        },
     ] {
         roundtrip(&request);
     }
@@ -122,6 +125,7 @@ fn all_message_variants_roundtrip_through_cbor() {
         },
         LocalControlOk::PolicyUpdated {
             report: NetworkPolicyReport {
+                network_label: None,
                 max_peers: 250,
                 issuer_node_id: cfg.creator_node_id,
                 issued_at_unix: 123,
@@ -455,4 +459,40 @@ async fn frames_reject_invalid_lengths_payloads_and_trailing_values() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn network_labels_are_signed_shared_and_preserved_by_policy_updates() {
+    let (mut cfg, _, _, _) = records();
+    let mut remote = cfg.clone();
+    cfg.issue_network_policy_with_label(100, Some("Office / Lab".into()))
+        .unwrap();
+    assert_eq!(
+        cfg.network_policy.admin_label.as_deref(),
+        Some("Office / Lab")
+    );
+    cfg.network_policy.verify_signature().unwrap();
+    roundtrip(&cfg.network_policy);
+    let hello = hello_from_config(&cfg).unwrap();
+    assert!(
+        remember_network_policy_in_config(&mut remote, hello.network_policy.unwrap(), &[]).unwrap()
+    );
+    assert_eq!(
+        remote.network_policy.admin_label,
+        cfg.network_policy.admin_label
+    );
+    for label in [None, Some("Fake network".into())] {
+        let mut tampered = cfg.network_policy.clone();
+        tampered.admin_label = label;
+        assert!(tampered.verify_signature().is_err());
+    }
+    cfg.issue_network_policy(200).unwrap();
+    assert_eq!(
+        cfg.network_policy.admin_label.as_deref(),
+        Some("Office / Lab")
+    );
+    assert!(
+        cfg.issue_network_policy_with_label(200, Some("different".into()))
+            .is_err()
+    );
 }

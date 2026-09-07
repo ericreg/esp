@@ -4,7 +4,7 @@ use super::{
 };
 use anyhow::Result;
 use serde::Serialize;
-use std::{fmt::Write as _, path::Path};
+use std::path::Path;
 
 pub(super) fn render(
     path: &Path,
@@ -19,32 +19,42 @@ pub(super) fn render(
     } else {
         "not running"
     };
+    let options = Options { format, no_color };
     if format == Format::Text {
-        let mut text = format!(
-            "esp_config: {}\ntransport: {}\nnetwork: {}\nmax_peers: {}\nname: {}\nconnection_id: {}\nnode_id: {}\nconnected_peers: {}",
-            path.display(),
-            transport,
-            report.network_id,
-            report.max_peers,
-            report.name,
-            report.connection_id,
-            report.node_id,
-            report
-                .connected_peers
-                .map_or_else(|| "unknown".into(), |count| count.to_string()),
-        );
+        let mut lines = vec![
+            options.text_field("esp_config", &path.display().to_string()),
+            options.text_field("transport", transport),
+            options.text_field("network", &report.network_id),
+            options.text_field(
+                "network_label",
+                report.network_label.as_deref().unwrap_or("not_recorded"),
+            ),
+            options.text_field("max_peers", &report.max_peers.to_string()),
+            options.text_field("name", &report.name),
+            options.text_field("connection_id", &report.connection_id),
+            options.text_field("node_id", &report.node_id.to_string()),
+            options.text_field(
+                "connected_peers",
+                &report
+                    .connected_peers
+                    .map_or_else(|| "unknown".into(), |count| count.to_string()),
+            ),
+        ];
         for invite in &report.invites {
-            write!(text, "\nissued_invite: {invite}")?;
+            lines.push(options.text_field("issued_invite", invite));
         }
         if peers {
             for peer in &report.peers {
-                write!(text, "\npeer: {} {}", peer.display_name(), peer.node_id)?;
+                lines.push(
+                    options
+                        .text_field("peer", &format!("{} {}", peer.display_name(), peer.node_id)),
+                );
             }
         }
         for revocation in &report.revocations {
-            write!(text, "\nrevoked: {revocation}")?;
+            lines.push(options.text_field("revoked", &revocation.to_string()));
         }
-        return Ok(text);
+        return Ok(lines.join("\n"));
     }
 
     #[derive(Serialize)]
@@ -56,7 +66,7 @@ pub(super) fn render(
         #[serde(skip_serializing_if = "Option::is_none")]
         peers: Option<&'a [Peer]>,
     }
-    Options { format, no_color }.render_json(&Output {
+    options.render_json(&Output {
         config: path.display().to_string(),
         transport,
         report,

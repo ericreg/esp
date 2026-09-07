@@ -7,6 +7,7 @@ use status_output::render;
 
 fn report() -> StatusReport {
     StatusReport {
+        network_label: None,
         network_id: "test-network".into(),
         connected_peers: Some(1),
         max_peers: 100,
@@ -79,7 +80,7 @@ fn json_preserves_status_fields_and_escaping_with_or_without_color() {
             Path::new("/tmp/config.yml"),
             &report,
             running,
-            Format::JsonColorized,
+            Format::Json,
             false,
             true,
         )
@@ -91,26 +92,28 @@ fn json_preserves_status_fields_and_escaping_with_or_without_color() {
 }
 
 #[test]
-fn text_uses_snake_case_keys_without_added_color() {
+fn text_uses_snake_case_keys_with_optional_colors() {
     let mut report = report();
     report.name = "local".into();
     let expected = format!(
-        "esp_config: /tmp/config.yml\ntransport: running\nnetwork: test-network\nmax_peers: 100\nname: local\nconnection_id: LOCAL1\nnode_id: {}\nconnected_peers: 1\nissued_invite: invite-1\npeer: peer (REMOTE) {}\nrevoked: {}",
+        "esp_config: /tmp/config.yml\ntransport: running\nnetwork: test-network\nnetwork_label: not_recorded\nmax_peers: 100\nname: local\nconnection_id: LOCAL1\nnode_id: {}\nconnected_peers: 1\nissued_invite: invite-1\npeer: peer (REMOTE) {}\nrevoked: {}",
         report.node_id, report.peers[0].node_id, report.revocations[0],
     );
     for no_color in [false, true] {
-        assert_eq!(
-            render(
-                Path::new("/tmp/config.yml"),
-                &report,
-                true,
-                Format::Text,
-                no_color,
-                true,
-            )
-            .unwrap(),
-            expected
-        );
+        let text = render(
+            Path::new("/tmp/config.yml"),
+            &report,
+            true,
+            Format::Text,
+            no_color,
+            true,
+        )
+        .unwrap();
+        assert_eq!(strip_colors(&text), expected);
+        assert_eq!(text.contains('\x1b'), !no_color);
+        if !no_color {
+            assert!(text.contains("\x1b[1;37mname:\x1b[0m \x1b[94mlocal\x1b[0m"));
+        }
     }
 }
 
@@ -136,8 +139,7 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
     for args in [
         vec![],
         vec!["--format", "json"],
-        vec!["--format", "json_colorized"],
-        vec!["--format", "json_colorized", "--no-color"],
+        vec!["--format", "json", "--color"],
         vec!["--no-color"],
         vec!["--format", "json", "--no-color"],
         vec!["--format", "text"],
@@ -158,15 +160,13 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.contains('\x1b'), !args.contains(&"--no-color"));
         if args.contains(&"text") {
-            assert!(stdout.starts_with("esp_config: "));
-            assert!(stdout.contains("transport: not running\n"));
-            assert!(!stdout.contains('\x1b'));
+            let plain = strip_colors(&stdout);
+            assert!(plain.starts_with("esp_config: "));
+            assert!(plain.contains("transport: not running\n"));
         } else {
-            assert_eq!(
-                stdout.contains('\x1b'),
-                !args.contains(&"--no-color") && !args.contains(&"json")
-            );
+            assert_eq!(stdout.contains('\x1b'), !args.contains(&"--no-color"));
             let json: serde_json::Value = serde_json::from_str(&strip_colors(&stdout)).unwrap();
             assert_eq!(json["transport"], "not running");
             assert_eq!(json["connected_peers"], 0);
@@ -205,6 +205,7 @@ fn status_summary_omits_peer_details_in_both_formats() {
         false,
     )
     .unwrap();
+    let text = strip_colors(&text);
     assert!(text.contains("\nconnected_peers: 1\n"));
     assert!(!text.contains("\npeer:"));
     assert!(!text.contains("REMOTE"));

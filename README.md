@@ -37,11 +37,17 @@ cargo install --git https://github.com/ericreg/esp.git --force
 On the first machine:
 
 ```sh
-esp init
+esp init "Home network"
 ```
 
-This creates `~/.esp/config.yml`, detects this host's name, and generates a unique
-connection id. Create an invite explicitly:
+This creates `~/.esp/config.yml` with the required network label, detects this
+host's name, and generates a unique connection id. Network labels are trimmed,
+nonblank printable ASCII strings of at most 64 bytes. They are signed into the
+network policy and shared with joined hosts. Admins can run `esp init "label"`
+to label an existing unlabeled network; repeating the same label is safe. Init
+does not rename an already labeled network. Update esp on all hosts before
+assigning a network label, since older versions cannot verify labeled policies.
+Create an invite explicitly:
 
 ```sh
 esp invite "laptop"
@@ -184,6 +190,9 @@ connection status and disables revocation. It reconnects automatically when the
 transport starts. A disconnected or unresponsive transport marks the view stale.
 The minimum terminal size is 80 columns by 20 rows.
 
+Pressing `r` opens `remove peer <admin_label> from network? y/n`. Press `y` to
+remove that peer or `n`/Esc to cancel; Enter defaults to cancellation.
+
 Every new invite requires an admin label: `esp invite "Eric laptop"`. Labels are
 trimmed, nonblank printable ASCII strings of at most 64 bytes. The label stays
 separate from the joining machine's hostname and is signed into its membership,
@@ -196,7 +205,7 @@ network creator's label initially matches its hostname and has no invite ID.
 ## Commands
 
 ```sh
-esp init --max-peers 100 # create ~/.esp/config.yml if missing
+esp init "Home network" --max-peers 100 # create ~/.esp/config.yml if missing
 esp join CODE         # join from an invite code
 esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
 esp rename NAME       # rename this host
@@ -204,8 +213,8 @@ esp revoke TARGET     # revoke a peer by name, connection id, or node id as an a
 esp policy --max-peers 100 # update the signed network peer cap as an admin
 esp invite "laptop" --role peer --ports 22 # create and print an invite as an admin
 esp status            # show transport, local node, and connected peer count as highlighted JSON
-esp status --format json # plain JSON for scripts
-esp status --format text # snake_case text output, always without color
+esp status --format json --no-color # plain JSON for scripts
+esp status --format text # snake_case text output; color follows the config
 esp status --peers     # include the full peer list (also works with --format text)
 esp admin             # interactive two-pane administration (admin members only)
 esp daemon --ports 22 # run the daemon; this is also the default `esp`
@@ -213,30 +222,33 @@ esp daemon --max-connections-per-peer 32 # allow more concurrent connections per
 ```
 
 The report commands (`init`, `join`, `rename`, `invite`, `revoke`, `policy`, and
-`status`) use the top-level `format` setting in `~/.esp/config.yml`:
+`status`) use the top-level `format` settings in `~/.esp/config.yml`:
 
 ```yaml
-format: json_colorized
+format:
+  type: json
+  colorize: true
 ```
 
-| Value | Output |
-| --- | --- |
-| `json` | Plain JSON |
-| `json_colorized` | Syntax-highlighted JSON (default when omitted) |
-| `text` | Plain text with snake_case keys |
+`type` accepts `json` or `text` and defaults to `json`. `colorize` accepts `true`
+or `false` and defaults to `true`. Colored JSON uses syntax highlighting; colored
+text uses bold white keys and light blue values. In text output, the init hint
+appears after the fields, separated by a blank line, without a `next_step` key.
+JSON retains `next_step`.
 
-Each command accepts `--format json`, `--format json_colorized`, and `--format text`
-to override the config for that invocation. `--no-color` disables highlighting
-without changing the selected format; it also takes precedence over
-`--format json_colorized`. CLI overrides do not modify the saved preference.
-Changes to the setting take effect on the next command, including with a running
-transport. For example:
+`--format json|text` overrides only the type, while `--color` and `--no-color`
+override colorization. CLI overrides do not modify the saved preferences. Changes
+take effect on the next command, including with a running transport. For example:
 
 ```sh
 esp join CODE --format text
-esp status --format json_colorized
-esp invite "laptop" --format json | jq -r .invite_code
+esp status --format text --color
+esp invite "laptop" --format json --no-color | jq -r .invite_code
 ```
+
+The previous scalar settings (`json`, `json_colorized`, and `text`) remain readable
+and are converted to the nested form when the config is next saved, preserving
+their existing output behavior.
 
 `invite` now returns an `invite_code` field rather than a bare code. The interactive
 admin screen, proxy byte stream, daemon logs, and command help retain their own

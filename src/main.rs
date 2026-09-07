@@ -95,6 +95,8 @@ struct Cli {
 enum Command {
     /// Create ~/.esp/config.yml if needed.
     Init {
+        /// Admin label for this network.
+        network_label: String,
         /// Maximum number of remote peers this network should remember.
         #[arg(long, default_value_t = DEFAULT_MAX_KNOWN_PEERS)]
         max_peers: usize,
@@ -179,7 +181,7 @@ enum Command {
 pub struct Config {
     pub version: u8,
     #[serde(default)]
-    pub format: output::Format,
+    pub format: output::FormatConfig,
     pub network_id: String,
     pub secret_key: String,
     pub network_policy: NetworkPolicyCertificate,
@@ -337,6 +339,8 @@ pub struct NetworkPolicyCertificate {
     pub issued_at_unix: u64,
     #[n(5)]
     pub signature: String,
+    #[n(6)]
+    pub admin_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -533,6 +537,8 @@ struct StatusReport {
     /// None when an older transport does not report live presence.
     #[n(8)]
     connected_peers: Option<usize>,
+    #[n(9)]
+    network_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -559,6 +565,8 @@ pub struct NetworkPolicyReport {
     pub issued_at_unix: u64,
     #[n(3)]
     pub peers: Vec<Peer>,
+    #[n(4)]
+    pub network_label: Option<String>,
 }
 
 #[derive(Clone)]
@@ -599,6 +607,7 @@ enum ConfigActorCommand {
         respond: oneshot::Sender<Result<RevocationReport>>,
     },
     UpdatePolicy {
+        network_label: Option<String>,
         max_peers: usize,
         respond: oneshot::Sender<Result<NetworkPolicyReport>>,
     },
@@ -695,6 +704,8 @@ enum LocalControlRequest {
     UpdatePolicy {
         #[n(0)]
         max_peers: usize,
+        #[n(1)]
+        network_label: Option<String>,
     },
     #[n(22)]
     Admin {
@@ -877,7 +888,11 @@ pub async fn run() -> Result<()> {
     let _logging_guard = init_logging(is_daemon)?;
 
     match command {
-        Command::Init { max_peers, output } => init(max_peers, output.resolve_from_config()?).await,
+        Command::Init {
+            network_label,
+            max_peers,
+            output,
+        } => init(&network_label, max_peers, output.resolve_from_config()?).await,
         Command::Join { invite, output } => join(&invite, output.resolve_from_config()?).await,
         Command::Daemon {
             ports,
@@ -933,34 +948,66 @@ fn env_filter_with_default(default_level: LevelFilter) -> EnvFilter {
         .from_env_lossy()
 }
 
-async fn init(max_peers: usize, output: output::Options) -> Result<()> {
+async fn init(network_label: &str, max_peers: usize, output: output::Options) -> Result<()> {
+    let network_label = normalize_network_label(network_label)?;
     validate_max_known_peers(max_peers)?;
     let path = config_path()?;
     if path.exists()
-        && let Some(report) = request_daemon_status().await?
+        && let Some(mut report) = request_daemon_status().await?
     {
-        print_init_report(&path, &report, output)?;
-        return Ok(());
+        ensure_network_label_matches(report.network_label.as_deref(), &network_label)?;
+        if report.network_label.is_none() {
+            let updated =
+                request_daemon_policy_update(report.max_peers, Some(network_label.clone()))
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow!("transport stopped while assigning network label; retry init")
+                    })?;
+            if updated.network_label.as_deref() != Some(&network_label) {
+                bail!(
+                    "restart the transport with the updated esp binary to assign a network label"
+                );
+            }
+            report.network_label = updated.network_label;
+        }
+        return print_init_report(&path, &report, output);
     }
 
-    let cfg = if path.exists() {
+    let mut cfg = if path.exists() {
         Config::load(&path)?
     } else {
-        let secret_key = SecretKey::generate();
-        let cfg = create_creator_config(
-            &secret_key,
+        create_creator_config(
+            &SecretKey::generate(),
             Uuid::new_v4().to_string(),
             default_connection_name(),
             generate_connection_id(),
             max_peers,
-        )?;
-        cfg.save(&path)?;
-        cfg
+        )?
     };
+    ensure_network_label_matches(cfg.network_policy.admin_label.as_deref(), &network_label)?;
+    let mut peers = Vec::new();
+    if cfg.network_policy.admin_label.is_none() {
+        peers = cfg
+            .issue_network_policy_with_label(cfg.max_known_peers()?, Some(network_label))?
+            .peers;
+        cfg.save(&path)?;
+    }
     cfg.validate_local_config()?;
+    print_init_report(&path, &status_report_from_config(&cfg)?, output)?;
+    broadcast_control_sync_from_file(&path, peers).await;
+    Ok(())
+}
 
-    let report = status_report_from_config(&cfg)?;
-    print_init_report(&path, &report, output)?;
+fn normalize_network_label(label: &str) -> Result<String> {
+    normalize_connection_name(label).context("invalid network label")
+}
+
+fn ensure_network_label_matches(existing: Option<&str>, requested: &str) -> Result<()> {
+    if let Some(existing) = existing
+        && existing != requested
+    {
+        bail!("network is already labeled {existing:?}; init cannot rename it");
+    }
     Ok(())
 }
 
@@ -978,7 +1025,7 @@ async fn join(invite_code: &str, output: output::Options) -> Result<()> {
     let creator_node_id = invite.creator_node_id;
     let connection_id = generate_connection_id();
     let mut cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: CONFIG_VERSION,
         network_id: invite.network_id.clone(),
         network_policy: pending_join_network_policy(&invite.network_id, creator_node_id),
@@ -1035,6 +1082,7 @@ fn join_report(path: &Path, cfg: &Config) -> Result<serde_json::Value> {
         "role": membership.role,
         "allowed_ports": membership.allowed_ports()?,
         "join_sync": "complete",
+        "network_label": cfg.network_policy.admin_label,
     }))
 }
 
@@ -1091,7 +1139,7 @@ async fn revoke(target: &str, output: output::Options) -> Result<()> {
 
 async fn update_policy(max_peers: usize, output: output::Options) -> Result<()> {
     validate_max_known_peers(max_peers)?;
-    if let Some(report) = request_daemon_policy_update(max_peers).await? {
+    if let Some(report) = request_daemon_policy_update(max_peers, None).await? {
         print_policy_report(&report, output)?;
         return Ok(());
     }
@@ -1189,9 +1237,15 @@ async fn request_daemon_revoke(target: &str) -> Result<Option<RevocationReport>>
     }
 }
 
-async fn request_daemon_policy_update(max_peers: usize) -> Result<Option<NetworkPolicyReport>> {
-    let Some(response) =
-        send_local_control_request(LocalControlRequest::UpdatePolicy { max_peers }).await?
+async fn request_daemon_policy_update(
+    max_peers: usize,
+    network_label: Option<String>,
+) -> Result<Option<NetworkPolicyReport>> {
+    let Some(response) = send_local_control_request(LocalControlRequest::UpdatePolicy {
+        max_peers,
+        network_label,
+    })
+    .await?
     else {
         return Ok(None);
     };
@@ -1292,7 +1346,7 @@ fn create_creator_config(
     let network_policy =
         NetworkPolicyCertificate::issue_for_network(&network_id, secret_key, max_peers)?;
     let cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: CONFIG_VERSION,
         network_id,
         secret_key: encode_secret_key(secret_key),
@@ -1314,6 +1368,7 @@ fn create_creator_config(
 
 fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
     Ok(StatusReport {
+        network_label: cfg.network_policy.admin_label.clone(),
         connected_peers: Some(0),
         network_id: cfg.network_id.clone(),
         max_peers: cfg.max_known_peers()?,
@@ -1340,6 +1395,7 @@ fn print_init_report(path: &Path, report: &StatusReport, output: output::Options
         "name": report.name,
         "connection_id": report.connection_id,
         "node_id": report.node_id.to_string(),
+        "network_label": report.network_label,
         "next_step": "run `esp invite \"name\"` to create a named invite",
     }))
 }
@@ -1363,6 +1419,7 @@ fn print_policy_report(report: &NetworkPolicyReport, output: output::Options) ->
         "max_peers": report.max_peers,
         "policy_issuer": report.issuer_node_id.to_string(),
         "policy_issued_at": report.issued_at_unix,
+        "network_label": report.network_label,
     }))
 }
 
@@ -1598,8 +1655,13 @@ async fn handle_local_control_connection(
                     LocalControlOk::Revoked { report }
                 })
             }
-            LocalControlRequest::UpdatePolicy { max_peers } => {
-                let result = actor.update_policy(max_peers).await;
+            LocalControlRequest::UpdatePolicy {
+                max_peers,
+                network_label,
+            } => {
+                let result = actor
+                    .update_policy_with_label(max_peers, network_label)
+                    .await;
                 if let Ok(report) = &result {
                     spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
                 }
@@ -1702,6 +1764,7 @@ fn pending_join_network_policy(
     creator_node_id: EndpointId,
 ) -> NetworkPolicyCertificate {
     NetworkPolicyCertificate {
+        admin_label: None,
         version: NETWORK_POLICY_VERSION,
         network_id: network_id.to_string(),
         max_peers: DEFAULT_MAX_KNOWN_PEERS,
@@ -2199,9 +2262,13 @@ async fn run_config_actor(
                 }
                 let _ = respond.send(result);
             }
-            ConfigActorCommand::UpdatePolicy { max_peers, respond } => {
+            ConfigActorCommand::UpdatePolicy {
+                max_peers,
+                network_label,
+                respond,
+            } => {
                 let result = commit_config_change(&path, &mut cfg, |next| {
-                    let report = next.issue_network_policy(max_peers)?;
+                    let report = next.issue_network_policy_with_label(max_peers, network_label)?;
                     Ok((report, true))
                 });
                 let _ = respond.send(result);
@@ -2378,9 +2445,17 @@ impl ConfigActorHandle {
             .await
     }
 
-    async fn update_policy(&self, max_peers: usize) -> Result<NetworkPolicyReport> {
-        self.request(|respond| ConfigActorCommand::UpdatePolicy { max_peers, respond })
-            .await
+    async fn update_policy_with_label(
+        &self,
+        max_peers: usize,
+        network_label: Option<String>,
+    ) -> Result<NetworkPolicyReport> {
+        self.request(|respond| ConfigActorCommand::UpdatePolicy {
+            max_peers,
+            network_label,
+            respond,
+        })
+        .await
     }
 
     async fn control_sync(
@@ -3861,15 +3936,30 @@ impl Config {
     }
 
     pub fn issue_network_policy(&mut self, max_peers: usize) -> Result<NetworkPolicyReport> {
+        self.issue_network_policy_with_label(max_peers, None)
+    }
+
+    fn issue_network_policy_with_label(
+        &mut self,
+        max_peers: usize,
+        network_label: Option<String>,
+    ) -> Result<NetworkPolicyReport> {
         self.validate_local_config()?;
         self.ensure_local_admin()?;
         let peers = self.peers.clone();
         let secret_key = self.secret_key()?;
-        let policy = NetworkPolicyCertificate::issue(self, &secret_key, max_peers)?;
+        let mut policy = NetworkPolicyCertificate::issue(self, &secret_key, max_peers)?;
+        if let Some(label) = network_label {
+            let label = normalize_network_label(&label)?;
+            ensure_network_label_matches(policy.admin_label.as_deref(), &label)?;
+            policy.admin_label = Some(label);
+            policy.signature = encode_signature(&secret_key.sign(&policy.signature_payload()?));
+        }
         verify_network_policy(self, &policy, &[])?;
         self.network_policy = policy.clone();
         enforce_state_caps(self)?;
         Ok(NetworkPolicyReport {
+            network_label: policy.admin_label.clone(),
             max_peers: policy.max_peers,
             issuer_node_id: policy.issuer_node_id,
             issued_at_unix: policy.issued_at_unix,
@@ -4204,7 +4294,16 @@ impl MembershipCertificate {
 
 impl NetworkPolicyCertificate {
     fn issue(cfg: &Config, issuer_key: &SecretKey, max_peers: usize) -> Result<Self> {
-        Self::issue_for_network(&cfg.network_id, issuer_key, max_peers)
+        let mut policy = Self::issue_for_network(&cfg.network_id, issuer_key, max_peers)?;
+        policy.admin_label = cfg.network_policy.admin_label.clone();
+        policy.issued_at_unix = policy.issued_at_unix.max(
+            cfg.network_policy
+                .issued_at_unix
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("network policy timestamp overflow"))?,
+        );
+        policy.signature = encode_signature(&issuer_key.sign(&policy.signature_payload()?));
+        Ok(policy)
     }
 
     pub fn issue_for_network(
@@ -4214,6 +4313,7 @@ impl NetworkPolicyCertificate {
     ) -> Result<Self> {
         validate_max_known_peers(max_peers)?;
         let mut policy = Self {
+            admin_label: None,
             version: NETWORK_POLICY_VERSION,
             network_id: network_id.to_string(),
             max_peers,
@@ -4264,6 +4364,12 @@ impl NetworkPolicyCertificate {
         append_signed_field(&mut payload, NETWORK_POLICY_SIGNATURE_CONTEXT);
         for field in &fields {
             append_signed_field(&mut payload, field);
+        }
+        if let Some(label) = &self.admin_label {
+            if normalize_network_label(label)? != *label {
+                bail!("network label must be normalized");
+            }
+            append_signed_field(&mut payload, label);
         }
         Ok(payload)
     }

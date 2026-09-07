@@ -16,6 +16,8 @@ fn fixture() -> (Config, SecretKey, Peer) {
         ABSOLUTE_MAX_KNOWN_PEERS,
     )
     .unwrap();
+    cfg.issue_network_policy_with_label(ABSOLUTE_MAX_KNOWN_PEERS, Some("Office / Lab".into()))
+        .unwrap();
     let peer = Peer {
         node_id: SecretKey::generate().public(),
         name: "laptop-host".into(),
@@ -246,20 +248,20 @@ fn admin_pages_cover_maximum_network_and_detect_directory_changes() {
 fn render_two_panes_connection_colors_offline_and_small_terminals() {
     let assert_transport_style = |buffer: &ratatui::buffer::Buffer, value: &str, color| {
         let row: String = (0..buffer.area.width)
-            .map(|x| buffer[(x, 2)].symbol())
+            .map(|x| buffer[(x, 3)].symbol())
             .collect();
         let phrase = format!("transport: {value}");
         let start = row[..row.find(&phrase).expect("transport status in header")]
             .chars()
             .count() as u16;
         for x in start..start + "transport:".len() as u16 {
-            let cell = &buffer[(x, 2)];
+            let cell = &buffer[(x, 3)];
             assert_eq!(cell.fg, Color::Reset);
             assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
         }
         let start = start + "transport: ".len() as u16;
         for x in start..start + value.len() as u16 {
-            let cell = &buffer[(x, 2)];
+            let cell = &buffer[(x, 3)];
             assert_eq!(cell.fg, color);
             assert!(cell.modifier.contains(ratatui::style::Modifier::BOLD));
         }
@@ -274,6 +276,7 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     for text_part in [
         "esp admin",
         "network_id:",
+        "network_label: Office / Lab",
         "transport: running",
         "Peers",
         "Peer details",
@@ -343,8 +346,56 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     assert!(text.contains("view only"));
     assert!(text.contains("transport: not_running"));
     assert!(!buffer.content.iter().any(|cell| cell.fg == Color::Green));
+    let (text, buffer) = screen(&mut app, 120, 30);
+    assert!(text.contains("connection_status: unknown"));
+    let row: String = (0..120).map(|x| buffer[(x, 3)].symbol()).collect();
+    let start = row[..row.find("connection_status:").unwrap()]
+        .chars()
+        .count() as u16;
+    for x in start..start + 18 {
+        assert_eq!(buffer[(x, 3)].fg, Color::White);
+        assert!(
+            buffer[(x, 3)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
+    for x in start + 19..start + 26 {
+        assert_eq!(buffer[(x, 3)].fg, Color::Gray);
+        assert!(
+            !buffer[(x, 3)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+    }
     assert!(screen(&mut app, 50, 10).0.contains("Resize terminal"));
     assert!(screen(&mut app, 120, 30).0.contains("Peer details"));
+}
+
+#[test]
+fn revocation_prompt_accepts_yes_and_no_and_checks_online_state() {
+    let (cfg, _, peer) = fixture();
+    let mut app = App::new(view(&cfg, true));
+    app.key(key(KeyCode::Char('r')));
+    assert!(
+        screen(&mut app, 120, 30)
+            .0
+            .contains("remove peer Eric laptop from network? y/n")
+    );
+    assert!(matches!(app.key(key(KeyCode::Char('n'))), Action::None));
+    assert!(app.confirmation.is_none());
+    assert!(!app.revoking);
+    app.key(key(KeyCode::Char('r')));
+    assert!(
+        matches!(app.key(key(KeyCode::Char('y'))), Action::Revoke(node) if node == peer.node_id)
+    );
+    assert!(app.revoking);
+    assert!(app.confirmation.is_none());
+    assert!(matches!(app.key(key(KeyCode::Char('y'))), Action::None));
+    let mut app = App::new(view(&cfg, true));
+    app.key(key(KeyCode::Char('r')));
+    app.stale("offline".into());
+    assert!(matches!(app.key(key(KeyCode::Char('y'))), Action::None));
 }
 
 #[test]
@@ -354,7 +405,11 @@ fn selection_survives_refresh_and_revocation_defaults_to_cancel() {
     assert!(matches!(app.key(key(KeyCode::Char('r'))), Action::None));
     assert!(app.confirmation.is_some());
     assert!(!app.confirm_yes);
-    assert!(screen(&mut app, 120, 30).0.contains("[ Cancel ]"));
+    assert!(
+        screen(&mut app, 120, 30)
+            .0
+            .contains("remove peer Eric laptop from network? y/n")
+    );
     assert!(matches!(app.key(key(KeyCode::Enter)), Action::None));
     assert!(!app.revoking);
     assert!(app.confirmation.is_none());
@@ -629,6 +684,6 @@ fn revoke_dialog_keeps_controls_visible_with_maximum_length_names() {
     app.view.peers[0].hostname = "H".repeat(64);
     app.key(key(KeyCode::Char('r')));
     let (text, _) = screen(&mut app, 80, 20);
-    assert!(text.contains("[ Cancel ]"));
-    assert!(text.contains("Esc: cancel"));
+    assert!(text.contains("[ n ]"));
+    assert!(text.contains("n/Esc: cancel"));
 }

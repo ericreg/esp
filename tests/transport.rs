@@ -207,6 +207,28 @@ async fn simultaneous_proxy_processes_start_and_reuse_one_background_transport()
         .unwrap();
     assert!(matches!(status, LocalControlOk::Status { .. }));
 
+    let initialized = home
+        .command()
+        .args(["init", "Shared network", "--no-color"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&initialized.stdout).unwrap();
+    assert_eq!(report["network_label"], "Shared network");
+    assert_eq!(
+        Config::load(&home.dir.join(ESP_DIR).join(CONFIG_FILE))
+            .unwrap()
+            .network_policy
+            .admin_label
+            .as_deref(),
+        Some("Shared network")
+    );
+
     // Starting a server must not create a competing endpoint under the same key.
     let output = timeout(
         Duration::from_secs(5),
@@ -565,7 +587,7 @@ async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
     assert_eq!(Config::load(&path).unwrap().peers.len(), 1);
     pty.master.write_all(b"r").unwrap();
     pty.until("Confirm revocation").await;
-    pty.master.write_all(b"\t\r").unwrap();
+    pty.master.write_all(b"y").unwrap();
     timeout(Duration::from_secs(5), async {
         while !Config::load(&path).unwrap().peers.is_empty() {
             tokio::time::sleep(Duration::from_millis(20)).await;

@@ -33,7 +33,10 @@ impl ProxyFixture {
     }
 
     async fn with_transport_idle(max_connections: usize, idle: Option<Duration>) -> Self {
-        let dir = std::env::temp_dir().join(format!("esp-p-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "esp-p-{}",
+            &Uuid::new_v4().simple().to_string()[..12]
+        ));
         fs::create_dir(&dir).unwrap();
         // Keep the path under macOS's Unix socket path length limit.
         let socket = dir.join(".esp.sock");
@@ -80,7 +83,7 @@ impl ProxyFixture {
             MembershipCertificate::issue(&cfg, &local_key, &peer, &[port], MembershipRole::Peer)
                 .unwrap();
         let remote_cfg = Config {
-            format: output::Format::default(),
+            format: output::FormatConfig::default(),
             version: CONFIG_VERSION,
             network_id: cfg.network_id.clone(),
             secret_key: encode_secret_key(&remote_key),
@@ -650,6 +653,11 @@ async fn incomplete_local_request_still_times_out() {
 #[tokio::test]
 async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     let fixture = ProxyFixture::new(8).await;
+    fixture
+        .actor
+        .update_policy_with_label(DEFAULT_MAX_KNOWN_PEERS, Some("Relay test network".into()))
+        .await
+        .unwrap();
     let acceptor = tokio::spawn(run_acceptor(
         fixture.local.clone(),
         fixture.actor.clone(),
@@ -674,7 +682,7 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
         connection_id: String::new(),
     };
     let mut cfg = Config {
-        format: output::Format::default(),
+        format: output::FormatConfig::default(),
         version: CONFIG_VERSION,
         network_id: invite.network_id.clone(),
         network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),
@@ -720,6 +728,14 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     })
     .await
     .expect("CBOR join timed out");
+    assert_eq!(
+        cfg.network_policy.admin_label.as_deref(),
+        Some("Relay test network")
+    );
+    assert_eq!(
+        join_report(Path::new("joined.yml"), &cfg).unwrap()["network_label"],
+        "Relay test network"
+    );
     ensure_completed_join(&cfg).unwrap();
     assert!(cfg.invite_proof.is_none());
     assert_eq!(
