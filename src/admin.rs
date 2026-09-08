@@ -63,6 +63,8 @@ pub(super) struct Overview {
     pub(super) connected: usize,
     #[n(5)]
     pub(super) network_label: Option<String>,
+    #[n(6)]
+    pub(super) local_role: Option<MembershipRole>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
@@ -134,6 +136,7 @@ fn overview(cfg: &Config, rows: &[PeerRow]) -> Result<Overview> {
     hash.update(minicbor::to_vec(&cfg.peers)?);
     hash.update(minicbor::to_vec(&cfg.memberships)?);
     Ok(Overview {
+        local_role: cfg.local_membership_role(),
         network_label: cfg.network_policy.admin_label.clone(),
         network_id: cfg.network_id.clone(),
         local_name: cfg.name.clone(),
@@ -161,7 +164,7 @@ fn detail(cfg: &Config, peer: PeerRow) -> Result<PeerDetail> {
 }
 
 pub(super) fn respond(cfg: &Config, presence: &Presence, request: Request) -> Result<Response> {
-    cfg.ensure_local_admin()?;
+    cfg.ensure_active()?;
     let peers = rows(cfg, presence);
     match request {
         Request::Overview => Ok(Response::Overview(overview(cfg, &peers)?)),
@@ -195,9 +198,9 @@ pub(super) struct View {
     pub(super) online: bool,
 }
 
-fn offline_view() -> Result<View> {
-    let cfg = Config::load(&config_path()?)?;
-    cfg.ensure_local_admin()?;
+fn offline_view(id: &str) -> Result<View> {
+    let cfg = networks::Store::local()?.load(id)?;
+    cfg.ensure_active()?;
     let peers = rows(&cfg, &Presence::new());
     Ok(View {
         overview: overview(&cfg, &peers)?,
@@ -206,24 +209,29 @@ fn offline_view() -> Result<View> {
     })
 }
 
-async fn request(request: Request) -> Result<Option<Response>> {
+async fn request(id: &str, request: Request) -> Result<Option<Response>> {
     match timeout(
         FETCH_TIMEOUT,
-        send_local_control_request(LocalControlRequest::Admin { request }),
+        networks::send(&networks::Request::Network {
+            id: id.into(),
+            request: LocalControlRequest::Admin { request },
+        }),
     )
     .await
     .context("local transport is not responding; data is stale")??
     {
-        Some(LocalControlOk::Admin { report }) => Ok(Some(report)),
+        Some(response) => match response.network()? {
+            LocalControlOk::Admin { report } => Ok(Some(report)),
+            _ => bail!("unexpected admin response"),
+        },
         None => Ok(None),
-        _ => bail!("incompatible local transport; restart it with the upgraded esp binary"),
     }
 }
 
-async fn fetch_view() -> Result<View> {
-    let overview = match request(Request::Overview).await? {
+async fn fetch_view(id: &str) -> Result<View> {
+    let overview = match request(id, Request::Overview).await? {
         Some(Response::Overview(overview)) => overview,
-        None => return offline_view(),
+        None => return offline_view(id),
         _ => bail!("invalid admin overview response"),
     };
     if overview.total > ABSOLUTE_MAX_KNOWN_PEERS {
@@ -234,10 +242,13 @@ async fn fetch_view() -> Result<View> {
         let Some(Response::Peers {
             revision,
             peers: page,
-        }) = request(Request::Peers {
-            revision: overview.revision.clone(),
-            offset: peers.len(),
-        })
+        }) = request(
+            id,
+            Request::Peers {
+                revision: overview.revision.clone(),
+                offset: peers.len(),
+            },
+        )
         .await?
         else {
             bail!("local transport stopped; data is stale");
@@ -257,14 +268,14 @@ async fn fetch_view() -> Result<View> {
     })
 }
 
-async fn fetch_detail(node_id: EndpointId, online: bool) -> Result<PeerDetail> {
+async fn fetch_detail(id: &str, node_id: EndpointId, online: bool) -> Result<PeerDetail> {
     if online {
-        match request(Request::Detail { node_id }).await? {
+        match request(id, Request::Detail { node_id }).await? {
             Some(Response::Detail(detail)) if detail.peer.node_id == node_id => Ok(detail),
             _ => bail!("peer details are unavailable; refreshing again"),
         }
     } else {
-        let cfg = Config::load(&config_path()?)?;
+        let cfg = networks::Store::local()?.load(id)?;
         match respond(&cfg, &Presence::new(), Request::Detail { node_id })? {
             Response::Detail(detail) => Ok(detail),
             _ => unreachable!(),
@@ -272,7 +283,54 @@ async fn fetch_detail(node_id: EndpointId, online: bool) -> Result<PeerDetail> {
     }
 }
 
+#[derive(Clone)]
+pub(super) struct NetworkRow {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) role: String,
+}
+fn empty_view(id: String, label: String) -> View {
+    View {
+        overview: Overview {
+            network_id: id,
+            network_label: Some(label),
+            local_name: String::new(),
+            revision: String::new(),
+            total: 0,
+            connected: 0,
+            local_role: None,
+        },
+        peers: Vec::new(),
+        online: false,
+    }
+}
+async fn fetch_networks() -> Result<Vec<NetworkRow>> {
+    let value = match networks::send(&networks::Request::Status {
+        id: None,
+        peers: false,
+    })
+    .await?
+    {
+        Some(response) => response.json()?,
+        None => networks::offline_status(&networks::Store::local()?, None, false)?,
+    };
+    Ok(value["networks"]
+        .as_array()
+        .ok_or_else(|| anyhow!("invalid network list"))?
+        .iter()
+        .map(|n| NetworkRow {
+            id: n["network_id"].as_str().unwrap_or_default().into(),
+            label: n["network_label"].as_str().unwrap_or_default().into(),
+            role: n["role"].as_str().unwrap_or("unavailable").into(),
+        })
+        .collect())
+}
+
 pub(super) struct App {
+    pub(super) networks: Vec<NetworkRow>,
+    pub(super) network_list: ListState,
+    pub(super) focus: usize,
+    pub(super) generation: u64,
     pub(super) view: View,
     pub(super) list: ListState,
     pub(super) detail: Option<PeerDetail>,
@@ -287,6 +345,7 @@ pub(super) enum Action {
     None,
     Quit,
     Detail,
+    Network,
     Revoke(EndpointId),
 }
 
@@ -297,6 +356,17 @@ impl App {
             list.select(Some(0));
         }
         Self {
+            networks: vec![NetworkRow {
+                id: view.overview.network_id.clone(),
+                label: view.overview.network_label.clone().unwrap_or_default(),
+                role: view
+                    .overview
+                    .local_role
+                    .map_or("unknown".into(), |r| r.to_string()),
+            }],
+            network_list: ListState::default().with_selected(Some(0)),
+            focus: 1,
+            generation: 0,
             view,
             list,
             detail: None,
@@ -305,6 +375,54 @@ impl App {
             confirm_yes: false,
             revoking: false,
             message: String::new(),
+        }
+    }
+    pub(super) fn set_networks(&mut self, networks: Vec<NetworkRow>) -> bool {
+        let id = self.view.overview.network_id.clone();
+        let index = networks.iter().position(|n| n.id == id).unwrap_or(0);
+        self.networks = networks;
+        self.network_list
+            .select((!self.networks.is_empty()).then_some(index));
+        let selected_id = self
+            .networks
+            .get(index)
+            .map(|n| n.id.as_str())
+            .unwrap_or("");
+        if selected_id != id {
+            self.select_network();
+            return true;
+        }
+        false
+    }
+    fn select_network(&mut self) {
+        let selected = self
+            .network_list
+            .selected()
+            .and_then(|i| self.networks.get(i));
+        self.update(empty_view(
+            selected.map(|n| n.id.clone()).unwrap_or_default(),
+            selected.map(|n| n.label.clone()).unwrap_or_default(),
+        ));
+        self.generation += 1;
+        self.detail = None;
+        self.confirmation = None;
+        self.revoking = false;
+        self.message.clear();
+    }
+    fn can_revoke(&self) -> bool {
+        self.view.online && self.view.overview.local_role == Some(MembershipRole::Admin)
+    }
+    pub(super) fn accept_detail(&mut self, id: &str, generation: u64, detail: PeerDetail) -> bool {
+        if id == self.view.overview.network_id
+            && generation == self.generation
+            && self
+                .selected()
+                .is_some_and(|peer| peer.node_id == detail.peer.node_id)
+        {
+            self.detail = Some(detail);
+            true
+        } else {
+            false
         }
     }
     pub(super) fn selected(&self) -> Option<&PeerRow> {
@@ -364,7 +482,7 @@ impl App {
                 KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                     self.confirmation = None;
                     if (self.confirm_yes || matches!(key.code, KeyCode::Char('y' | 'Y')))
-                        && self.view.online
+                        && self.can_revoke()
                         && !self.revoking
                     {
                         self.revoking = true;
@@ -376,11 +494,25 @@ impl App {
             }
             return Action::None;
         }
+        match key.code {
+            KeyCode::Tab => {
+                self.focus = (self.focus + 1) % 3;
+                return Action::None;
+            }
+            KeyCode::BackTab => {
+                self.focus = (self.focus + 2) % 3;
+                return Action::None;
+            }
+            _ => {}
+        }
+        if self.revoking && key.code != KeyCode::Char('q') {
+            return Action::None;
+        }
         let delta = match key.code {
             KeyCode::Char('q') => return Action::Quit,
             KeyCode::Char('r') if !self.revoking => {
-                if !self.view.online {
-                    self.message = "Revocation disabled: start esp daemon to manage peers.".into();
+                if !self.can_revoke() {
+                    self.message = "Revocation disabled: requires an online administrator.".into();
                 } else {
                     self.confirmation = self.selected().cloned();
                     self.confirm_yes = false;
@@ -401,6 +533,23 @@ impl App {
             }
             _ => return Action::None,
         };
+        if self.focus == 0 {
+            if !self.networks.is_empty() {
+                let index = (self.network_list.selected().unwrap_or(0) as isize + delta)
+                    .clamp(0, self.networks.len() as isize - 1)
+                    as usize;
+                if self.network_list.selected() != Some(index) {
+                    self.network_list.select(Some(index));
+                    self.select_network();
+                    return Action::Network;
+                }
+            }
+            return Action::None;
+        }
+        if self.focus == 2 {
+            self.scroll = (self.scroll as isize + delta).clamp(0, u16::MAX as isize) as u16;
+            return Action::None;
+        }
         if !self.view.peers.is_empty() {
             let index = (self.list.selected().unwrap_or(0) as isize + delta)
                 .clamp(0, self.view.peers.len() as isize - 1) as usize;
@@ -441,8 +590,8 @@ impl App {
             format!("{} peers", self.view.peers.len())
         };
         let mut network = detail_line("network_id", self.view.overview.network_id.clone());
-        if !self.view.online {
-            network.spans.push(Span::raw(" | view only"));
+        if !self.can_revoke() {
+            network.spans.push(Span::raw(" | read only"));
         }
         let mut host = detail_line("local_host", self.view.overview.local_name.clone());
         host.spans.push(Span::raw(" | "));
@@ -499,8 +648,38 @@ impl App {
             .block(Block::bordered().title(" esp admin ")),
             sections[0],
         );
-        let panes = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(sections[1]);
+        let columns = Layout::horizontal([
+            Constraint::Percentage(22),
+            Constraint::Percentage(30),
+            Constraint::Percentage(48),
+        ])
+        .split(sections[1]);
+        let panes = &columns[1..];
+        let network_items: Vec<_> = self
+            .networks
+            .iter()
+            .map(|n| {
+                ListItem::new(vec![
+                    Line::from(n.label.clone()),
+                    Line::from(Span::styled(
+                        n.role.clone(),
+                        Style::default().fg(Color::Gray),
+                    )),
+                ])
+            })
+            .collect();
+        frame.render_stateful_widget(
+            List::new(network_items)
+                .block(Block::bordered().title(if self.focus == 0 {
+                    " Networks * "
+                } else {
+                    " Networks "
+                }))
+                .highlight_symbol("> ")
+                .highlight_style(Style::default().bg(Color::DarkGray)),
+            columns[0],
+            &mut self.network_list,
+        );
         let items: Vec<_> = self
             .view
             .peers
@@ -531,17 +710,30 @@ impl App {
             .collect();
         if items.is_empty() {
             frame.render_widget(
-                Paragraph::new(
-                    "No joined peers.\n\nCreate a named invite with:\nesp invite \"name\"",
-                )
+                Paragraph::new(format!(
+                    "No joined peers.\n\nesp invite {:?} \"name\"",
+                    self.view
+                        .overview
+                        .network_label
+                        .as_deref()
+                        .unwrap_or_default()
+                ))
                 .wrap(Wrap { trim: false })
-                .block(Block::bordered().title(" Peers ")),
+                .block(Block::bordered().title(if self.focus == 1 {
+                    " Peers * "
+                } else {
+                    " Peers "
+                })),
                 panes[0],
             );
         } else {
             frame.render_stateful_widget(
                 List::new(items)
-                    .block(Block::bordered().title(" Peers "))
+                    .block(Block::bordered().title(if self.focus == 1 {
+                        " Peers * "
+                    } else {
+                        " Peers "
+                    }))
                     .highlight_symbol("> ")
                     .highlight_style(
                         Style::default()
@@ -562,7 +754,14 @@ impl App {
                 } else {
                     "disconnected"
                 };
-                let mut status_value = Span::raw(status);
+                let mut status_value = Span::styled(
+                    status,
+                    Style::default().fg(if self.view.online {
+                        Color::LightBlue
+                    } else {
+                        Color::Gray
+                    }),
+                );
                 if self.view.online && peer.active_connections > 0 {
                     status_value = status_value.style(
                         Style::default()
@@ -615,9 +814,14 @@ impl App {
                 text
             }
         };
-        let paragraph = Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" Peer details "));
+        let paragraph =
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(Block::bordered().title(if self.focus == 2 {
+                    " Peer details * "
+                } else {
+                    " Peer details "
+                }));
         self.scroll = self.scroll.min(
             paragraph
                 .line_count(panes[1].width.saturating_sub(2))
@@ -627,7 +831,7 @@ impl App {
         frame.render_widget(paragraph.scroll((self.scroll, 0)), panes[1]);
         frame.render_widget(
             Paragraph::new(format!(
-                "j/k or arrows: select | PgUp/PgDn: page | J/K: details | r: revoke | q: quit\n{}",
+                "Tab/Shift-Tab: focus | j/k: navigate | J/K: scroll details | r: revoke | q: quit\n{}",
                 self.message
             ))
             .wrap(Wrap { trim: false }),
@@ -648,7 +852,7 @@ impl App {
             } else {
                 "[ n ]     y"
             };
-            frame.render_widget(Paragraph::new(format!("remove peer {} from network? y/n\nhost: {} ({})\nnode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\ny: remove | n/Esc: cancel | Tab/arrows: choose | Enter: confirm", peer.admin_label, peer.hostname, peer.connection_id, peer.node_id, buttons))
+            frame.render_widget(Paragraph::new(format!("remove peer {} from network {:?}? y/n\nhost: {} ({})\nnode: {}\n\nActive connections will close. This peer must rejoin with a new invite.\n{}\ny: remove | n/Esc: cancel | Tab/arrows: choose | Enter: confirm", peer.admin_label, self.view.overview.network_label.as_deref().unwrap_or_default(), peer.hostname, peer.connection_id, peer.node_id, buttons))
                 .wrap(Wrap { trim: false }).block(Block::bordered().title(" Confirm revocation ")), dialog);
         }
     }
@@ -704,16 +908,34 @@ impl Drop for RestoreTerminal {
 }
 
 enum Update {
-    View(Result<View>),
-    Detail(EndpointId, Result<PeerDetail>),
-    Revoked(Result<RevocationReport>),
+    Networks(Result<Vec<NetworkRow>>),
+    View(String, u64, Result<View>),
+    Detail(String, u64, EndpointId, Result<PeerDetail>),
+    Revoked(String, u64, Result<RevocationReport>),
 }
 
-pub(super) async fn run() -> Result<()> {
+pub(super) async fn run(preselect: Option<String>) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("esp admin requires an interactive terminal (use ssh -t for remote access)");
     }
-    let mut app = App::new(offline_view()?);
+    let networks = fetch_networks().await?;
+    let initial = preselect
+        .as_ref()
+        .and_then(|label| networks.iter().find(|n| &n.label == label))
+        .or_else(|| networks.first());
+    if preselect.is_some()
+        && !networks
+            .iter()
+            .any(|n| Some(&n.label) == preselect.as_ref())
+    {
+        bail!("requested network is not configured");
+    }
+    let mut app = App::new(empty_view(
+        initial.map(|n| n.id.clone()).unwrap_or_default(),
+        initial.map(|n| n.label.clone()).unwrap_or_default(),
+    ));
+    app.set_networks(networks);
+    app.focus = 0;
     let mut terminal = ratatui::init();
     let _restore = RestoreTerminal;
     let mut events = EventStream::new();
@@ -721,80 +943,75 @@ pub(super) async fn run() -> Result<()> {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut jobs = tokio::task::JoinSet::new();
     let mut refreshing = false;
+    let mut listing = false;
     let mut detail_job: Option<tokio::task::AbortHandle> = None;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
         terminal.draw(|frame| app.render(frame))?;
         let mut refresh_detail = false;
+        let mut refresh_view = false;
         tokio::select! {
             _ = &mut shutdown => break,
             _ = tick.tick() => {
-                if !refreshing && !app.revoking {
-                    refreshing = true;
-                    jobs.spawn(async { Update::View(fetch_view().await) });
-                }
+                if !listing { listing = true; jobs.spawn(async { Update::Networks(fetch_networks().await) }); }
+                refresh_view = !refreshing && !app.revoking;
             }
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) => match app.key(key) {
                         Action::Quit => break,
                         Action::Detail => refresh_detail = true,
+                        Action::Network => { refresh_view = true; refreshing = false; },
                         Action::Revoke(node_id) => {
-                            // Discard reads that could otherwise resurrect a revoked row.
-                            jobs.abort_all();
-                            refreshing = false;
-                            // Never use the file-writing CLI fallback from the TUI.
-                            jobs.spawn(async move { Update::Revoked(async {
-                                request_daemon_revoke(&node_id.to_string()).await?
-                                    .ok_or_else(|| anyhow!("local transport stopped; revocation was not applied"))
-                            }.await) });
+                            app.generation += 1;
+                            let id = app.view.overview.network_id.clone(); let generation = app.generation;
+                            jobs.spawn(async move { let result = async {
+                                let response = networks::send(&networks::Request::Network { id: id.clone(), request: LocalControlRequest::Revoke { target: node_id.to_string() } }).await?.ok_or_else(|| anyhow!("local transport stopped; revocation was not applied"))?;
+                                match response.network()? { LocalControlOk::Revoked { report } => Ok(report), _ => bail!("invalid revoke response") }
+                            }.await; Update::Revoked(id, generation, result) });
                         }
-                        Action::None => {}
+                        Action::None => {},
                     },
-                    Some(Ok(_)) => {},
-                    Some(Err(err)) => return Err(err.into()),
-                    None => break,
+                    Some(Ok(_)) => {}, Some(Err(e)) => return Err(e.into()), None => break,
                 }
             }
             update = jobs.join_next(), if !jobs.is_empty() => {
                 match update {
-                    Some(Ok(Update::View(result))) => {
-                        refreshing = false;
-                        match result {
-                            Ok(view) => { app.update(view); refresh_detail = true; }
-                            Err(err) => app.stale(format!("{err:#}")),
+                    Some(Ok(Update::Networks(result))) => {
+                        listing = false;
+                        match result { Ok(networks) => { if app.set_networks(networks) { refreshing = false; refresh_view = true; } }, Err(e) => app.stale(format!("{e:#}")) }
+                    }
+                    Some(Ok(Update::View(id, generation, result))) => {
+                        if id == app.view.overview.network_id && generation == app.generation {
+                            refreshing = false;
+                            match result { Ok(view) => { app.update(view); refresh_detail = true; }, Err(e) => app.stale(format!("{e:#}")) }
                         }
                     }
-                    Some(Ok(Update::Detail(node_id, result))) => {
-                        if app.selected().is_some_and(|peer| peer.node_id == node_id) {
-                            match result {
-                                Ok(detail) => app.detail = Some(detail),
-                                Err(err) => app.message = format!("{err:#}"),
-                            }
+                    Some(Ok(Update::Detail(id, generation, node_id, result))) => {
+                        if id == app.view.overview.network_id && generation == app.generation && app.selected().is_some_and(|p| p.node_id == node_id) {
+                            match result { Ok(detail) => { app.accept_detail(&id, generation, detail); }, Err(e) => app.message = format!("{e:#}") }
                         }
                     }
-                    Some(Ok(Update::Revoked(result))) => {
-                        app.revoking = false;
-                        match result {
-                            Ok(report) => {
-                                let mut view = app.view.clone();
-                                view.peers.retain(|peer| peer.node_id != report.node_id);
-                                view.overview.total = view.peers.len();
-                                view.overview.connected = view.peers.iter().filter(|peer| peer.active_connections > 0).count();
-                                app.update(view);
-                                app.message = format!("Revoked {}", report.display_name);
-                                refresh_detail = true;
-                            }
-                            Err(err) => app.stale(format!("Revocation failed: {err:#}")),
+                    Some(Ok(Update::Revoked(id, generation, result))) => {
+                        if id == app.view.overview.network_id && generation == app.generation {
+                            app.revoking = false; refreshing = false;
+                            match result { Ok(report) => { let mut view = app.view.clone(); view.peers.retain(|p| p.node_id != report.node_id); app.update(view); app.message = format!("Revoked {}", report.display_name); }, Err(e) => app.stale(format!("Revocation failed: {e:#}")) }
+                            refresh_view = true;
                         }
-                        tick.reset_immediately();
                     }
-                    Some(Err(err)) if err.is_cancelled() => {},
-                    Some(Err(err)) => return Err(err.into()),
-                    None => {},
+                    Some(Err(e)) if e.is_cancelled() => {}, Some(Err(e)) => return Err(e.into()), None => {},
                 }
             }
+        }
+        if refresh_view && !app.view.overview.network_id.is_empty() {
+            refreshing = true;
+            let id = app.view.overview.network_id.clone();
+            let generation = app.generation;
+            jobs.spawn(async move {
+                let result = fetch_view(&id).await;
+                Update::View(id, generation, result)
+            });
         }
         if refresh_detail {
             if let Some(job) = detail_job.take() {
@@ -803,13 +1020,15 @@ pub(super) async fn run() -> Result<()> {
             if let Some(peer) = app.selected() {
                 let node_id = peer.node_id;
                 let online = app.view.online;
+                let id = app.view.overview.network_id.clone();
+                let generation = app.generation;
                 detail_job = Some(jobs.spawn(async move {
-                    Update::Detail(node_id, fetch_detail(node_id, online).await)
+                    let result = fetch_detail(&id, node_id, online).await;
+                    Update::Detail(id, generation, node_id, result)
                 }));
             }
         }
     }
-    // Aborting view requests is safe; confirmed revocations are processed by the actor.
     jobs.abort_all();
     Ok(())
 }

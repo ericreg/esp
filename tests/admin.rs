@@ -9,6 +9,7 @@ use ratatui::{Terminal, backend::TestBackend, style::Color};
 fn fixture() -> (Config, SecretKey, Peer) {
     let key = SecretKey::generate();
     let mut cfg = create_creator_config(
+        "Office / Lab",
         &key,
         Uuid::new_v4().to_string(),
         "origin".into(),
@@ -105,7 +106,9 @@ fn screen(app: &mut App, width: u16, height: u16) -> (String, ratatui::buffer::B
 #[test]
 fn invite_names_are_required_validated_and_distinct_from_hostnames() {
     assert!(Cli::try_parse_from(["esp", "invite"]).is_err());
-    assert!(Cli::try_parse_from(["esp", "invite", "laptop", "--role", "admin"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["esp", "invite", "Office / Lab", "laptop", "--role", "admin"]).is_ok()
+    );
     let (mut cfg, _, peer) = fixture();
     for name in ["", "   ", "line\nbreak", "\x1b[31m", "é", &"x".repeat(65)] {
         assert!(cfg.issue_invite(name, &[22], MembershipRole::Peer).is_err());
@@ -122,7 +125,10 @@ fn invite_names_are_required_validated_and_distinct_from_hostnames() {
     let member = find_membership_by_subject(&cfg, &[], peer.node_id).unwrap();
     assert_eq!(member.admin_label, "Eric laptop");
     assert_eq!(cfg.peers[0].name, "laptop-host");
-    assert!(cfg.resolve_peer("Eric laptop").is_err());
+    assert_eq!(
+        cfg.resolve_peer("Eric laptop").unwrap().node_id,
+        peer.node_id
+    );
     assert_eq!(
         cfg.resolve_peer("laptop-host").unwrap().node_id,
         peer.node_id
@@ -245,7 +251,7 @@ fn admin_pages_cover_maximum_network_and_detect_directory_changes() {
 }
 
 #[test]
-fn render_two_panes_connection_colors_offline_and_small_terminals() {
+fn render_three_panes_connection_colors_offline_and_small_terminals() {
     let assert_transport_style = |buffer: &ratatui::buffer::Buffer, value: &str, color| {
         let row: String = (0..buffer.area.width)
             .map(|x| buffer[(x, 3)].symbol())
@@ -312,13 +318,13 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     ] {
         let row = (0..30)
             .find(|&y| {
-                (43..119)
+                (63..119)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
                     .starts_with(label)
             })
             .unwrap_or_else(|| panic!("missing detail label {label}"));
-        for x in 43..43 + label.len() as u16 {
+        for x in 63..63 + label.len() as u16 {
             assert!(
                 buffer[(x, row)]
                     .modifier
@@ -326,7 +332,19 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
                 "{label}"
             );
         }
-        let value = &buffer[(44 + label.len() as u16, row)];
+        // Long IDs wrap in the narrower third pane; inspect the first nonblank value cell.
+        let value = (row..30)
+            .find_map(|y| {
+                let start = if y == row {
+                    64 + label.len() as u16
+                } else {
+                    63
+                };
+                (start..119)
+                    .map(|x| &buffer[(x, y)])
+                    .find(|cell| cell.symbol() != " ")
+            })
+            .unwrap();
         if label == "status:" {
             assert_eq!(value.symbol(), "c");
             assert_eq!(value.fg, Color::Green);
@@ -343,7 +361,7 @@ fn render_two_panes_connection_colors_offline_and_small_terminals() {
     let (text, buffer) = screen(&mut app, 80, 24);
     assert_transport_style(&buffer, "not_running", Color::Red);
     assert!(text.contains("Unknown"));
-    assert!(text.contains("view only"));
+    assert!(text.contains("read only"));
     assert!(text.contains("transport: not_running"));
     assert!(!buffer.content.iter().any(|cell| cell.fg == Color::Green));
     let (text, buffer) = screen(&mut app, 120, 30);
@@ -380,7 +398,7 @@ fn revocation_prompt_accepts_yes_and_no_and_checks_online_state() {
     assert!(
         screen(&mut app, 120, 30)
             .0
-            .contains("remove peer Eric laptop from network? y/n")
+            .contains("remove peer Eric laptop from network \"Office / Lab\"? y/n")
     );
     assert!(matches!(app.key(key(KeyCode::Char('n'))), Action::None));
     assert!(app.confirmation.is_none());
@@ -408,7 +426,7 @@ fn selection_survives_refresh_and_revocation_defaults_to_cancel() {
     assert!(
         screen(&mut app, 120, 30)
             .0
-            .contains("remove peer Eric laptop from network? y/n")
+            .contains("remove peer Eric laptop from network \"Office / Lab\"? y/n")
     );
     assert!(matches!(app.key(key(KeyCode::Enter)), Action::None));
     assert!(!app.revoking);
@@ -651,17 +669,20 @@ async fn admin_control_reports_live_presence_and_revokes_with_existing_actor() {
 }
 
 #[test]
-fn admin_requests_reject_non_admin_memberships_and_legacy_state() {
+fn admin_requests_allow_read_only_memberships_and_reject_legacy_state() {
     let (mut cfg, key, _) = fixture();
     let peer = cfg.local_peer().unwrap();
     cfg.membership =
         Some(MembershipCertificate::issue(&cfg, &key, &peer, &[22], MembershipRole::Peer).unwrap());
-    assert!(admin::respond(&cfg, &HashMap::new(), Request::Overview).is_err());
+    assert!(admin::respond(&cfg, &HashMap::new(), Request::Overview).is_ok());
+    let mut app = App::new(view(&cfg, true));
+    app.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert!(app.confirmation.is_none());
     let (cfg, _, _) = fixture();
     let saved = SavedFixture::new(&cfg);
     let original = serde_yaml::to_string(&cfg)
         .unwrap()
-        .replacen("version: 2", "version: 1", 1);
+        .replacen("version: 3", "version: 1", 1);
     fs::write(&saved.path, &original).unwrap();
     assert!(
         Config::load(&saved.path)
@@ -686,4 +707,47 @@ fn revoke_dialog_keeps_controls_visible_with_maximum_length_names() {
     let (text, _) = screen(&mut app, 80, 20);
     assert!(text.contains("[ n ]"));
     assert!(text.contains("n/Esc: cancel"));
+}
+
+#[test]
+fn network_focus_switching_rejects_stale_details_and_clears_removed_networks() {
+    let (cfg, _, peer) = fixture();
+    let mut app = App::new(view(&cfg, true));
+    let first_id = cfg.network_id.clone();
+    let other_id = Uuid::new_v4().to_string();
+    app.set_networks(vec![
+        admin::NetworkRow {
+            id: first_id.clone(),
+            label: "A".into(),
+            role: "admin".into(),
+        },
+        admin::NetworkRow {
+            id: other_id.clone(),
+            label: "B".into(),
+            role: "peer".into(),
+        },
+    ]);
+    let old_generation = app.generation;
+    let detail = get_detail(&cfg, &peer);
+    assert!(app.accept_detail(&first_id, old_generation, detail.clone()));
+    assert!(matches!(app.key(key(KeyCode::BackTab)), Action::None));
+    assert_eq!(app.focus, 0);
+    assert!(matches!(app.key(key(KeyCode::Down)), Action::Network));
+    assert_eq!(app.view.overview.network_id, other_id);
+    assert!(app.detail.is_none());
+    assert!(!app.accept_detail(&first_id, old_generation, detail.clone()));
+    // Switching away and back invalidates reads even if the peer and network IDs match.
+    app.key(key(KeyCode::Up));
+    app.update(view(&cfg, true));
+    assert!(!app.accept_detail(&first_id, old_generation, detail));
+    app.key(key(KeyCode::Tab));
+    assert_eq!(app.focus, 1);
+    app.key(key(KeyCode::Tab));
+    assert_eq!(app.focus, 2);
+    app.key(key(KeyCode::Down));
+    assert_eq!(app.scroll, 1);
+    assert!(app.set_networks(vec![]));
+    assert!(app.view.overview.network_id.is_empty());
+    assert!(app.selected().is_none());
+    assert!(screen(&mut app, 120, 30).0.contains("Networks"));
 }

@@ -17,6 +17,7 @@ impl TransportHome {
         fs::create_dir(&dir).unwrap();
         let key = SecretKey::generate();
         let cfg = create_creator_config(
+            "Test network",
             &key,
             Uuid::new_v4().to_string(),
             "local".to_string(),
@@ -24,8 +25,20 @@ impl TransportHome {
             DEFAULT_MAX_KNOWN_PEERS,
         )
         .unwrap();
-        cfg.save(&dir.join(ESP_DIR).join(CONFIG_FILE)).unwrap();
+        let store = networks::Store {
+            root: dir.join(ESP_DIR),
+        };
+        store.prepare().unwrap();
+        cfg.save(&store.path(&cfg.network_id).unwrap()).unwrap();
         Self { dir }
+    }
+
+    fn network(&self) -> PathBuf {
+        let store = networks::Store {
+            root: self.dir.join(ESP_DIR),
+        };
+        let cfg = store.select("Test network").unwrap();
+        store.path(&cfg.network_id).unwrap()
     }
 
     fn socket(&self) -> PathBuf {
@@ -55,7 +68,7 @@ impl TransportHome {
         timeout(
             Duration::from_secs(10),
             self.command()
-                .args(["proxy", "unknown-host", "22"])
+                .args(["proxy", "Test network", "unknown-host", "22"])
                 .output(),
         )
         .await
@@ -118,7 +131,7 @@ fn assert_reached_transport(output: &std::process::Output) {
 #[tokio::test]
 async fn originator_invite_commands_issue_fresh_codes_without_transport() {
     let home = TransportHome::new();
-    let path = home.dir.join(ESP_DIR).join(CONFIG_FILE);
+    let path = home.network();
     let mut codes = HashSet::new();
     let mut ids = HashSet::new();
     let mut secrets = HashSet::new();
@@ -127,7 +140,7 @@ async fn originator_invite_commands_issue_fresh_codes_without_transport() {
         let output = timeout(
             Duration::from_secs(5),
             home.command()
-                .args(["invite", "Test peer", "--no-color"])
+                .args(["invite", "Test network", "Test peer", "--no-color"])
                 .output(),
         )
         .await
@@ -167,7 +180,7 @@ async fn simultaneous_proxy_processes_start_and_reuse_one_background_transport()
     for _ in 0..8 {
         children.push(
             home.command()
-                .args(["proxy", "unknown-host", "22"])
+                .args(["proxy", "Test network", "unknown-host", "22"])
                 .spawn()
                 .unwrap(),
         );
@@ -221,26 +234,23 @@ async fn simultaneous_proxy_processes_start_and_reuse_one_background_transport()
     let report: serde_json::Value = serde_json::from_slice(&initialized.stdout).unwrap();
     assert_eq!(report["network_label"], "Shared network");
     assert_eq!(
-        Config::load(&home.dir.join(ESP_DIR).join(CONFIG_FILE))
+        Config::load(&home.network())
             .unwrap()
             .network_policy
             .admin_label
             .as_deref(),
-        Some("Shared network")
+        Some("Test network")
     );
 
-    // Starting a server must not create a competing endpoint under the same key.
-    let output = timeout(
-        Duration::from_secs(5),
-        home.command().arg("daemon").output(),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    // Promotion retains the helper PID; another foreground owner is rejected.
+    let mut foreground = home.command().arg("daemon").spawn().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(home.pid(), pid);
+    let output = home.command().arg("daemon").output().await.unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("already running"));
-    assert_eq!(home.pid(), pid);
-    home.stop().await;
+    foreground.kill().await.unwrap();
+    home.wait_until_unlocked().await;
 }
 
 #[tokio::test]
@@ -287,7 +297,7 @@ async fn spawn_failure_releases_transport_lock() {
     let home = TransportHome::new();
     let err = transport::connect_or_start(
         &home.socket(),
-        &home.dir.join(ESP_DIR).join(CONFIG_FILE),
+        &home.network(),
         &home.dir.join("missing-esp-executable"),
     )
     .await
@@ -317,7 +327,7 @@ async fn waiting_for_another_transport_to_start_is_bounded() {
     let _owner = transport::try_lock(&home.socket()).unwrap().unwrap();
     let err = transport::connect_or_start(
         &home.socket(),
-        &home.dir.join(ESP_DIR).join(CONFIG_FILE),
+        &home.network(),
         Path::new(env!("CARGO_BIN_EXE_esp")),
     )
     .await
@@ -333,22 +343,18 @@ async fn setup_retries_when_transport_closes_before_ready() {
     let listener = bind_local_control_socket(&home.socket()).unwrap();
     let server = tokio::spawn(async move {
         let (mut first, _) = listener.accept().await.unwrap();
-        let _: LocalControlRequest =
+        let _: networks::Request =
             read_cbor_frame(&mut first, MAX_LOCAL_CONTROL_MESSAGE_LEN, "first request")
                 .await
                 .unwrap();
         drop(first); // Simulate shutdown before the readiness reply.
         let (mut second, _) = listener.accept().await.unwrap();
-        let request: LocalControlRequest =
+        let request: networks::Request =
             read_cbor_frame(&mut second, MAX_LOCAL_CONTROL_MESSAGE_LEN, "retry")
                 .await
                 .unwrap();
-        assert_eq!(
-            request,
-            LocalControlRequest::Proxy {
-                target: "remote-host".to_string(),
-                port: 22
-            }
+        assert!(
+            matches!(request, networks::Request::Network { request: LocalControlRequest::Proxy { target, port: 22 }, .. } if target == "remote-host")
         );
         write_cbor_frame(
             &mut second,
@@ -364,7 +370,7 @@ async fn setup_retries_when_transport_closes_before_ready() {
         Duration::from_secs(5),
         transport::open_proxy(
             &home.socket(),
-            &home.dir.join("unused-config"),
+            &home.network(),
             &home.dir.join("unused-executable"),
             "remote-host".to_string(),
             22,
@@ -545,7 +551,7 @@ impl AdminPty {
 #[tokio::test]
 async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
     let fixture = TransportHome::new();
-    let path = fixture.dir.join(ESP_DIR).join(CONFIG_FILE);
+    let path = fixture.network();
     let mut cfg = Config::load(&path).unwrap();
     let peer = Peer {
         node_id: SecretKey::generate().public(),
@@ -561,23 +567,10 @@ async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
     let mut pty = AdminPty::new();
     let original_flags = pty.flags();
     let mut child = pty.spawn(&fixture);
-    pty.until("view only").await;
+    pty.until("read only").await;
     assert_eq!(pty.flags() & (libc::ECHO | libc::ICANON), 0);
 
-    let actor = spawn_config_actor(path.clone(), cfg);
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .secret_key(key)
-        .relay_mode(RelayMode::Disabled)
-        .bind()
-        .await
-        .unwrap();
-    let listener = bind_local_control_socket(&fixture.socket()).unwrap();
-    let server = tokio::spawn(run_local_control_server(
-        listener,
-        actor,
-        endpoint.clone(),
-        None,
-    ));
+    let mut server = fixture.command().arg("daemon").spawn().unwrap();
     // The unchanged transport key is not repainted when the status changes.
     pty.until("0 connected").await;
     pty.master.write_all(b"r").unwrap();
@@ -596,9 +589,11 @@ async fn admin_terminal_reconnects_confirms_revocation_and_restores_terminal() {
     .await
     .unwrap();
     assert!(is_node_revoked(&Config::load(&path).unwrap(), peer.node_id));
-    server.abort();
-    endpoint.close().await;
-    fs::remove_file(fixture.socket()).unwrap();
+    // Graceful signal only to this fixture daemon.
+    unsafe {
+        libc::kill(server.id().unwrap() as i32, libc::SIGTERM);
+    }
+    server.wait().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     pty.master.write_all(b"r").unwrap();
     pty.until("disabled:").await;

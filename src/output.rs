@@ -1,5 +1,5 @@
 //! Shared formatting for command reports. Proxy streams and the TUI bypass this module.
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,61 +15,21 @@ pub enum Format {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "FormatConfigInput")]
+#[serde(deny_unknown_fields)]
 pub struct FormatConfig {
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub kind: Format,
+    #[serde(default = "default_colorize")]
     pub colorize: bool,
 }
-
+fn default_colorize() -> bool {
+    true
+}
 impl Default for FormatConfig {
     fn default() -> Self {
         Self {
             kind: Format::Json,
             colorize: true,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged, deny_unknown_fields)]
-enum FormatConfigInput {
-    Structured {
-        #[serde(default, rename = "type")]
-        kind: Format,
-        #[serde(default = "default_colorize")]
-        colorize: bool,
-    },
-    Legacy(LegacyFormat),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum LegacyFormat {
-    Json,
-    JsonColorized,
-    Text,
-}
-
-fn default_colorize() -> bool {
-    true
-}
-
-impl From<FormatConfigInput> for FormatConfig {
-    fn from(input: FormatConfigInput) -> Self {
-        match input {
-            FormatConfigInput::Structured { kind, colorize } => Self { kind, colorize },
-            FormatConfigInput::Legacy(legacy) => match legacy {
-                LegacyFormat::Json => Self {
-                    kind: Format::Json,
-                    colorize: false,
-                },
-                LegacyFormat::JsonColorized => Self::default(),
-                LegacyFormat::Text => Self {
-                    kind: Format::Text,
-                    colorize: false,
-                },
-            },
         }
     }
 }
@@ -115,13 +75,7 @@ pub(super) fn read_format(path: &Path) -> Result<Option<FormatConfig>> {
         }
         Err(error) => return Err(error),
     };
-    #[derive(Deserialize)]
-    struct Preferences {
-        #[serde(default)]
-        format: FormatConfig,
-    }
-    let preferences: Preferences = serde_yaml::from_str(&text)
-        .with_context(|| format!("failed to parse output format in {}", path.display()))?;
+    let preferences = super::networks::GlobalConfig::parse(&text)?;
     Ok(Some(preferences.format))
 }
 

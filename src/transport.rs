@@ -117,7 +117,8 @@ pub async fn open_proxy(
 ) -> Result<UnixStream> {
     for attempt in 0..2 {
         let stream = connect_or_start(socket, config, executable).await?;
-        match request_local_proxy(stream, target.clone(), port).await {
+        let id = Config::load(config)?.network_id;
+        match networks::request_proxy(stream, id, target.clone(), port).await {
             Err(err) if attempt == 0 && connection_closed(&err) => {
                 // The idle helper can exit just as a new client connects. Retry
                 // setup only; no SSH bytes have been sent at this point.
@@ -157,24 +158,21 @@ pub async fn run() -> Result<()> {
     lock.set_len(0)?;
     writeln!(lock, "{}", std::process::id())?;
 
-    let path = config_path()?;
-    let cfg = Config::load(&path)?;
-    ensure_completed_join(&cfg)?;
-    let key = cfg.secret_key()?;
+    let store = networks::Store::local()?;
+    store.prepare()?;
     let (listener, _socket_guard) = prepare_local_control_socket()?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(key)
-        // Client transports receive membership/revocation updates, but do not
-        // advertise or accept inbound TCP forwarding.
-        .alpns(vec![CONTROL_ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
-        .bind()
-        .await
-        .context("failed to bind shared esp endpoint")?;
-    let actor = spawn_config_actor(path, cfg);
-    serve(listener, actor, endpoint, PROXY_TRANSPORT_IDLE_TIMEOUT).await
+    networks::serve(
+        listener,
+        store,
+        false,
+        networks::TransportOverrides::default(),
+        PROXY_TRANSPORT_IDLE_TIMEOUT,
+    )
+    .await
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub async fn serve(
     listener: UnixListener,
     actor: ConfigActorHandle,

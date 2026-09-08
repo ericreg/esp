@@ -39,7 +39,11 @@ impl ProxyFixture {
         ));
         fs::create_dir(&dir).unwrap();
         // Keep the path under macOS's Unix socket path length limit.
-        let socket = dir.join(".esp.sock");
+        let store = networks::Store {
+            root: dir.join(ESP_DIR),
+        };
+        store.prepare().unwrap();
+        let socket = store.root.join(LOCAL_CONTROL_SOCKET_FILE);
         let tcp = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = tcp.local_addr().unwrap().port();
 
@@ -53,6 +57,7 @@ impl ProxyFixture {
         let local_key = SecretKey::generate();
         let remote_key = SecretKey::generate();
         let mut cfg = create_creator_config(
+            "Test network",
             &local_key,
             Uuid::new_v4().to_string(),
             "local".to_string(),
@@ -83,7 +88,8 @@ impl ProxyFixture {
             MembershipCertificate::issue(&cfg, &local_key, &peer, &[port], MembershipRole::Peer)
                 .unwrap();
         let remote_cfg = Config {
-            format: output::FormatConfig::default(),
+            transport: networks::TransportOverrides::default(),
+            destruction: None,
             version: CONFIG_VERSION,
             network_id: cfg.network_id.clone(),
             secret_key: encode_secret_key(&remote_key),
@@ -106,6 +112,7 @@ impl ProxyFixture {
         cfg.peers.push(peer);
         cfg.memberships.push(membership);
         cfg.save(&dir.join("local.yml")).unwrap();
+        cfg.save(&store.path(&cfg.network_id).unwrap()).unwrap();
         remote_cfg.save(&dir.join("remote.yml")).unwrap();
         let actor = spawn_config_actor(dir.join("local.yml"), cfg);
         let remote_actor = spawn_config_actor(dir.join("remote.yml"), remote_cfg);
@@ -343,7 +350,12 @@ async fn shared_transport_survives_first_proxy_exit_and_closes_after_last_sessio
     )));
     let start_proxy = || {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_esp"))
-            .args(["proxy", "remote-host", &fixture.port.to_string()])
+            .args([
+                "proxy",
+                "Test network",
+                "remote-host",
+                &fixture.port.to_string(),
+            ])
             .env("HOME", &fixture.dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -560,14 +572,14 @@ fn proxy_without_config_fails_without_starting_a_transport() {
     let dir = std::env::temp_dir().join(format!("esp-n-{}", Uuid::new_v4()));
     fs::create_dir(&dir).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_esp"))
-        .args(["proxy", "remote-host", "22"])
+        .args(["proxy", "Test network", "remote-host", "22"])
         .env("HOME", &dir)
         .output()
         .unwrap();
     assert!(!result.status.success());
     assert!(result.stdout.is_empty());
     let stderr = String::from_utf8(result.stderr).unwrap();
-    assert!(stderr.contains("config.yml"), "{stderr}");
+    assert!(stderr.contains("no local network"), "{stderr}");
     assert!(!stderr.contains("Endpoint dropped"), "{stderr}");
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     fs::remove_dir(dir).unwrap();
@@ -578,7 +590,7 @@ fn daemon_connection_limit_must_be_positive() {
     assert!(Cli::try_parse_from(["esp", "daemon", "--max-connections-per-peer", "0"]).is_err());
     let cli = Cli::try_parse_from(["esp", "daemon", "--max-connections-per-peer", "32"]).unwrap();
     assert!(
-        matches!(cli.command, Some(Command::Daemon { max_connections_per_peer, .. }) if max_connections_per_peer.get() == 32)
+        matches!(cli.command, Some(Command::Daemon { max_connections_per_peer, .. }) if max_connections_per_peer.unwrap().get() == 32)
     );
 }
 
@@ -586,7 +598,12 @@ fn daemon_connection_limit_must_be_positive() {
 async fn proxy_process_exits_on_remote_eof_with_stdin_open() {
     let fixture = ProxyFixture::new(8).await;
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_esp"))
-        .args(["proxy", "remote-host", &fixture.port.to_string()])
+        .args([
+            "proxy",
+            "Test network",
+            "remote-host",
+            &fixture.port.to_string(),
+        ])
         .env("HOME", &fixture.dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -621,6 +638,7 @@ async fn proxy_process_exits_on_remote_eof_with_stdin_open() {
 async fn incomplete_local_request_still_times_out() {
     let key = SecretKey::generate();
     let cfg = create_creator_config(
+        "Test network",
         &key,
         Uuid::new_v4().to_string(),
         "local".to_string(),
@@ -655,7 +673,7 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     let fixture = ProxyFixture::new(8).await;
     fixture
         .actor
-        .update_policy_with_label(DEFAULT_MAX_KNOWN_PEERS, Some("Relay test network".into()))
+        .update_policy_with_label(DEFAULT_MAX_KNOWN_PEERS, Some("Test network".into()))
         .await
         .unwrap();
     let acceptor = tokio::spawn(run_acceptor(
@@ -682,10 +700,15 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
         connection_id: String::new(),
     };
     let mut cfg = Config {
-        format: output::FormatConfig::default(),
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
         version: CONFIG_VERSION,
         network_id: invite.network_id.clone(),
-        network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),
+        network_policy: pending_join_network_policy(
+            &invite.network_id,
+            invite.creator_node_id,
+            "Test network",
+        ),
         secret_key: encode_secret_key(&key),
         creator_node_id: invite.creator_node_id,
         invite_proof: Some(InviteProof {
@@ -730,11 +753,11 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
     .expect("CBOR join timed out");
     assert_eq!(
         cfg.network_policy.admin_label.as_deref(),
-        Some("Relay test network")
+        Some("Test network")
     );
     assert_eq!(
         join_report(Path::new("joined.yml"), &cfg).unwrap()["network_label"],
-        "Relay test network"
+        "Test network"
     );
     ensure_completed_join(&cfg).unwrap();
     assert!(cfg.invite_proof.is_none());

@@ -5,6 +5,7 @@ include!("../src/main.rs");
 fn records() -> (Config, Peer, MembershipCertificate, RevocationCertificate) {
     let key = SecretKey::from_bytes(&[7; 32]);
     let mut cfg = create_creator_config(
+        "Test network",
         &key,
         // Preserve the exact UUID spelling, including in signed payloads.
         "01234567-89AB-CDEF-0123-456789ABCDEF".to_string(),
@@ -135,7 +136,7 @@ fn all_message_variants_roundtrip_through_cbor() {
     ] {
         roundtrip(&LocalControlResponse::ok(response));
     }
-    roundtrip(&LocalControlResponse::err("rejected".to_string()));
+    roundtrip(&networks::Response::Error("rejected".to_string()));
 }
 
 #[test]
@@ -148,13 +149,14 @@ fn compact_records_use_cbor_strings_and_preserve_valid_signatures() {
     let invite = Invite::decode(&code).unwrap();
     let bytes = URL_SAFE_NO_PAD.decode(&code).unwrap();
     let mut d = minicbor::Decoder::new(&bytes);
-    assert_eq!(d.array().unwrap(), Some(6));
+    assert_eq!(d.array().unwrap(), Some(7));
     assert_eq!(d.u8().unwrap(), INVITE_VERSION);
     assert_eq!(d.str().unwrap(), invite.network_id);
     assert_eq!(d.str().unwrap(), invite.invite_id);
     assert_eq!(d.str().unwrap(), invite.invite_secret);
     assert_eq!(d.bytes().unwrap(), invite.creator_node_id.as_bytes());
     assert_eq!(d.bytes().unwrap(), invite.inviter_node_id.as_bytes());
+    assert_eq!(d.str().unwrap(), invite.network_label);
     assert_eq!(d.position(), bytes.len());
 
     let member =
@@ -260,6 +262,7 @@ fn invalid_invite_fields_are_rejected_at_record_boundaries() {
         ),
     ] {
         let invalid = Invite {
+            network_label: "Test network".into(),
             version,
             network_id: network_id.to_string(),
             invite_id: invite_id.to_string(),
@@ -436,7 +439,7 @@ async fn frames_reject_invalid_lengths_payloads_and_trailing_values() {
         name: "x".repeat(usize::from(u16::MAX)),
     };
     assert!(
-        write_cbor_frame(&mut output, &oversized, usize::MAX, "huge")
+        write_cbor_frame(&mut output, &oversized, u16::MAX as usize, "huge")
             .await
             .is_err()
     );
@@ -465,11 +468,11 @@ async fn frames_reject_invalid_lengths_payloads_and_trailing_values() {
 fn network_labels_are_signed_shared_and_preserved_by_policy_updates() {
     let (mut cfg, _, _, _) = records();
     let mut remote = cfg.clone();
-    cfg.issue_network_policy_with_label(100, Some("Office / Lab".into()))
+    cfg.issue_network_policy_with_label(100, Some("Test network".into()))
         .unwrap();
     assert_eq!(
         cfg.network_policy.admin_label.as_deref(),
-        Some("Office / Lab")
+        Some("Test network")
     );
     cfg.network_policy.verify_signature().unwrap();
     roundtrip(&cfg.network_policy);
@@ -489,7 +492,7 @@ fn network_labels_are_signed_shared_and_preserved_by_policy_updates() {
     cfg.issue_network_policy(200).unwrap();
     assert_eq!(
         cfg.network_policy.admin_label.as_deref(),
-        Some("Office / Lab")
+        Some("Test network")
     );
     assert!(
         cfg.issue_network_policy_with_label(200, Some("different".into()))

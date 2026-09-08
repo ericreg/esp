@@ -16,15 +16,21 @@ fn issue_membership(cfg: &Config, issuer_key: &SecretKey, subject: &Peer) -> Mem
 }
 
 fn issue_policy(network_id: &str, issuer_key: &SecretKey) -> NetworkPolicyCertificate {
-    NetworkPolicyCertificate::issue_for_network(network_id, issuer_key, DEFAULT_MAX_KNOWN_PEERS)
-        .unwrap()
+    NetworkPolicyCertificate::issue_for_network(
+        network_id,
+        issuer_key,
+        DEFAULT_MAX_KNOWN_PEERS,
+        "Test network",
+    )
+    .unwrap()
 }
 
 #[test]
 fn invite_round_trips() {
     let key = SecretKey::generate();
     let invite = Invite {
-        version: 2,
+        network_label: "Test network".into(),
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         invite_id: "ABC123".to_string(),
         invite_secret: "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
@@ -34,7 +40,7 @@ fn invite_round_trips() {
 
     let code = invite.encode().unwrap();
     let decoded = Invite::decode(&code).unwrap();
-    assert!(code.len() < 200);
+    assert!(code.len() < 300);
     assert_eq!(decoded.network_id, invite.network_id);
     assert_eq!(decoded.invite_id, invite.invite_id);
     assert_eq!(decoded.invite_secret, invite.invite_secret);
@@ -52,8 +58,9 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         connection_id: "DEF456".to_string(),
     };
     let mut cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &creator_key),
         secret_key: encode_secret_key(&secret_key),
@@ -98,7 +105,7 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         second.invite_id
     );
     let decoded = Invite::decode(&first.code).unwrap();
-    assert!(first.code.len() < 200);
+    assert!(first.code.len() < 300);
     assert_eq!(decoded.inviter_node_id, secret_key.public());
     assert_eq!(decoded.creator_node_id, creator_key.public());
 }
@@ -109,8 +116,9 @@ fn resolving_duplicate_names_requires_connection_id() {
     let first_peer_key = SecretKey::generate();
     let second_peer_key = SecretKey::generate();
     let cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
@@ -138,7 +146,7 @@ fn resolving_duplicate_names_requires_connection_id() {
     };
 
     let err = cfg.resolve_peer("amd").unwrap_err().to_string();
-    assert!(err.contains("multiple esp peers are named amd"));
+    assert!(err.contains("ambiguous peer"));
     assert_eq!(cfg.resolve_peer("DEF456").unwrap().connection_id, "DEF456");
 }
 
@@ -152,8 +160,9 @@ fn connection_ids_are_case_sensitive_base62() {
     let secret_key = SecretKey::generate();
     let peer_key = SecretKey::generate();
     let cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),
@@ -182,8 +191,9 @@ fn advertised_peer_lists_are_bounded() {
     let secret_key = SecretKey::generate();
     let remote_key = SecretKey::generate();
     let mut cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: issue_policy(TEST_NETWORK_ID, &secret_key),
         secret_key: encode_secret_key(&secret_key),

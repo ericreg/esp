@@ -6,6 +6,7 @@ const TEST_NETWORK_ID: &str = "00000000-0000-0000-0000-000000000001";
 
 fn creator_config(secret_key: &SecretKey) -> Config {
     create_creator_config(
+        "Test network",
         secret_key,
         TEST_NETWORK_ID.to_string(),
         "creator".to_string(),
@@ -187,8 +188,9 @@ fn incomplete_join_is_not_saved() {
     let creator_cfg = creator_config(&creator_key);
     let member_key = SecretKey::generate();
     let pending = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -230,10 +232,15 @@ fn short_invite_join_bootstraps_policy_issuer_membership() {
     let invite = Invite::decode(&invite.code).unwrap();
     let member_key = SecretKey::generate();
     let mut join_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: invite.network_id.clone(),
-        network_policy: pending_join_network_policy(&invite.network_id, invite.creator_node_id),
+        network_policy: pending_join_network_policy(
+            &invite.network_id,
+            invite.creator_node_id,
+            "Test network",
+        ),
         secret_key: encode_secret_key(&member_key),
         creator_node_id: invite.creator_node_id,
         invite_proof: Some(InviteProof {
@@ -296,7 +303,7 @@ fn config_schema_requires_current_policy_field() {
     let secret_key = SecretKey::generate();
     let yaml = format!(
         "\
-version: 2
+version: 3
 network_id: net
 secret_key: {}
 creator_node_id: {}
@@ -352,8 +359,9 @@ fn joined_admin_cannot_issue_invite_for_ungranted_port() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -402,8 +410,9 @@ fn joined_peer_cannot_issue_invites() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -586,8 +595,9 @@ fn joined_peer_cannot_revoke() {
         connection_id: "FED654".to_string(),
     };
     let mut member_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -774,8 +784,9 @@ fn non_admin_hello_does_not_advertise_directory() {
         connection_id: "FED654".to_string(),
     };
     let member_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&member_key),
@@ -931,8 +942,9 @@ fn joined_admin_can_update_network_policy() {
     )
     .unwrap();
     let mut admin_cfg = Config {
-        format: output::FormatConfig::default(),
-        version: 2,
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
+        version: 3,
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: creator_cfg.network_policy.clone(),
         secret_key: encode_secret_key(&admin_key),
@@ -982,6 +994,7 @@ async fn config_actor_serializes_invite_consumption() {
     let first_key = SecretKey::generate();
     let second_key = SecretKey::generate();
     let first_hello = Hello {
+        network_label: "Test network".into(),
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: None,
         name: "joined-one".to_string(),
@@ -993,6 +1006,7 @@ async fn config_actor_serializes_invite_consumption() {
         revocations: Vec::new(),
     };
     let second_hello = Hello {
+        network_label: "Test network".into(),
         network_id: TEST_NETWORK_ID.to_string(),
         network_policy: None,
         name: "joined-two".to_string(),

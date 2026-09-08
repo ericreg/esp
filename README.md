@@ -1,262 +1,230 @@
 # esp
 
-`esp` is a tiny iroh-backed TCP proxy aimed at one thing first: SSH between
-machines without manually exposing port 22.
-
-It is an SSH transport helper, not a general VPN manager.
+`esp` carries TCP traffic over iroh so you can SSH between machines without
+opening inbound SSH ports or configuring a VPN. SSH still authenticates users
+and encrypts the SSH session.
 
 ## Installation
 
-With Rust and `just` installed, run from this checkout:
+With Rust and `just` installed:
 
 ```sh
 just install
-```
-
-Or run Cargo directly:
-
-```sh
+# Or:
 cargo install --locked --path . --force
 ```
 
-This installs `esp` into Cargo's bin directory, usually `~/.cargo/bin`. Make
-sure that directory is on your `PATH`:
+The executable is normally installed in `~/.cargo/bin`. Check `esp --help`.
 
-```sh
-esp --help
-```
-
-You can also install from git:
-
-```sh
-cargo install --git https://github.com/ericreg/esp.git --force
-```
-
-## Flow
+## Create and join networks
 
 On the first machine:
 
 ```sh
 esp init "Home network"
+esp invite "Home network" "laptop"
+esp daemon
 ```
 
-This creates `~/.esp/config.yml` with the required network label, detects this
-host's name, and generates a unique connection id. Network labels are trimmed,
-nonblank printable ASCII strings of at most 64 bytes. They are signed into the
-network policy and shared with joined hosts. Admins can run `esp init "label"`
-to label an existing unlabeled network; repeating the same label is safe. Init
-does not rename an already labeled network. Update esp on all hosts before
-assigning a network label, since older versions cannot verify labeled policies.
-Create an invite explicitly:
+Copy the `invite_code` field to the second machine:
 
 ```sh
-esp invite "laptop"
+esp join INVITE_CODE
+esp daemon
 ```
 
-Copy the `invite_code` value from the JSON report for `esp join`. Each run
-creates a fresh, single-use invite, including on the network creator.
-Codes from the same host share a long prefix and suffix because they encode the
-same network and host identities; the random invite id and secret change in the
-middle of the code.
+Each invitation is fresh and single-use. It includes the shared network label;
+joining verifies that label against the inviter's signed policy before accepting
+membership. Labels are immutable, case-sensitive, trimmed printable ASCII,
+1–64 characters long. Quoted spaces are allowed. A local label cannot refer to
+two different active networks. Repeating `init` for an existing label returns its
+identity and leaves its policy unchanged.
 
-Keep the daemon running on that machine:
+A machine can belong to several networks:
 
 ```sh
-esp
+esp init "Work network"
+esp invite "Work network" "work laptop" --role admin
+esp status
 ```
 
-By default, the daemon only allows peers to proxy to local SSH on port `22`.
-Allow additional localhost ports explicitly on that host:
+Each network has independent identities, peer names, invitations, membership
+roles, revocations, policy, ports, and connection history. One shared daemon
+serves all configured networks. Creating, joining, and removing a network while
+it runs updates that daemon without restarting the other endpoints. The daemon
+can start with no networks. An invalid network appears as an error in status
+while healthy networks keep running.
+
+## SSH and forwarding
 
 ```sh
-esp daemon --ports 22,8000
+ssh -o 'ProxyCommand=esp proxy "Home network" %n %p' user@host
+ssh -o 'ProxyCommand=esp proxy "Home network" %n %p' user@A1B2C3
 ```
 
-Each daemon process opens one timestamped log file at startup and writes
-INFO-level logs there by default, for example
-`~/.esp/logs/esp-1767225600-000000000.log`. Set `RUST_LOG` to override the log
-level.
-
-Invites grant the `peer` role and SSH-only port access by default. To grant a
-peer additional ports, include them in the invite:
-
-```sh
-esp invite "web host" --ports 22,80,8080
-```
-
-Only admins can create invites. To let a new host invite others, grant the
-`admin` role explicitly:
-
-```sh
-esp invite "admin laptop" --role admin
-```
-
-The effective policy is the intersection of the peer's signed invite grant and
-the daemon's local `--ports` allowlist.
-
-On the second machine:
-
-```sh
-esp join <invite-code>
-esp
-```
-
-To add a third machine, print a new invite on any already-joined admin:
-
-```sh
-esp invite "laptop"
-```
-
-Join with that new code on the third machine. Each host shares its detected name
-and its unique case-sensitive, six-character base62 connection id when it joins
-and when it initiates a proxy connection. Duplicate names are allowed but must
-be disambiguated by id.
-
-Keep `esp daemon` running on machines that should accept incoming connections.
-From a client, SSH through esp to any learned peer:
-
-```sh
-ssh -o ProxyCommand='esp proxy %n %p' user@host
-ssh -o ProxyCommand='esp proxy %n %p' user@A1B2C3
-```
-
-Or add an SSH config entry:
+Or in `~/.ssh/config`:
 
 ```sshconfig
-Host host
-    HostName host
+Host home-server
+    HostName server
     User user
-    ProxyCommand esp proxy %n %p
+    ProxyCommand esp proxy "Home network" %n %p
 ```
 
-Then connect normally:
+Peer lookup is confined to the chosen network. It accepts admin labels,
+hostnames, six-character connection IDs, and full node IDs. Exact IDs take
+precedence. Ambiguous names or labels fail and show IDs for disambiguation.
+
+`esp proxy` starts one shared outgoing-only helper when needed. All local proxy
+processes use `~/.esp/.esp.sock`, protected by the persistent
+`~/.esp/.esp.lock`. Each network has its own iroh endpoint. The helper exits
+30 seconds after the last local session ends.
+
+Running `esp daemon` promotes an existing helper in place, enabling inbound
+forwarding while preserving active sessions. The foreground command owns the
+promoted process: termination or loss of its controlling connection stops the
+shared daemon. A second foreground owner is rejected.
+
+A remote proxy connects to `127.0.0.1:PORT` on the receiving host. The requested
+port must be allowed by both the requester's signed membership and the
+receiving network's local transport settings. Invitations grant port 22 and the
+ordinary `peer` role by default. Admins can grant other ports or the admin role:
 
 ```sh
-ssh host
+esp invite "Home network" "web host" --ports 22,80,8080
+esp invite "Home network" "admin laptop" --role admin
+esp daemon --ports 22,80,8080 --max-connections-per-peer 32
 ```
 
-`esp proxy` automatically starts a shared background transport when needed and
-connects to it through `~/.esp/.esp.sock`, with its transport lock stored at
-`~/.esp/.esp.lock`. Other proxy processes reuse that transport;
-each SSH session gets its own connection through the same iroh endpoint. Closing
-the first session leaves the others connected. Once all local sessions have
-ended, the background transport exits after 30 seconds of inactivity. The next
-SSH session starts it again automatically.
+## Configuration
 
-If a local daemon is already running, proxies use its endpoint. The automatic
-client transport handles outgoing sessions and control updates; incoming TCP
-forwarding requires `esp daemon` on the receiving host. To start a daemon while
-the client transport is running, close local proxy sessions and let it exit.
-
-By default, a daemon accepts up to eight concurrent incoming connections from
-each peer, including control syncs. To allow more, set the limit on the receiving
-host:
-
-```sh
-esp daemon --max-connections-per-peer 32
-```
-
-The limit must be positive; the daemon also retains its overall worker limits.
-After upgrading esp, restart the local daemon to enable the new proxy request.
-
-If multiple peers are named `host`, esp exits and prints the matching connection
-ids. Rename one of them with `esp rename NAME` or use the id directly.
-
-The remote daemon connects to `127.0.0.1:%p` on its own machine, so Linux
-firewall rules do not need to allow inbound SSH from esp peers.
-
-## Interactive administration
-
-Run `esp admin` in a terminal on an admin host, or `ssh -t amd esp admin`.
-The header identifies the current network and local host. The left pane lists
-joined peers by admin label, hostname, and connection ID. The right pane shows
-the selected peer's identities, role, ports, original six-character invite ID,
-inviter, join time, and local connection history.
-
-A green **Connected** peer has at least one established, authorized connection
-to this host's esp transport. Idle reachable hosts are not marked connected;
-there are no background reachability probes. Last-connected timestamps are
-saved locally and survive transport restarts. They are not network-wide history.
-
-Use arrows or `j`/`k` to select, Page Up/Down to move ten peers, `J`/`K` to scroll
-details, `r` to revoke, and `q` or Ctrl-C to quit. Revocation opens a confirmation
-with **Cancel** selected. Use Tab or left/right and Enter to confirm, or Escape
-to cancel. Revocation closes active sessions and broadcasts the signed change;
-the peer needs a new invite to rejoin. Revoked peers and pending invitations are
-not included in the list.
-
-Without a local daemon or helper, the TUI shows saved data with **Unknown**
-connection status and disables revocation. It reconnects automatically when the
-transport starts. A disconnected or unresponsive transport marks the view stale.
-The minimum terminal size is 80 columns by 20 rows.
-
-Pressing `r` opens `remove peer <admin_label> from network? y/n`. Press `y` to
-remove that peer or `n`/Esc to cancel; Enter defaults to cancellation.
-
-Every new invite requires an admin label: `esp invite "Eric laptop"`. Labels are
-trimmed, nonblank printable ASCII strings of at most 64 bytes. The label stays
-separate from the joining machine's hostname and is signed into its membership,
-along with the consumed invite ID and join time. Other admins receive these
-fields through membership exchange. `esp rename` still changes the hostname;
-labels cannot be edited in this version and are not proxy lookup aliases.
-Duplicate labels are allowed; use connection IDs to distinguish peers. The
-network creator's label initially matches its hostname and has no invite ID.
-
-## Commands
-
-```sh
-esp init "Home network" --max-peers 100 # create ~/.esp/config.yml if missing
-esp join CODE         # join from an invite code
-esp proxy TARGET PORT # proxy stdio to localhost:PORT on peer name or id
-esp rename NAME       # rename this host
-esp revoke TARGET     # revoke a peer by name, connection id, or node id as an admin
-esp policy --max-peers 100 # update the signed network peer cap as an admin
-esp invite "laptop" --role peer --ports 22 # create and print an invite as an admin
-esp status            # show transport, local node, and connected peer count as highlighted JSON
-esp status --format json --no-color # plain JSON for scripts
-esp status --format text # snake_case text output; color follows the config
-esp status --peers     # include the full peer list (also works with --format text)
-esp admin             # interactive two-pane administration (admin members only)
-esp daemon --ports 22 # run the daemon; this is also the default `esp`
-esp daemon --max-connections-per-peer 32 # allow more concurrent connections per peer
-```
-
-The report commands (`init`, `join`, `rename`, `invite`, `revoke`, `policy`, and
-`status`) use the top-level `format` settings in `~/.esp/config.yml`:
+Global preferences live in `~/.esp/config.yml`:
 
 ```yaml
+version: 3
 format:
   type: json
   colorize: true
+transport:
+  ports: [22]
+  max_connections_per_peer: 8
 ```
 
-`type` accepts `json` or `text` and defaults to `json`. `colorize` accepts `true`
-or `false` and defaults to `true`. Colored JSON uses syntax highlighting; colored
-text uses bold white keys and light blue values. In text output, the init hint
-appears after the fields, separated by a blank line, without a `next_step` key.
-JSON retains `next_step`.
+Network identities and signed state live in
+`~/.esp/networks/<network_uuid>.yml`. Each network file may override transport
+settings:
 
-`--format json|text` overrides only the type, while `--color` and `--no-color`
-override colorization. CLI overrides do not modify the saved preferences. Changes
-take effect on the next command, including with a running transport. For example:
+```yaml
+transport:
+  ports: []
+  max_connections_per_peer: 4
+```
+
+An empty port list disables inbound forwarding on that network. Settings use
+explicit daemon flags first, then network overrides, then global defaults.
+They are read when starting or promoting the daemon and when adding a network.
+Restart the daemon after manually editing transport settings. State saves
+preserve those edits.
+
+Keep network files private: they contain each network's secret identity.
+Directories use mode `0700`, files use `0600`, and writes are atomic. esp rejects
+symlinked state paths, linked secret files, and files with group/world access.
+Do not copy network identities between machines.
+
+Report commands default to highlighted JSON. `--format json|text` overrides the
+global format; `--color` and `--no-color` independently override colorization.
+Text output uses snake_case keys and groups networks into separate blocks.
+Colored text uses bold white keys and light-blue values. Preferences change on
+the next command and CLI overrides are not saved. Scalar legacy format settings
+are rejected.
 
 ```sh
-esp join CODE --format text
-esp status --format text --color
-esp invite "laptop" --format json --no-color | jq -r .invite_code
+esp status --no-color
+esp status "Home network" --peers --format text
+esp invite "Home network" "laptop" --no-color | jq -r .invite_code
 ```
 
-The previous scalar settings (`json`, `json_colorized`, and `text`) remain readable
-and are converted to the nested form when the config is next saved, preserving
-their existing output behavior.
+`status` lists networks in label order, including role, transport state, and peer
+counts. `status NETWORK` shows detailed identity and configuration information.
+`--peers` includes peer records in either form. Connected counts measure
+established connections observed locally; offline presence is `null` in JSON and
+`unknown` in text. Reachable but idle hosts are not counted as connected.
 
-`invite` now returns an `invite_code` field rather than a bare code. The interactive
-admin screen, proxy byte stream, daemon logs, and command help retain their own
-formats.
+The daemon writes timestamped INFO logs under `~/.esp/logs/`. Use `RUST_LOG` to
+change the log level.
+
+## Administration
+
+`esp admin [NETWORK]` opens **Networks → Peers → Peer details**. Every active
+local network is shown; ordinary memberships are read-only. Tab and Shift-Tab
+move focus, arrows or `j/k` navigate, Page Up/Down move by ten, and `J/K` scroll
+details. Press `q` or Ctrl-C to quit. Use `ssh -t` for remote terminals.
+
+The header and details show the selected network, host, peer identities, role,
+ports, invite provenance, and local connection history. Connected/running values
+are green, stopped transport is red, and unknown presence is gray. Keys are bold.
+The interface handles network removal and daemon reconnects while it is open.
+
+An online administrator can press `r` to revoke the selected peer. The prompt
+names both the peer and network. Press `y` to confirm or `n`/Esc to cancel;
+Enter defaults to cancellation. Revocation closes that peer's sessions and
+broadcasts the signed change. Peer admin labels remain separate from hostnames;
+`rename NETWORK NAME` changes this host's hostname within that network.
+
+## Commands and destruction
+
+```sh
+esp init NETWORK --max-peers 100
+esp join INVITE
+esp invite NETWORK PEER --role peer --ports 22
+esp proxy NETWORK PEER PORT
+esp rename NETWORK NAME
+esp revoke NETWORK PEER
+esp policy NETWORK --max-peers 100
+esp status [NETWORK] [--peers]
+esp admin [NETWORK]
+esp destroy NETWORK [--global] [--yes]
+esp daemon # also the default command: esp
+```
+
+`destroy NETWORK` closes that network's local sessions and removes its local
+file. Other members' records are unchanged. A fresh invitation can rejoin it.
+
+`destroy NETWORK --global` requires a serving daemon and a valid admin
+membership. It durably records a signed destruction certificate, disables
+forwarding and membership changes, closes active sessions, and sends the
+certificate to known members. Recipients verify the signature and admin chain
+against the pinned creator and known revocations. Ordinary members can relay
+valid certificates.
+
+Both forms prompt for confirmation. Noninteractive use requires `--yes`.
+
+Global destruction is permanent. A terminal record retains the control identity
+and pending deliveries, survives restart, rejects rejoining that UUID, and is
+hidden from active network lists. Notifications retry with exponential backoff
+capped at five minutes. Offline members stop only after receiving the
+certificate; the command reports that destruction is recorded with delivery
+pending when applicable. Reusing the label with `init` creates a new UUID and
+identity.
+
+## Upgrade to version 3
+
+This is a forward-only breaking release. There is no migration or compatibility
+layer for previous configurations, invitations, certificates, or protocols.
+
+1. Stop old daemons and automatic transports on every host.
+2. Back up and manually move the old private configuration aside.
+3. Install version 3 on all hosts and initialize new networks.
+4. Issue fresh invitations and join the other hosts.
+5. Update SSH ProxyCommand entries to include the network label, then restart
+   daemons.
+
+esp never automatically deletes or migrates old configuration. Integration tests
+use temporary profiles and leave existing user networks untouched.
 
 ## Linux systemd
 
-Example user service at `~/.config/systemd/user/esp.service`:
+Example `~/.config/systemd/user/esp.service`:
 
 ```ini
 [Unit]
@@ -266,15 +234,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/esp daemon --ports 22
+ExecStart=%h/.cargo/bin/esp daemon
 Restart=on-failure
 RestartSec=5s
 
 [Install]
 WantedBy=default.target
 ```
-
-Enable and start it:
 
 ```sh
 systemctl --user daemon-reload
@@ -288,100 +254,28 @@ To keep user services running after logout:
 sudo loginctl enable-linger "$USER"
 ```
 
-## Leaving
+## Protocol and limits
 
-There is no leave command. Stop any daemon, close local SSH sessions, wait for
-the automatic transport to exit, and delete `~/.esp/config.yml`.
+Membership, policy, revocation, invitation, and configuration versions are 3.
+Network protocols use `esp/control/cbor/3`, `esp/tcp/cbor/3`, and
+`esp/destruction/cbor/3`. UUIDs and verified certificates are the authentication
+boundary; labels are used for local selection.
 
-## Security
+Remote messages use CBOR with two-byte big-endian lengths, capped at 65,535
+bytes. Version 3 local manager messages use four-byte lengths with an 8 MiB cap
+for multi-network reports. Every network-specific local request carries its
+UUID. Proxy setup requires a Ready/Error acknowledgement before raw TCP bytes.
+Admin peer pages contain at most 50 rows.
 
-`esp` is a reachability layer in front of SSH. SSH still authenticates users and
-encrypts SSH sessions, but esp decides which peers can ask the daemon to open a
-local TCP connection.
+Signed network policy bounds stored peers and certificates; shared directory
+and revocation messages are also bounded. Inbound work has a shared process
+budget and per-network peer quotas. Connections have handshake/setup deadlines
+and a one-hour idle timeout in each direction. TCP half-closes let pending
+responses finish after input EOF.
 
-- The daemon allows proxying to local port 22 only by default. Additional ports
-  must be explicitly allowed with `esp daemon --ports`.
-- Invite codes are short bearer bootstrap secrets containing the network id,
-  inviter node id, invite id, and invite secret. A successful join connects to
-  the inviter, consumes the invite there, fetches signed network policy and
-  membership chain data, and returns a signed membership certificate for the new
-  node. Membership certificates include the peer's role and allowed port list in
-  the signed payload.
-- The creator is an admin by default. Only admins can create invites, and admins
-  can grant either `peer` or `admin` with `esp invite "name" --role`.
-- Network creation signs a peer storage policy. `esp init --max-peers` sets the
-  initial known-peer cap, and admins can update it with `esp policy --max-peers`.
-- Invites grant port access per peer with `esp invite "name" --ports`. Proxy traffic is
-  accepted only when both the peer's signed membership and the daemon's local
-  `--ports` allow the requested port.
-- After join, peers authenticate esp membership with certificates signed by an
-  existing member and chained back to the network creator. Normal proxy requests
-  do not carry invite secrets.
-- Admins can revoke peers with `esp revoke TARGET`. Revocations are signed,
-  persisted, shared during control/proxy sync, and cause the daemon to close
-  active connections from the revoked node.
-- `esp status` asks the local transport (a daemon or automatic client helper)
-  first and shows whether it is running. If it is unavailable, it falls back to
-  the local config so peers can still inspect their node identity. The
-  `connected_peers` count measures distinct peers with established connections
-  observed by this host (zero without a running transport). Use `--peers` to
-  include the full known peer list. Older transports that do not report presence
-  show `null` in JSON or `unknown` in text until restarted. While a
-  transport is running, local `esp invite`,
-  `esp rename`, `esp revoke`, `esp policy`, and existing-config `esp init`
-  commands use its private local control socket instead of writing
-  `~/.esp/config.yml` directly.
-- Admins act as the peer directory. Generic hellos from peers carry only their
-  self identity, membership chain, signed network policy, and revocations; only
-  admins may advertise additional peers and membership certificates.
-- Shared peer, certificate, and revocation lists are capped per message, and
-  total stored peers/certificates are capped by signed network policy. Duplicate
-  connection ids are rejected.
-- The daemon bounds inbound work with small `try_send`-based worker queues,
-  configurable per-peer concurrent connection quotas, handshake/setup read
-  timeouts, and a one-hour idle timeout in each direction on proxy byte streams.
-  The local request setup timeout does not limit the lifetime of an established
-  tunnel. TCP half-closes allow pending responses to finish after input EOF.
-- `~/.esp/config.yml` contains this host's private iroh key and, while a join is
-  pending, may contain an unused invite proof. esp writes this file atomically
-  with `0600` permissions and refuses to use configs with group/world access,
-  symlinks, or hard links. Pending invite proofs are sent only during the
-  explicit join sync to the inviter. Keep the file private and do not share it
-  between machines.
-- Duplicate peer names are allowed, so use the six-character connection id when
-  a name is ambiguous.
-
-## Notes
-
-- Control messages, TCP proxy setup requests, and local daemon requests use CBOR
-  encoded with `minicbor`. Local request discriminants start at 16 for version 2,
-  so older daemons reject new requests instead of ignoring named-invite fields.
-  Each message has a two-byte big-endian payload length
-  followed by one CBOR value, capped at 65,535 bytes. Proxy setup includes a
-  remote Ready/Error acknowledgement before SSH data starts as a raw byte stream.
-  Admin lists are fetched in pages of at most 50 peers.
-- Invites and signed records use derived CBOR arrays. UUIDs, signatures, and
-  invite secrets retain their string representations; endpoint keys use byte
-  strings. Invite codes and the signed-record fields in
-  `~/.esp/config.yml` contain URL-safe base64 of these CBOR values. Rust
-  `#[n(...)]` annotations define the field and variant numbers.
-- Named invites and administration use configuration, invite, and membership
-  format version 2. Update all hosts, stop existing transports, and recreate
-  the network and invites before rejoining peers and restarting transports.
-  Back up the old private configuration before manually moving it aside.
-  Existing state is never automatically deleted or migrated. Old configs and
-  invites are rejected, and mixed-version transports are not supported.
-  The network protocols are `esp/control/cbor/2` and `esp/tcp/cbor/2`.
-- SSH bytes are carried over iroh QUIC streams. esp lets iroh try direct
-  connections first and use relays when a direct path is unavailable.
-- The daemon allows proxying to local port 22 only unless additional ports are
-  passed with `esp daemon --ports`.
-- The inviter accepts invited peers by checking the random network id and issued
-  invite proof, then signs a membership certificate bound to the joining node
-  id, connection id, role, allowed ports, admin label, invite ID, and join time.
-  Only admins can issue invites.
-- Hosts exchange signed policy, minimal membership identity, and signed
-  revocations during join, control sync, and proxy connection setup. Admins can
-  additionally publish the peer directory.
-- Shared peer, certificate, and revocation lists are capped at 100 entries per
-  message. Total stored peers are capped by signed network policy.
+Invites are bearer bootstrap secrets. Successful joining pins the creator,
+consumes the invitation, and obtains signed membership. Established peers use
+membership certificates instead of invite secrets. Only administrators may
+advertise the peer directory; ordinary members share their own membership chain
+and signed policy/revocations. iroh tries direct paths and can use relays when
+needed.

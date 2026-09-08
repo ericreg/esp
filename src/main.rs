@@ -34,8 +34,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter};
 
-const CONTROL_ALPN: &[u8] = b"esp/control/cbor/2";
-const TCP_ALPN: &[u8] = b"esp/tcp/cbor/2";
+const CONTROL_ALPN: &[u8] = b"esp/control/cbor/3";
+const TCP_ALPN: &[u8] = b"esp/tcp/cbor/3";
 const ESP_DIR: &str = ".esp";
 const CONFIG_FILE: &str = "config.yml";
 const LOG_DIR: &str = "logs";
@@ -49,11 +49,12 @@ const PRIVATE_DIR_MODE: u32 = 0o700;
 pub const DEFAULT_ALLOWED_PORT: u16 = 22;
 const MAX_PROXY_REQUEST_LEN: usize = 64 * 1024 - 1;
 const MAX_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
-const MAX_LOCAL_CONTROL_MESSAGE_LEN: usize = 64 * 1024 - 1;
+const MAX_LOCAL_CONTROL_MESSAGE_LEN: usize = 8 * 1024 * 1024;
 const CONFIG_ACTOR_QUEUE: usize = 64;
 const INCOMING_WORKERS: usize = 64;
-const INCOMING_WORKER_QUEUE: usize = 1;
 const PEER_QUOTA_QUEUE: usize = 256;
+#[cfg(test)]
+#[allow(dead_code)]
 const DEFAULT_MAX_CONNECTIONS_PER_PEER: usize = 8;
 const LOCAL_CONTROL_SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const PROXY_TRANSPORT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,14 +65,14 @@ pub const MAX_SHARED_PEERS: usize = 100;
 pub const DEFAULT_MAX_KNOWN_PEERS: usize = 100;
 const ABSOLUTE_MAX_KNOWN_PEERS: usize = 1000;
 const GRACEFUL_CLOSE: VarInt = VarInt::from_u32(0);
-const CONFIG_VERSION: u8 = 2;
-const INVITE_VERSION: u8 = 2;
-const MEMBERSHIP_CERTIFICATE_VERSION: u8 = 2;
-const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/2";
-const NETWORK_POLICY_VERSION: u8 = 1;
-const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/1";
-const REVOCATION_CERTIFICATE_VERSION: u8 = 1;
-const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/1";
+const CONFIG_VERSION: u8 = 3;
+const INVITE_VERSION: u8 = 3;
+const MEMBERSHIP_CERTIFICATE_VERSION: u8 = 3;
+const MEMBERSHIP_SIGNATURE_CONTEXT: &str = "esp/membership/3";
+const NETWORK_POLICY_VERSION: u8 = 3;
+const NETWORK_POLICY_SIGNATURE_CONTEXT: &str = "esp/network-policy/3";
+const REVOCATION_CERTIFICATE_VERSION: u8 = 3;
+const REVOCATION_SIGNATURE_CONTEXT: &str = "esp/revocation/3";
 const MAX_SHARED_REVOCATIONS: usize = 100;
 const CONNECTION_ID_ALPHABET: &[u8; 62] =
     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
@@ -79,6 +80,8 @@ static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 mod admin;
 mod cbor;
+mod destruction;
+mod networks;
 mod output;
 mod status_output;
 #[cfg(unix)]
@@ -93,7 +96,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Create ~/.esp/config.yml if needed.
+    /// Create an independently stored network.
     Init {
         /// Admin label for this network.
         network_label: String,
@@ -113,14 +116,15 @@ enum Command {
     /// Run the TCP proxy daemon. This is also the default command.
     Daemon {
         /// Localhost ports peers may connect to through this daemon.
-        #[arg(long, value_delimiter = ',', default_value = "22")]
-        ports: Vec<u16>,
+        #[arg(long, value_delimiter = ',')]
+        ports: Option<Vec<u16>>,
         /// Maximum concurrent incoming connections from each peer, including control syncs.
-        #[arg(long, default_value = "8")]
-        max_connections_per_peer: NonZeroUsize,
+        #[arg(long)]
+        max_connections_per_peer: Option<NonZeroUsize>,
     },
     /// Proxy stdio to localhost:PORT on a peer over iroh.
     Proxy {
+        network: String,
         /// Peer name or six-character connection id from the esp config.
         target: String,
         /// TCP port to connect to on the peer's localhost.
@@ -132,12 +136,14 @@ enum Command {
     ProxyTransport,
     /// Rename this host in esp.
     Rename {
+        network: String,
         name: String,
         #[command(flatten)]
         output: output::Arguments,
     },
     /// Revoke a peer by name, connection id, or node id.
     Revoke {
+        network: String,
         /// Peer name, six-character connection id, or full node id to revoke.
         target: String,
         #[command(flatten)]
@@ -145,6 +151,7 @@ enum Command {
     },
     /// Update signed network policy as an admin.
     Policy {
+        network: String,
         /// Maximum number of remote peers this network should remember.
         #[arg(long)]
         max_peers: usize,
@@ -153,6 +160,7 @@ enum Command {
     },
     /// Print a fresh invite code for the configured network.
     Invite {
+        network: String,
         /// Admin label assigned to the invited peer (separate from its hostname).
         name: String,
         /// Localhost ports this invited peer may connect to on esp daemons.
@@ -165,9 +173,20 @@ enum Command {
         output: output::Arguments,
     },
     /// Browse the network and revoke peers in an interactive terminal.
-    Admin,
+    Admin { network: Option<String> },
+    /// Remove a network locally, or permanently destroy it for all members.
+    Destroy {
+        network: String,
+        #[arg(long)]
+        global: bool,
+        #[arg(long)]
+        yes: bool,
+        #[command(flatten)]
+        output: output::Arguments,
+    },
     /// Print local esp information.
     Status {
+        network: Option<String>,
         #[command(flatten)]
         output: output::Arguments,
         /// Include the full peer list in addition to the connected peer count.
@@ -181,7 +200,9 @@ enum Command {
 pub struct Config {
     pub version: u8,
     #[serde(default)]
-    pub format: output::FormatConfig,
+    pub transport: networks::TransportOverrides,
+    #[serde(default)]
+    pub destruction: Option<destruction::Record>,
     pub network_id: String,
     pub secret_key: String,
     pub network_policy: NetworkPolicyCertificate,
@@ -245,6 +266,8 @@ pub struct Invite {
     #[n(5)]
     #[cbor(with = "cbor::endpoint_id")]
     pub inviter_node_id: EndpointId,
+    #[n(6)]
+    pub network_label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Encode, Decode)]
@@ -440,6 +463,8 @@ struct Hello {
     peers: Vec<Peer>,
     #[n(8)]
     revocations: Vec<RevocationCertificate>,
+    #[n(9)]
+    network_label: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
@@ -534,7 +559,7 @@ struct StatusReport {
     #[n(7)]
     #[cbor(with = "cbor::endpoint_ids")]
     revocations: Vec<EndpointId>,
-    /// None when an older transport does not report live presence.
+    /// None when live presence is unavailable.
     #[n(8)]
     connected_peers: Option<usize>,
     #[n(9)]
@@ -575,6 +600,20 @@ struct ConfigActorHandle {
 }
 
 enum ConfigActorCommand {
+    Snapshot {
+        respond: oneshot::Sender<Result<Config>>,
+    },
+    Stop {
+        respond: oneshot::Sender<Result<()>>,
+    },
+    Destroy {
+        certificate: Option<destruction::Certificate>,
+        respond: oneshot::Sender<Result<()>>,
+    },
+    Delivered {
+        node_id: EndpointId,
+        respond: oneshot::Sender<Result<()>>,
+    },
     PrepareProxy {
         target: String,
         port: u16,
@@ -658,6 +697,9 @@ struct PeerQuotaPermit {
 }
 
 enum PeerQuotaCommand {
+    SetLimit {
+        max: usize,
+    },
     TryAcquire {
         peer_id: EndpointId,
         respond: oneshot::Sender<bool>,
@@ -669,8 +711,7 @@ enum PeerQuotaCommand {
 
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
-// Version 2 uses new discriminants so old daemons cannot accept named-invite
-// requests while silently ignoring the new label field.
+// Network operations are carried inside the version 3 UUID-addressed manager envelope.
 enum LocalControlRequest {
     #[n(16)]
     Proxy {
@@ -836,18 +877,6 @@ impl LocalControlResponse {
         }
     }
 
-    fn err(error: String) -> Self {
-        Self {
-            error: Some(error),
-            status: None,
-            renamed: None,
-            invite_code: None,
-            revoked: None,
-            policy: None,
-            admin: None,
-        }
-    }
-
     fn into_result(self) -> Result<LocalControlOk> {
         if let Some(error) = self.error {
             bail!(error);
@@ -877,44 +906,15 @@ impl LocalControlResponse {
 }
 
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Command::Daemon {
-        ports: vec![DEFAULT_ALLOWED_PORT],
-        max_connections_per_peer: NonZeroUsize::new(DEFAULT_MAX_CONNECTIONS_PER_PEER).unwrap(),
+    let command = Cli::parse().command.unwrap_or(Command::Daemon {
+        ports: None,
+        max_connections_per_peer: None,
     });
-    let is_daemon = matches!(command, Command::Daemon { .. } | Command::Admin);
+    let is_daemon = matches!(command, Command::Daemon { .. } | Command::Admin { .. });
     #[cfg(unix)]
     let is_daemon = is_daemon || matches!(command, Command::ProxyTransport);
     let _logging_guard = init_logging(is_daemon)?;
-
-    match command {
-        Command::Init {
-            network_label,
-            max_peers,
-            output,
-        } => init(&network_label, max_peers, output.resolve_from_config()?).await,
-        Command::Join { invite, output } => join(&invite, output.resolve_from_config()?).await,
-        Command::Daemon {
-            ports,
-            max_connections_per_peer,
-        } => daemon(ports, max_connections_per_peer.get()).await,
-        Command::Proxy { target, port } => proxy(target, port).await,
-        #[cfg(unix)]
-        Command::ProxyTransport => transport::run().await,
-        Command::Rename { name, output } => rename(&name, output.resolve_from_config()?).await,
-        Command::Revoke { target, output } => revoke(&target, output.resolve_from_config()?).await,
-        Command::Policy { max_peers, output } => {
-            update_policy(max_peers, output.resolve_from_config()?).await
-        }
-        Command::Invite {
-            name,
-            ports,
-            role,
-            output,
-        } => print_invite(&name, &ports, role, output.resolve_from_config()?).await,
-        Command::Admin => admin::run().await,
-        Command::Status { output, peers } => status(output.resolve_from_config()?, peers).await,
-    }
+    networks::execute(command).await
 }
 
 fn init_logging(daemon: bool) -> Result<Option<WorkerGuard>> {
@@ -948,56 +948,6 @@ fn env_filter_with_default(default_level: LevelFilter) -> EnvFilter {
         .from_env_lossy()
 }
 
-async fn init(network_label: &str, max_peers: usize, output: output::Options) -> Result<()> {
-    let network_label = normalize_network_label(network_label)?;
-    validate_max_known_peers(max_peers)?;
-    let path = config_path()?;
-    if path.exists()
-        && let Some(mut report) = request_daemon_status().await?
-    {
-        ensure_network_label_matches(report.network_label.as_deref(), &network_label)?;
-        if report.network_label.is_none() {
-            let updated =
-                request_daemon_policy_update(report.max_peers, Some(network_label.clone()))
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("transport stopped while assigning network label; retry init")
-                    })?;
-            if updated.network_label.as_deref() != Some(&network_label) {
-                bail!(
-                    "restart the transport with the updated esp binary to assign a network label"
-                );
-            }
-            report.network_label = updated.network_label;
-        }
-        return print_init_report(&path, &report, output);
-    }
-
-    let mut cfg = if path.exists() {
-        Config::load(&path)?
-    } else {
-        create_creator_config(
-            &SecretKey::generate(),
-            Uuid::new_v4().to_string(),
-            default_connection_name(),
-            generate_connection_id(),
-            max_peers,
-        )?
-    };
-    ensure_network_label_matches(cfg.network_policy.admin_label.as_deref(), &network_label)?;
-    let mut peers = Vec::new();
-    if cfg.network_policy.admin_label.is_none() {
-        peers = cfg
-            .issue_network_policy_with_label(cfg.max_known_peers()?, Some(network_label))?
-            .peers;
-        cfg.save(&path)?;
-    }
-    cfg.validate_local_config()?;
-    print_init_report(&path, &status_report_from_config(&cfg)?, output)?;
-    broadcast_control_sync_from_file(&path, peers).await;
-    Ok(())
-}
-
 fn normalize_network_label(label: &str) -> Result<String> {
     normalize_connection_name(label).context("invalid network label")
 }
@@ -1009,59 +959,6 @@ fn ensure_network_label_matches(existing: Option<&str>, requested: &str) -> Resu
         bail!("network is already labeled {existing:?}; init cannot rename it");
     }
     Ok(())
-}
-
-async fn join(invite_code: &str, output: output::Options) -> Result<()> {
-    let path = config_path()?;
-    if path.exists() {
-        bail!(
-            "{} already exists; delete it first to leave the current esp network",
-            path.display()
-        );
-    }
-
-    let invite = Invite::decode(invite_code)?;
-    let secret_key = SecretKey::generate();
-    let creator_node_id = invite.creator_node_id;
-    let connection_id = generate_connection_id();
-    let mut cfg = Config {
-        format: output::FormatConfig::default(),
-        version: CONFIG_VERSION,
-        network_id: invite.network_id.clone(),
-        network_policy: pending_join_network_policy(&invite.network_id, creator_node_id),
-        secret_key: encode_secret_key(&secret_key),
-        creator_node_id,
-        invite_proof: Some(InviteProof {
-            invite_id: invite.invite_id,
-            invite_secret: invite.invite_secret,
-        }),
-        membership: None,
-        memberships: Vec::new(),
-        name: default_connection_name(),
-        connection_id: connection_id.clone(),
-        invites: Vec::new(),
-        peer_last_connected: HashMap::new(),
-        peers: vec![Peer {
-            node_id: invite.inviter_node_id,
-            name: String::new(),
-            connection_id: String::new(),
-        }],
-        revocations: Vec::new(),
-    };
-    let inviter = cfg.peers[0].clone();
-
-    sync_joined_config_once(&mut cfg, &inviter)
-        .await
-        .context("failed to complete join sync")?;
-    if path.exists() {
-        bail!(
-            "{} was created while joining; refusing to overwrite it",
-            path.display()
-        );
-    }
-    save_completed_join(&path, &cfg)?;
-
-    output.print(&join_report(&path, &cfg)?)
 }
 
 fn join_report(path: &Path, cfg: &Config) -> Result<serde_json::Value> {
@@ -1086,222 +983,33 @@ fn join_report(path: &Path, cfg: &Config) -> Result<serde_json::Value> {
     }))
 }
 
-async fn rename(name: &str, output: output::Options) -> Result<()> {
-    if let Some(identity) = request_daemon_rename(name).await? {
-        print_identity(&identity, output)?;
-        return Ok(());
-    }
-
-    let path = config_path()?;
-    let mut cfg = Config::load(&path)?;
-    cfg.name = normalize_connection_name(name)?;
-    cfg.save(&path)?;
-    let identity = host_identity_from_config(&cfg);
-    print_identity(&identity, output)?;
-    Ok(())
-}
-
-async fn print_invite(
-    name: &str,
-    ports: &[u16],
-    role: MembershipRole,
-    output: output::Options,
-) -> Result<()> {
-    let allowed_ports = normalize_allowed_ports(ports)?;
-    if let Some(code) = request_daemon_invite(name, &allowed_ports, role).await? {
-        output.print(&serde_json::json!({ "invite_code": code }))?;
-        return Ok(());
-    }
-
-    let path = config_path()?;
-    let mut cfg = Config::load(&path)?;
-    let invite = cfg.issue_invite(name, &allowed_ports, role)?;
-    cfg.save(&path)?;
-    output.print(&serde_json::json!({ "invite_code": invite.code }))?;
-    Ok(())
-}
-
-async fn revoke(target: &str, output: output::Options) -> Result<()> {
-    if let Some(report) = request_daemon_revoke(target).await? {
-        print_revocation_report(&report, output)?;
-        return Ok(());
-    }
-
-    let path = config_path()?;
-    let mut cfg = Config::load(&path)?;
-    let report = cfg.issue_revocation(target)?;
-    let peers = report.peers.clone();
-    cfg.save(&path)?;
-    print_revocation_report(&report, output)?;
-    broadcast_control_sync_from_file(&path, peers).await;
-    Ok(())
-}
-
-async fn update_policy(max_peers: usize, output: output::Options) -> Result<()> {
-    validate_max_known_peers(max_peers)?;
-    if let Some(report) = request_daemon_policy_update(max_peers, None).await? {
-        print_policy_report(&report, output)?;
-        return Ok(());
-    }
-
-    let path = config_path()?;
-    let mut cfg = Config::load(&path)?;
-    let report = cfg.issue_network_policy(max_peers)?;
-    let peers = report.peers.clone();
-    cfg.save(&path)?;
-    print_policy_report(&report, output)?;
-    broadcast_control_sync_from_file(&path, peers).await;
-    Ok(())
-}
-
-async fn status(output: output::Options, peers: bool) -> Result<()> {
-    let path = config_path()?;
-    if let Some(report) = request_daemon_status().await? {
-        println!(
-            "{}",
-            status_output::render(&path, &report, true, output.format, output.no_color, peers)?
-        );
-        return Ok(());
-    }
-
-    let cfg = Config::load(&path)?;
-    let report = status_report_from_config(&cfg)?;
-    println!(
-        "{}",
-        status_output::render(&path, &report, false, output.format, output.no_color, peers)?
-    );
-    Ok(())
-}
-
-async fn request_daemon_status() -> Result<Option<StatusReport>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::Status).await? else {
-        return Ok(None);
-    };
-    match response {
-        LocalControlOk::Status { report } => Ok(Some(report)),
-        _ => bail!("daemon returned unexpected response to status request"),
-    }
-}
-
-async fn request_daemon_rename(name: &str) -> Result<Option<HostIdentity>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::Rename {
-        name: name.to_string(),
-    })
-    .await?
-    else {
-        return Ok(None);
-    };
-    match response {
-        LocalControlOk::Renamed {
-            name,
-            connection_id,
-        } => Ok(Some(HostIdentity {
-            name,
-            connection_id,
-        })),
-        _ => bail!("daemon returned unexpected response to rename request"),
-    }
-}
-
-async fn request_daemon_invite(
-    name: &str,
-    ports: &[u16],
-    role: MembershipRole,
-) -> Result<Option<String>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::IssueInvite {
-        name: normalize_connection_name(name)?,
-        ports: ports.to_vec(),
-        role,
-    })
-    .await?
-    else {
-        return Ok(None);
-    };
-    match response {
-        LocalControlOk::Invite { code } => Ok(Some(code)),
-        _ => bail!("daemon returned unexpected response to invite request"),
-    }
-}
-
-async fn request_daemon_revoke(target: &str) -> Result<Option<RevocationReport>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::Revoke {
-        target: target.to_string(),
-    })
-    .await?
-    else {
-        return Ok(None);
-    };
-    match response {
-        LocalControlOk::Revoked { report } => Ok(Some(report)),
-        _ => bail!("daemon returned unexpected response to revoke request"),
-    }
-}
-
-async fn request_daemon_policy_update(
-    max_peers: usize,
-    network_label: Option<String>,
-) -> Result<Option<NetworkPolicyReport>> {
-    let Some(response) = send_local_control_request(LocalControlRequest::UpdatePolicy {
-        max_peers,
-        network_label,
-    })
-    .await?
-    else {
-        return Ok(None);
-    };
-    match response {
-        LocalControlOk::PolicyUpdated { report } => Ok(Some(report)),
-        _ => bail!("daemon returned unexpected response to policy request"),
-    }
-}
-
-async fn send_local_control_request(
-    request: LocalControlRequest,
-) -> Result<Option<LocalControlOk>> {
-    #[cfg(unix)]
-    {
-        let path = local_control_socket_path()?;
-        send_local_control_request_to_path(&path, request).await
-    }
-
-    #[cfg(not(unix))]
-    {
-        drop(request);
-        Ok(None)
-    }
-}
-
 #[cfg(unix)]
+#[cfg(test)]
+#[allow(dead_code)]
 async fn send_local_control_request_to_path(
     path: &Path,
     request: LocalControlRequest,
 ) -> Result<Option<LocalControlOk>> {
-    let mut stream = match UnixStream::connect(path).await {
-        Ok(stream) => stream,
-        Err(err) if is_local_control_unavailable(&err) => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to connect to {}", path.display()));
-        }
+    let Some(response) = networks::send_to(
+        path,
+        &networks::Request::Status {
+            id: None,
+            peers: false,
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
     };
-    timeout(Duration::from_secs(5), async {
-        write_cbor_frame(
-            &mut stream,
-            &request,
-            MAX_LOCAL_CONTROL_MESSAGE_LEN,
-            "local esp control request",
-        )
-        .await?;
-
-        let response: LocalControlResponse = read_cbor_frame(
-            &mut stream,
-            MAX_LOCAL_CONTROL_MESSAGE_LEN,
-            "local esp control response (restart the transport if it uses an older esp version)",
-        )
-        .await?;
-        response.into_result().map(Some)
-    })
-    .await
-    .context("timed out waiting for local esp control response")?
+    let status = response.json()?;
+    let id = status["networks"][0]["network_id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("test network missing"))?
+        .to_string();
+    networks::send_to(path, &networks::Request::Network { id, request })
+        .await?
+        .map(networks::Response::network)
+        .transpose()
 }
 
 #[cfg(unix)]
@@ -1320,6 +1028,7 @@ fn host_identity_from_config(cfg: &Config) -> HostIdentity {
 }
 
 fn create_creator_config(
+    network_label: &str,
     secret_key: &SecretKey,
     network_id: String,
     name: String,
@@ -1343,10 +1052,15 @@ fn create_creator_config(
         &[DEFAULT_ALLOWED_PORT],
         MembershipRole::Admin,
     )?;
-    let network_policy =
-        NetworkPolicyCertificate::issue_for_network(&network_id, secret_key, max_peers)?;
+    let network_policy = NetworkPolicyCertificate::issue_for_network(
+        &network_id,
+        secret_key,
+        max_peers,
+        network_label,
+    )?;
     let cfg = Config {
-        format: output::FormatConfig::default(),
+        transport: networks::TransportOverrides::default(),
+        destruction: None,
         version: CONFIG_VERSION,
         network_id,
         secret_key: encode_secret_key(secret_key),
@@ -1369,7 +1083,7 @@ fn create_creator_config(
 fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
     Ok(StatusReport {
         network_label: cfg.network_policy.admin_label.clone(),
-        connected_peers: Some(0),
+        connected_peers: None,
         network_id: cfg.network_id.clone(),
         max_peers: cfg.max_known_peers()?,
         name: cfg.name.clone(),
@@ -1387,17 +1101,6 @@ fn status_report_from_config(cfg: &Config) -> Result<StatusReport> {
             .map(|revocation| revocation.subject_node_id)
             .collect(),
     })
-}
-
-fn print_init_report(path: &Path, report: &StatusReport, output: output::Options) -> Result<()> {
-    output.print(&serde_json::json!({
-        "esp_config": path.display().to_string(),
-        "name": report.name,
-        "connection_id": report.connection_id,
-        "node_id": report.node_id.to_string(),
-        "network_label": report.network_label,
-        "next_step": "run `esp invite \"name\"` to create a named invite",
-    }))
 }
 
 fn print_identity(identity: &HostIdentity, output: output::Options) -> Result<()> {
@@ -1421,47 +1124,6 @@ fn print_policy_report(report: &NetworkPolicyReport, output: output::Options) ->
         "policy_issued_at": report.issued_at_unix,
         "network_label": report.network_label,
     }))
-}
-
-async fn daemon(allowed_ports: Vec<u16>, max_connections_per_peer: usize) -> Result<()> {
-    let allowed_ports = normalize_allowed_ports(&allowed_ports)?;
-    #[cfg(unix)]
-    let _transport_lock = transport::try_lock(&local_control_socket_path()?)?
-        .ok_or_else(|| anyhow!("an esp daemon or proxy transport is already running; close active proxies and wait for the transport to become idle before starting a daemon"))?;
-    #[cfg(unix)]
-    let (local_control_listener, _local_control_socket) =
-        prepare_local_control_socket().context("failed to start local esp control")?;
-
-    let path = config_path()?;
-    sync_pending_join_if_needed(&path).await?;
-    let cfg = Config::load(&path)?;
-    let secret_key = cfg.secret_key()?;
-    let actor = spawn_config_actor(path, cfg);
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .alpns(vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()])
-        .relay_mode(RelayMode::Default)
-        .bind()
-        .await
-        .context("failed to bind iroh endpoint")?;
-
-    info!(node_id = %endpoint.id(), "esp endpoint bound");
-    endpoint.online().await;
-    info!(addr = ?endpoint.addr(), "esp endpoint online");
-
-    #[cfg(unix)]
-    let local_control_task =
-        spawn_local_control_server(local_control_listener, actor.clone(), endpoint.clone());
-
-    info!(ports = ?allowed_ports, max_connections_per_peer, "esp TCP proxy port allowlist active");
-    let accept_result = tokio::select! {
-        result = run_acceptor(endpoint.clone(), actor, allowed_ports, max_connections_per_peer) => result,
-        result = shutdown_signal() => result,
-    };
-    #[cfg(unix)]
-    local_control_task.abort();
-    endpoint.close().await;
-    accept_result
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -1502,6 +1164,8 @@ fn prepare_local_control_socket() -> Result<(UnixListener, LocalControlSocket)> 
 }
 
 #[cfg(unix)]
+#[cfg(test)]
+#[allow(dead_code)]
 fn spawn_local_control_server(
     listener: UnixListener,
     actor: ConfigActorHandle,
@@ -1558,6 +1222,8 @@ fn bind_local_control_socket(path: &Path) -> Result<UnixListener> {
 }
 
 #[cfg(unix)]
+#[cfg(test)]
+#[allow(dead_code)]
 async fn run_local_control_server(
     listener: UnixListener,
     actor: ConfigActorHandle,
@@ -1602,12 +1268,14 @@ async fn run_local_control_server(
 }
 
 #[cfg(unix)]
+#[cfg(test)]
+#[allow(dead_code)]
 async fn handle_local_control_connection(
     mut stream: UnixStream,
     actor: ConfigActorHandle,
     endpoint: Endpoint,
 ) -> Result<()> {
-    let request = timeout(
+    let request: networks::Request = timeout(
         LOCAL_CONTROL_SETUP_TIMEOUT,
         read_cbor_frame(
             &mut stream,
@@ -1617,88 +1285,50 @@ async fn handle_local_control_connection(
     )
     .await
     .context("timed out reading local esp control request")??;
+    let cfg = actor
+        .request(|respond| ConfigActorCommand::Snapshot { respond })
+        .await?;
+    if let networks::Request::Status { .. } = request {
+        let report = actor.status().await?;
+        let value = networks::status_value(
+            Path::new("test-network.yml"),
+            &cfg,
+            &report,
+            "running",
+            false,
+            false,
+            None,
+        );
+        return write_cbor_frame(
+            &mut stream,
+            &networks::Response::Report(
+                serde_json::json!({"daemon": "serving", "networks": [value]}).to_string(),
+            ),
+            MAX_LOCAL_CONTROL_MESSAGE_LEN,
+            "test manager response",
+        )
+        .await;
+    }
+    let networks::Request::Network { id, request } = request else {
+        bail!("unsupported fixture request");
+    };
+    if id != cfg.network_id {
+        bail!("wrong network UUID");
+    }
     if let LocalControlRequest::Proxy { target, port } = request {
         return handle_local_proxy_connection(stream, actor, endpoint, target, port).await;
     }
-    timeout(LOCAL_CONTROL_SETUP_TIMEOUT, async {
-        let result = match request {
-            LocalControlRequest::Admin { request } => actor
-                .request(|respond| ConfigActorCommand::Admin { request, respond })
-                .await
-                .map(|report| LocalControlOk::Admin { report }),
-            LocalControlRequest::Status => actor
-                .status()
-                .await
-                .map(|report| LocalControlOk::Status { report }),
-            LocalControlRequest::Rename { name } => {
-                actor
-                    .rename(name)
-                    .await
-                    .map(|identity| LocalControlOk::Renamed {
-                        name: identity.name,
-                        connection_id: identity.connection_id,
-                    })
-            }
-            LocalControlRequest::IssueInvite { name, ports, role } => actor
-                .issue_invite(name, ports, role)
-                .await
-                .map(|invite| LocalControlOk::Invite { code: invite.code }),
-            LocalControlRequest::Revoke { target } => {
-                let result = actor.revoke(target).await;
-                if let Ok(report) = &result {
-                    spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
-                }
-                result.map(|mut report| {
-                    // The transport broadcasts to peers; clients only need the outcome.
-                    // Avoid returning the complete directory in a bounded local frame.
-                    report.peers.clear();
-                    LocalControlOk::Revoked { report }
-                })
-            }
-            LocalControlRequest::UpdatePolicy {
-                max_peers,
-                network_label,
-            } => {
-                let result = actor
-                    .update_policy_with_label(max_peers, network_label)
-                    .await;
-                if let Ok(report) = &result {
-                    spawn_control_sync_broadcast(endpoint, actor.clone(), report.peers.clone());
-                }
-                result.map(|report| LocalControlOk::PolicyUpdated { report })
-            }
-            LocalControlRequest::Proxy { .. } => {
-                unreachable!("proxy handled before control dispatch")
-            }
-        };
-        let response = match result {
-            Ok(ok) => LocalControlResponse::ok(ok),
-            Err(err) => LocalControlResponse::err(err.to_string()),
-        };
-        write_cbor_frame(
-            &mut stream,
-            &response,
-            MAX_LOCAL_CONTROL_MESSAGE_LEN,
-            "local esp control response (restart the transport if it uses an older esp version)",
-        )
-        .await?;
-        stream
-            .shutdown()
-            .await
-            .context("failed to finish local esp control response")?;
-        Ok(())
-    })
+    let response = match networks::dispatch_network(actor, endpoint, request).await {
+        Ok(r) => networks::Response::Network(LocalControlResponse::ok(r)),
+        Err(e) => networks::Response::Error(e.to_string()),
+    };
+    write_cbor_frame(
+        &mut stream,
+        &response,
+        MAX_LOCAL_CONTROL_MESSAGE_LEN,
+        "test network response",
+    )
     .await
-    .context("timed out handling local esp control request")?
-}
-
-async fn sync_joined_peer_once(path: &Path, inviter: &Peer) -> Result<()> {
-    let mut cfg = Config::load(path)?;
-    let changed = sync_joined_config_once(&mut cfg, inviter).await?;
-    if changed {
-        save_completed_join(path, &cfg)?;
-    }
-    Ok(())
 }
 
 async fn sync_joined_config_once(cfg: &mut Config, inviter: &Peer) -> Result<bool> {
@@ -1726,24 +1356,6 @@ async fn sync_joined_config_once(cfg: &mut Config, inviter: &Peer) -> Result<boo
     Ok(changed)
 }
 
-async fn sync_pending_join_if_needed(path: &Path) -> Result<()> {
-    let cfg = Config::load(path)?;
-    if cfg.membership.is_some() {
-        return Ok(());
-    }
-    if cfg.invite_proof.is_none() {
-        bail!("local host has no membership certificate");
-    }
-    let inviter = cfg
-        .peers
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("pending join config is missing inviter peer"))?;
-    sync_joined_peer_once(path, &inviter)
-        .await
-        .context("failed to complete pending join sync")
-}
-
 fn save_completed_join(path: &Path, cfg: &Config) -> Result<()> {
     ensure_completed_join(cfg)?;
     cfg.save(path)
@@ -1762,9 +1374,10 @@ fn ensure_completed_join(cfg: &Config) -> Result<()> {
 fn pending_join_network_policy(
     network_id: &str,
     creator_node_id: EndpointId,
+    network_label: &str,
 ) -> NetworkPolicyCertificate {
     NetworkPolicyCertificate {
-        admin_label: None,
+        admin_label: Some(network_label.into()),
         version: NETWORK_POLICY_VERSION,
         network_id: network_id.to_string(),
         max_peers: DEFAULT_MAX_KNOWN_PEERS,
@@ -1774,8 +1387,19 @@ fn pending_join_network_policy(
     }
 }
 
+static CONTROL_BROADCAST_BUDGET: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
 fn spawn_control_sync_broadcast(endpoint: Endpoint, actor: ConfigActorHandle, peers: Vec<Peer>) {
+    let budget = CONTROL_BROADCAST_BUDGET
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(8)))
+        .clone();
+    let Ok(permit) = budget.try_acquire_owned() else {
+        warn!(
+            "control broadcast budget full; signed changes will propagate on subsequent peer sync"
+        );
+        return;
+    };
     tokio::spawn(async move {
+        let _permit = permit;
         for peer in peers {
             if let Err(err) = sync_known_peer_from_actor(&endpoint, actor.clone(), &peer).await {
                 warn!(
@@ -1825,131 +1449,54 @@ async fn sync_known_peer_from_actor(
     result
 }
 
-async fn broadcast_control_sync_from_file(path: &Path, peers: Vec<Peer>) {
-    if peers.is_empty() {
-        return;
-    }
-    let result = async {
-        let cfg = Config::load(path)?;
-        let secret_key = cfg.secret_key()?;
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .relay_mode(RelayMode::Default)
-            .bind()
-            .await
-            .context("failed to bind iroh endpoint for revocation broadcast")?;
-        for peer in peers {
-            if let Err(err) = sync_known_peer_from_file(&endpoint, path, &peer).await {
-                warn!(
-                    peer = %peer.node_id,
-                    error = %err,
-                    "failed to broadcast esp control sync"
-                );
-            }
-        }
-        endpoint.close().await;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-    if let Err(err) = result {
-        warn!(error = %err, "failed to broadcast esp revocation");
-    }
-}
-
-async fn sync_known_peer_from_file(
-    endpoint: &Endpoint,
-    path: &Path,
-    expected_peer: &Peer,
-) -> Result<()> {
-    let conn = endpoint
-        .connect(expected_peer.node_id, CONTROL_ALPN)
-        .await
-        .with_context(|| format!("failed to connect to esp peer {}", expected_peer.node_id))?;
-    sync_control_client(&conn, path, expected_peer, false).await?;
-    conn.close(GRACEFUL_CLOSE, b"synced");
-    Ok(())
-}
-
+#[cfg(test)]
+#[allow(dead_code)]
 async fn run_acceptor(
     endpoint: Endpoint,
     actor: ConfigActorHandle,
     allowed_ports: Vec<u16>,
     max_connections_per_peer: usize,
 ) -> Result<()> {
-    let peer_quota = spawn_peer_quota_actor(max_connections_per_peer);
-    let mut incoming_queue = spawn_incoming_workers(actor, allowed_ports, peer_quota);
-    info!("accepting esp control and TCP proxy connections");
-    while let Some(incoming) = endpoint.accept().await {
-        if let Some(incoming) = incoming_queue.try_enqueue(incoming) {
-            incoming.refuse();
-            warn!("incoming esp connection queue full; refused connection");
-        }
-    }
-    Ok(())
+    let (_settings, receiver) = tokio::sync::watch::channel(networks::TransportSettings {
+        ports: allowed_ports,
+        max_connections_per_peer,
+    });
+    run_acceptor_dynamic(endpoint, actor, receiver).await
 }
 
-struct IncomingConnectionQueue {
-    workers: Vec<mpsc::Sender<Incoming>>,
-    next_worker: usize,
-}
-
-impl IncomingConnectionQueue {
-    fn try_enqueue(&mut self, incoming: Incoming) -> Option<Incoming> {
-        let mut incoming = Some(incoming);
-        for offset in 0..self.workers.len() {
-            let worker = (self.next_worker + offset) % self.workers.len();
-            match self.workers[worker].try_send(incoming.take().expect("incoming is present")) {
-                Ok(()) => {
-                    self.next_worker = (worker + 1) % self.workers.len();
-                    return None;
-                }
-                Err(mpsc::error::TrySendError::Full(value)) => {
-                    incoming = Some(value);
-                }
-                Err(mpsc::error::TrySendError::Closed(value)) => {
-                    incoming = Some(value);
-                }
+// One process-wide admission budget shared across all network endpoints.
+static INCOMING_BUDGET: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+async fn run_acceptor_dynamic(
+    endpoint: Endpoint,
+    actor: ConfigActorHandle,
+    mut settings: tokio::sync::watch::Receiver<networks::TransportSettings>,
+) -> Result<()> {
+    let quota = spawn_peer_quota_actor(settings.borrow().max_connections_per_peer);
+    let budget = INCOMING_BUDGET
+        .get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(INCOMING_WORKERS)))
+        .clone();
+    let mut jobs = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break; };
+                let Ok(permit) = budget.clone().try_acquire_owned() else { incoming.refuse(); continue; };
+                let current = settings.borrow_and_update().clone();
+                quota.sender.send(PeerQuotaCommand::SetLimit { max: current.max_connections_per_peer }).await.map_err(|_| anyhow!("peer quota stopped"))?;
+                let (actor, quota, ports) = (actor.clone(), quota.clone(), current.ports);
+                jobs.spawn(async move { let _permit = permit; if let Err(e) = handle_incoming_connection(incoming, actor, &ports, &quota).await { warn!(error = %e, "network session ended"); } });
             }
-        }
-        Some(incoming.expect("incoming is returned when all workers are full"))
-    }
-}
-
-fn spawn_incoming_workers(
-    actor: ConfigActorHandle,
-    allowed_ports: Vec<u16>,
-    peer_quota: PeerQuotaHandle,
-) -> IncomingConnectionQueue {
-    let mut workers = Vec::with_capacity(INCOMING_WORKERS);
-    for _ in 0..INCOMING_WORKERS {
-        let (sender, receiver) = mpsc::channel(INCOMING_WORKER_QUEUE);
-        workers.push(sender);
-        tokio::spawn(run_incoming_worker(
-            receiver,
-            actor.clone(),
-            allowed_ports.clone(),
-            peer_quota.clone(),
-        ));
-    }
-    IncomingConnectionQueue {
-        workers,
-        next_worker: 0,
-    }
-}
-
-async fn run_incoming_worker(
-    mut receiver: mpsc::Receiver<Incoming>,
-    actor: ConfigActorHandle,
-    allowed_ports: Vec<u16>,
-    peer_quota: PeerQuotaHandle,
-) {
-    while let Some(incoming) = receiver.recv().await {
-        if let Err(err) =
-            handle_incoming_connection(incoming, actor.clone(), &allowed_ports, &peer_quota).await
-        {
-            warn!(error = %format_args!("{err:#}"), "esp connection stopped");
+            result = settings.changed() => {
+                if result.is_err() { break; }
+                let max = settings.borrow().max_connections_per_peer;
+                let _ = quota.sender.send(PeerQuotaCommand::SetLimit { max }).await;
+            }
+            _ = jobs.join_next(), if !jobs.is_empty() => {},
         }
     }
+    jobs.abort_all();
+    while jobs.join_next().await.is_some() {}
+    Ok(())
 }
 
 async fn handle_incoming_connection(
@@ -1977,6 +1524,9 @@ async fn handle_incoming_connection(
         warn!(peer = %peer_id, "peer connection quota exceeded");
         return Ok(());
     };
+    if conn.alpn() == destruction::ALPN {
+        return destruction::receive(conn, actor).await;
+    }
     let close_conn = conn.clone();
     let mut active_connection = match actor.register_connection(peer_id).await {
         Ok(active_connection) => active_connection,
@@ -2022,6 +1572,8 @@ async fn handle_control_connection(
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 async fn sync_control_client(
     conn: &Connection,
     path: &Path,
@@ -2173,6 +1725,55 @@ async fn run_config_actor(
     let mut established = HashMap::<EndpointId, HashSet<Uuid>>::new();
     while let Some(command) = receiver.recv().await {
         match command {
+            ConfigActorCommand::Snapshot { respond } => {
+                let _ = respond.send(Ok(cfg.clone()));
+            }
+            ConfigActorCommand::Stop { respond } => {
+                active_connections.clear();
+                let _ = respond.send(Ok(()));
+                break;
+            }
+            ConfigActorCommand::Destroy {
+                certificate,
+                respond,
+            } => {
+                let result = (|| {
+                    if let Some(certificate) = &certificate {
+                        certificate.verify(&cfg)?;
+                    }
+                    if cfg.destruction.is_some() {
+                        return Ok(());
+                    }
+                    let certificate = match certificate {
+                        Some(c) => c,
+                        None => destruction::Certificate::issue(&cfg)?,
+                    };
+                    certificate.verify(&cfg)?;
+                    let mut next = cfg.clone();
+                    next.destruction = Some(destruction::Record::new(certificate, &cfg.peers));
+                    next.invites.clear();
+                    next.transport = Config::load(&path)?.transport;
+                    next.save(&path)?;
+                    cfg = next;
+                    active_connections.clear();
+                    established.clear();
+                    Ok(())
+                })();
+                let _ = respond.send(result);
+            }
+            ConfigActorCommand::Delivered { node_id, respond } => {
+                let result = (|| {
+                    let mut next = cfg.clone();
+                    if let Some(record) = &mut next.destruction {
+                        record.pending.retain(|id| *id != node_id);
+                    }
+                    next.transport = Config::load(&path)?.transport;
+                    next.save(&path)?;
+                    cfg = next;
+                    Ok(())
+                })();
+                let _ = respond.send(result);
+            }
             ConfigActorCommand::PrepareProxy {
                 target,
                 port,
@@ -2290,7 +1891,7 @@ async fn run_config_actor(
                 let _ = respond.send(result.map(|(response, _)| response));
             }
             ConfigActorCommand::RegisterConnection { node_id, respond } => {
-                let result = if is_node_revoked(&cfg, node_id) {
+                let result = if cfg.destruction.is_some() || is_node_revoked(&cfg, node_id) {
                     Err(anyhow!("peer {} has been revoked", node_id))
                 } else {
                     let (cancel, cancelled) = oneshot::channel();
@@ -2384,13 +1985,12 @@ fn commit_config_change<T>(
     cfg: &mut Config,
     apply: impl FnOnce(&mut Config) -> Result<(T, bool)>,
 ) -> Result<T> {
+    cfg.ensure_active()?;
     let mut next = cfg.clone();
     let (output, changed) = apply(&mut next)?;
     if changed {
-        // Preserve local presentation edits made while this actor was running.
-        if let Some(format) = output::read_format(path)? {
-            next.format = format;
-        }
+        // Runtime settings are applied at startup, while manual edits survive state writes.
+        next.transport = Config::load(path)?.transport;
         next.save(path)?;
     }
     *cfg = next;
@@ -2555,10 +2155,16 @@ fn spawn_peer_quota_actor(max_per_peer: usize) -> PeerQuotaHandle {
     PeerQuotaHandle { sender }
 }
 
-async fn run_peer_quota_actor(max_per_peer: usize, mut receiver: mpsc::Receiver<PeerQuotaCommand>) {
+async fn run_peer_quota_actor(
+    mut max_per_peer: usize,
+    mut receiver: mpsc::Receiver<PeerQuotaCommand>,
+) {
     let mut counts = HashMap::<EndpointId, usize>::new();
     while let Some(command) = receiver.recv().await {
         match command {
+            PeerQuotaCommand::SetLimit { max } => {
+                max_per_peer = max;
+            }
             PeerQuotaCommand::TryAcquire { peer_id, respond } => {
                 let current = counts.get(&peer_id).copied().unwrap_or(0);
                 let accepted = current < max_per_peer;
@@ -2667,6 +2273,10 @@ fn apply_proxy_request(
     let expected = cfg.peer_by_id(node_id).cloned();
     let request_policy = request.network_policy.clone();
     let reported = Hello {
+        network_label: request_policy
+            .admin_label
+            .clone()
+            .ok_or_else(|| anyhow!("network label missing"))?,
         network_id: request.network_id,
         network_policy: Some(request_policy.clone()),
         name: request.requester_name,
@@ -2714,6 +2324,9 @@ fn validate_peer_report(
     remote: &Hello,
     expected_peer: Option<&Peer>,
 ) -> Result<Peer> {
+    if cfg.network_policy.admin_label.as_deref() != Some(&remote.network_label) {
+        bail!("invitation or peer label does not match signed network policy");
+    }
     if remote.network_id != cfg.network_id {
         bail!("peer joined a different esp network");
     }
@@ -3039,64 +2652,30 @@ fn ensure_peer_capacity(cfg: &Config, node_id: EndpointId) -> Result<()> {
     Ok(())
 }
 
-async fn proxy(target: String, port: u16) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let stream = transport::open_proxy(
-            &local_control_socket_path()?,
-            &config_path()?,
-            &std::env::current_exe().context("failed to locate esp executable")?,
-            target,
-            port,
-        )
-        .await?;
-        proxy_stdio(io::stdin(), io::stdout(), stream).await
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (target, port);
-        bail!(
-            "esp proxy requires a shared transport over a Unix socket; this platform is not supported"
-        )
-    }
-}
-
 #[cfg(unix)]
-async fn request_local_proxy(
-    mut stream: UnixStream,
-    target: String,
-    port: u16,
-) -> Result<UnixStream> {
-    timeout(
-        LOCAL_CONTROL_SETUP_TIMEOUT + Duration::from_secs(5),
-        async {
-            write_cbor_frame(
-                &mut stream,
-                &LocalControlRequest::Proxy { target, port },
-                MAX_LOCAL_CONTROL_MESSAGE_LEN,
-                "local esp proxy request",
-            )
-            .await?;
-            let response: LocalProxyResponse = read_cbor_frame(
-                &mut stream,
-                MAX_LOCAL_CONTROL_MESSAGE_LEN,
-                "local esp proxy response",
-            )
-            .await
-            .context(
-                "failed to read proxy response; ensure the local esp transport is up to date",
-            )?;
-            match response {
-                LocalProxyResponse::Ready => Ok(()),
-                LocalProxyResponse::Error(error) => {
-                    bail!("local esp transport rejected proxy: {error}")
-                }
-            }
+#[cfg(test)]
+#[allow(dead_code)]
+async fn request_local_proxy(stream: UnixStream, target: String, port: u16) -> Result<UnixStream> {
+    let path = stream
+        .peer_addr()?
+        .as_pathname()
+        .ok_or_else(|| anyhow!("missing socket pathname"))?
+        .to_path_buf();
+    let status = networks::send_to(
+        &path,
+        &networks::Request::Status {
+            id: None,
+            peers: false,
         },
     )
-    .await
-    .context("timed out waiting for local esp proxy setup")??;
-    Ok(stream)
+    .await?
+    .ok_or_else(|| anyhow!("transport unavailable"))?
+    .json()?;
+    let id = status["networks"][0]["network_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    networks::request_proxy(stream, id, target, port).await
 }
 
 #[cfg(unix)]
@@ -3134,6 +2713,7 @@ where
 }
 
 fn prepare_proxy_request(cfg: &Config, target: &str, port: u16) -> Result<(Peer, TcpProxyRequest)> {
+    cfg.ensure_active()?;
     ensure_completed_join(cfg)?;
     let peer = cfg.resolve_peer(target)?.clone();
     let hello = hello_from_config(cfg)?;
@@ -3482,11 +3062,12 @@ where
     R: AsyncRead + Unpin,
     T: for<'b> Decode<'b, ()>,
 {
-    let mut len = [0u8; 2];
-    recv.read_exact(&mut len)
-        .await
-        .with_context(|| format!("failed to read {label} length"))?;
-    let len = usize::from(u16::from_be_bytes(len));
+    let len = if max_len > u16::MAX as usize {
+        recv.read_u32().await.map(|n| n as usize)
+    } else {
+        recv.read_u16().await.map(usize::from)
+    }
+    .with_context(|| format!("failed to read {label} length"))?;
     if len > max_len {
         bail!("{label} is too large");
     }
@@ -3504,12 +3085,15 @@ where
     T: Encode<()>,
 {
     let data = minicbor::to_vec(value).with_context(|| format!("failed to encode {label}"))?;
-    if data.len() > max_len || data.len() > usize::from(u16::MAX) {
+    if data.len() > max_len || data.len() > u32::MAX as usize {
         bail!("{label} is too large");
     }
-    send.write_all(&(data.len() as u16).to_be_bytes())
-        .await
-        .with_context(|| format!("failed to write {label} length"))?;
+    if max_len > u16::MAX as usize {
+        send.write_u32(data.len() as u32).await
+    } else {
+        send.write_u16(data.len() as u16).await
+    }
+    .with_context(|| format!("failed to write {label} length"))?;
     send.write_all(&data)
         .await
         .with_context(|| format!("failed to write {label}"))?;
@@ -3735,7 +3319,7 @@ fn write_private_config(path: &Path, bytes: &[u8]) -> Result<()> {
                 temp_path.display()
             )
         })?;
-        sync_parent_dir(parent);
+        sync_parent_dir(parent)?;
         validate_existing_config_file(path)
     });
 
@@ -3769,14 +3353,22 @@ fn write_private_config_temp(temp_path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sync_parent_dir(parent: &Path) {
+fn sync_parent_dir(parent: &Path) -> Result<()> {
     #[cfg(unix)]
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
+    fs::File::open(parent)?
+        .sync_all()
+        .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    Ok(())
 }
 
 impl Config {
+    fn ensure_active(&self) -> Result<()> {
+        if self.destruction.is_some() {
+            bail!("network has been permanently destroyed");
+        }
+        Ok(())
+    }
+
     fn load(path: &Path) -> Result<Self> {
         let text = read_private_config(path)?;
         let header: serde_yaml::Value = serde_yaml::from_str(&text)?;
@@ -3813,35 +3405,46 @@ impl Config {
 
     pub fn resolve_peer(&self, target: &str) -> Result<&Peer> {
         let target = target.trim();
-        if is_valid_connection_id(target) {
+        if let Ok(id) = target.parse::<EndpointId>() {
             return self
-                .peer_by_connection_id(target)
-                .ok_or_else(|| anyhow!("no configured esp peer with connection id {}", target));
+                .peer_by_id(id)
+                .ok_or_else(|| anyhow!("no configured esp peer with node id {target}"));
         }
-
+        if let Some(peer) = self.peer_by_connection_id(target) {
+            return Ok(peer);
+        }
         let name = normalize_connection_name(target)?;
-        let matches: Vec<_> = self.peers.iter().filter(|peer| peer.name == name).collect();
+        let matches: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|peer| {
+                peer.name == name
+                    || find_membership_by_subject(self, &[], peer.node_id)
+                        .is_some_and(|m| m.admin_label == name)
+            })
+            .collect();
         match matches.as_slice() {
             [peer] => Ok(peer),
-            [] => bail!("no configured esp peer named {}", name),
-            peers => {
-                let ids = peers
+            [] => bail!("no configured esp peer named {name}"),
+            _ => bail!(
+                "ambiguous peer {name:?}; use a node id: {}",
+                matches
                     .iter()
-                    .map(|peer| peer.connection_id.as_str())
+                    .map(|p| format!("{} ({})", p.node_id, p.connection_id))
                     .collect::<Vec<_>>()
-                    .join(", ");
-                bail!(
-                    "multiple esp peers are named {}; rename them or use a connection id: {}",
-                    name,
-                    ids
-                )
-            }
+                    .join(", ")
+            ),
         }
     }
 
     fn validate_local_config(&self) -> Result<()> {
         if self.version != CONFIG_VERSION {
             bail!("unsupported config version {}", self.version);
+        }
+        validate_network_id(&self.network_id)?;
+        self.transport.validate()?;
+        if let Some(record) = &self.destruction {
+            return record.certificate.verify(self);
         }
         let local_node_id = self.secret_key()?.public();
         normalize_connection_name(&self.name)?;
@@ -4012,6 +3615,11 @@ impl Config {
             invite_secret: invite_secret.clone(),
             creator_node_id: self.creator_node_id,
             inviter_node_id: secret_key.public(),
+            network_label: self
+                .network_policy
+                .admin_label
+                .clone()
+                .ok_or_else(|| anyhow!("network label is required"))?,
         };
         let issued = InviteCode {
             invite_id: invite_id.clone(),
@@ -4028,6 +3636,7 @@ impl Config {
     }
 
     fn ensure_local_admin(&self) -> Result<()> {
+        self.ensure_active()?;
         let membership = self
             .membership
             .as_ref()
@@ -4294,7 +3903,15 @@ impl MembershipCertificate {
 
 impl NetworkPolicyCertificate {
     fn issue(cfg: &Config, issuer_key: &SecretKey, max_peers: usize) -> Result<Self> {
-        let mut policy = Self::issue_for_network(&cfg.network_id, issuer_key, max_peers)?;
+        let mut policy = Self::issue_for_network(
+            &cfg.network_id,
+            issuer_key,
+            max_peers,
+            cfg.network_policy
+                .admin_label
+                .as_deref()
+                .ok_or_else(|| anyhow!("network label is required"))?,
+        )?;
         policy.admin_label = cfg.network_policy.admin_label.clone();
         policy.issued_at_unix = policy.issued_at_unix.max(
             cfg.network_policy
@@ -4310,10 +3927,11 @@ impl NetworkPolicyCertificate {
         network_id: &str,
         issuer_key: &SecretKey,
         max_peers: usize,
+        network_label: &str,
     ) -> Result<Self> {
         validate_max_known_peers(max_peers)?;
         let mut policy = Self {
-            admin_label: None,
+            admin_label: Some(normalize_network_label(network_label)?),
             version: NETWORK_POLICY_VERSION,
             network_id: network_id.to_string(),
             max_peers,
@@ -4365,7 +3983,11 @@ impl NetworkPolicyCertificate {
         for field in &fields {
             append_signed_field(&mut payload, field);
         }
-        if let Some(label) = &self.admin_label {
+        {
+            let label = self
+                .admin_label
+                .as_ref()
+                .ok_or_else(|| anyhow!("network label is required"))?;
             if normalize_network_label(label)? != *label {
                 bail!("network label must be normalized");
             }
@@ -4435,6 +4057,11 @@ impl RevocationCertificate {
 fn hello_from_config(cfg: &Config) -> Result<Hello> {
     let can_advertise_directory = cfg.can_advertise_directory();
     Ok(Hello {
+        network_label: cfg
+            .network_policy
+            .admin_label
+            .clone()
+            .ok_or_else(|| anyhow!("network label missing"))?,
         network_id: cfg.network_id.clone(),
         network_policy: Some(cfg.network_policy.clone()),
         name: cfg.name.clone(),
@@ -4464,6 +4091,11 @@ fn join_hello_from_config(cfg: &Config) -> Result<Hello> {
         .clone()
         .ok_or_else(|| anyhow!("joined config missing invite proof"))?;
     Ok(Hello {
+        network_label: cfg
+            .network_policy
+            .admin_label
+            .clone()
+            .ok_or_else(|| anyhow!("network label missing"))?,
         network_id: cfg.network_id.clone(),
         network_policy: None,
         name: cfg.name.clone(),
@@ -4719,6 +4351,9 @@ fn verify_network_policy(
         bail!("network policy is for a different esp network");
     }
     policy.verify_signature()?;
+    if cfg.network_policy.admin_label != policy.admin_label {
+        bail!("signed network labels are immutable");
+    }
     let issuer_membership =
         find_membership_by_subject(cfg, extra_memberships, policy.issuer_node_id)
             .ok_or_else(|| anyhow!("missing network policy issuer {}", policy.issuer_node_id))?;
@@ -5019,6 +4654,9 @@ impl Invite {
         }
         validate_network_id(&self.network_id)?;
         validate_invite_secret(&self.invite_secret)?;
+        if normalize_network_label(&self.network_label)? != self.network_label {
+            bail!("invite network label must be normalized");
+        }
         Ok(())
     }
 
@@ -5028,7 +4666,16 @@ impl Invite {
     }
 
     pub fn decode(code: &str) -> Result<Self> {
-        let invite: Self = cbor::decode_compact(code).context("invalid invite code")?;
+        let bytes = URL_SAFE_NO_PAD
+            .decode(code)
+            .context("invalid invite code")?;
+        let mut header = minicbor::Decoder::new(&bytes);
+        header.array().context("invalid invite header")?;
+        let version = header.u8().context("invalid invite version")?;
+        if version != INVITE_VERSION {
+            bail!("unsupported invite version {version}; create a new version 3 invitation");
+        }
+        let invite: Self = cbor::decode_exact(&bytes).context("invalid invite code")?;
         invite.validate()?;
         Ok(invite)
     }

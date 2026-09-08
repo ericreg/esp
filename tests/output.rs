@@ -28,10 +28,10 @@ fn every_report_command_accepts_the_same_format_options() {
     for command in [
         vec!["init", "Test network"],
         vec!["join", "invite-code"],
-        vec!["rename", "host"],
-        vec!["invite", "Laptop"],
-        vec!["revoke", "ABC123"],
-        vec!["policy", "--max-peers", "100"],
+        vec!["rename", "Test network", "host"],
+        vec!["invite", "Test network", "Laptop"],
+        vec!["revoke", "Test network", "ABC123"],
+        vec!["policy", "Test network", "--max-peers", "100"],
         vec!["status"],
     ] {
         for (args, format, no_color) in [
@@ -91,6 +91,14 @@ impl Home {
         ));
         fs::create_dir(&dir).unwrap();
         Self(dir)
+    }
+
+    fn network(&self) -> PathBuf {
+        let store = networks::Store {
+            root: self.0.join(ESP_DIR),
+        };
+        let cfg = store.select("Test network").unwrap();
+        store.path(&cfg.network_id).unwrap()
     }
 
     fn config(&self) -> PathBuf {
@@ -157,15 +165,15 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
         let home = Home::new();
         let init = home.report(&["init", "Test network"], &flags);
         assert_eq!(init["network_label"], "Test network");
-        assert_eq!(init["esp_config"], home.config().display().to_string());
+        assert_eq!(init["esp_config"], home.network().display().to_string());
         if flags.contains(&"text") {
             assert!(init.get("next_step").is_none());
             let text = home.run(&["init", "Test network"], &flags);
-            assert!(text.ends_with("\n\nrun `esp invite \"name\"` to create a named invite\n"));
+            assert!(text.contains("esp invite 'Test network'"));
         } else {
             assert!(init["next_step"].as_str().unwrap().contains("esp invite"));
         }
-        let cfg = Config::load(&home.config()).unwrap();
+        let cfg = Config::load(&home.network()).unwrap();
         assert_eq!(
             init["node_id"],
             cfg.secret_key().unwrap().public().to_string()
@@ -173,10 +181,10 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
         assert_eq!(init["connection_id"], cfg.connection_id);
         // Existing-config init uses the same report format.
         assert_eq!(home.report(&["init", "Test network"], &flags), init);
-        let renamed = home.report(&["rename", "new-host"], &flags);
+        let renamed = home.report(&["rename", "Test network", "new-host"], &flags);
         assert_eq!(renamed["name"], "new-host");
         assert_eq!(renamed["connection_id"], cfg.connection_id);
-        let policy = home.report(&["policy", "--max-peers", "200"], &flags);
+        let policy = home.report(&["policy", "Test network", "--max-peers", "200"], &flags);
         assert_eq!(
             policy["max_peers"],
             if flags.contains(&"text") {
@@ -190,10 +198,10 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
             cfg.secret_key().unwrap().public().to_string()
         );
         assert!(policy.get("policy_issued_at").is_some());
-        let invite = home.report(&["invite", "Laptop"], &flags);
+        let invite = home.report(&["invite", "Test network", "Laptop"], &flags);
         Invite::decode(invite["invite_code"].as_str().unwrap()).unwrap();
 
-        let mut cfg = Config::load(&home.config()).unwrap();
+        let mut cfg = Config::load(&home.network()).unwrap();
         let peer = Peer {
             node_id: SecretKey::generate().public(),
             name: "removed".into(),
@@ -210,8 +218,8 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
             .unwrap(),
         );
         cfg.peers.push(peer.clone());
-        cfg.save(&home.config()).unwrap();
-        let revoked = home.report(&["revoke", "REMOVE"], &flags);
+        cfg.save(&home.network()).unwrap();
+        let revoked = home.report(&["revoke", "Test network", "REMOVE"], &flags);
         assert_eq!(revoked["revoked"], peer.node_id.to_string());
         assert_eq!(revoked["name"], peer.display_name());
     }
@@ -221,6 +229,7 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
 fn join_report_contains_all_fields_and_formats_ports_and_identity() {
     let key = SecretKey::generate();
     let mut cfg = create_creator_config(
+        "Test network",
         &key,
         Uuid::new_v4().to_string(),
         "joined-host".into(),
@@ -245,7 +254,7 @@ fn join_report_contains_all_fields_and_formats_ports_and_identity() {
             "role": "admin",
             "allowed_ports": [22],
             "join_sync": "complete",
-            "network_label": null,
+            "network_label": "Test network",
         })
     );
     let colored = Options::default().render(&report).unwrap();
@@ -291,82 +300,33 @@ fn format_configs() -> [FormatConfig; 4] {
 }
 
 #[test]
-fn config_format_defaults_roundtrips_and_accepts_legacy_settings() {
+fn config_format_defaults_roundtrips_and_rejects_legacy_settings() {
     let home = Home::new();
     assert_eq!(output::read_format(&home.config()).unwrap(), None);
     home.report(&["init", "Test network"], &[]);
-    let mut cfg = Config::load(&home.config()).unwrap();
+    let mut cfg = networks::GlobalConfig::load(&home.config()).unwrap();
     assert_eq!(cfg.format, FormatConfig::default());
-    let mut yaml = serde_yaml::to_value(&cfg).unwrap();
-    yaml.as_mapping_mut()
-        .unwrap()
-        .remove(serde_yaml::Value::String("format".into()));
-    write_private_config(
-        &home.config(),
-        serde_yaml::to_string(&yaml).unwrap().as_bytes(),
-    )
-    .unwrap();
-    assert_eq!(
-        Config::load(&home.config()).unwrap().format,
-        FormatConfig::default()
-    );
     for format in format_configs() {
         cfg.format = format;
         cfg.save(&home.config()).unwrap();
-        let saved: serde_yaml::Value =
-            serde_yaml::from_str(&fs::read_to_string(home.config()).unwrap()).unwrap();
-        assert_eq!(
-            saved["format"]["type"],
-            serde_yaml::to_value(format.kind).unwrap()
-        );
-        assert_eq!(saved["format"]["colorize"].as_bool(), Some(format.colorize));
-        assert_eq!(Config::load(&home.config()).unwrap().format, format);
         assert_eq!(output::read_format(&home.config()).unwrap(), Some(format));
     }
-    for (legacy, expected) in [
-        (
-            "json",
-            FormatConfig {
-                kind: Format::Json,
-                colorize: false,
-            },
-        ),
-        ("json_colorized", FormatConfig::default()),
-        (
-            "text",
-            FormatConfig {
-                kind: Format::Text,
-                colorize: false,
-            },
-        ),
-    ] {
-        yaml["format"] = serde_yaml::Value::String(legacy.into());
-        write_private_config(
-            &home.config(),
-            serde_yaml::to_string(&yaml).unwrap().as_bytes(),
-        )
-        .unwrap();
-        let loaded = Config::load(&home.config()).unwrap();
-        assert_eq!(loaded.format, expected);
-        loaded.save(&home.config()).unwrap();
-        assert!(
-            fs::read_to_string(home.config())
-                .unwrap()
-                .contains("format:\n  type:")
-        );
-    }
     for invalid in [
+        "json",
+        "json_colorized",
+        "text",
         "type: yaml\ncolorize: true",
         "type: text\ncolorize: wrong",
         "type: text\ncolorise: true",
     ] {
+        let mut yaml = serde_yaml::to_value(&cfg).unwrap();
         yaml["format"] = serde_yaml::from_str(invalid).unwrap();
         write_private_config(
             &home.config(),
             serde_yaml::to_string(&yaml).unwrap().as_bytes(),
         )
         .unwrap();
-        assert!(Config::load(&home.config()).is_err());
+        assert!(networks::GlobalConfig::load(&home.config()).is_err());
         assert!(output::read_format(&home.config()).is_err());
     }
 }
@@ -392,7 +352,7 @@ fn command_line_overrides_type_and_color_independently_without_persisting() {
     let home = Home::new();
     home.report(&["init", "Test network"], &[]);
     for configured in format_configs() {
-        let mut cfg = Config::load(&home.config()).unwrap();
+        let mut cfg = networks::GlobalConfig::load(&home.config()).unwrap();
         cfg.format = configured;
         cfg.save(&home.config()).unwrap();
         for (flags, expected, no_color) in [
@@ -404,13 +364,17 @@ fn command_line_overrides_type_and_color_independently_without_persisting() {
             (vec!["--format", "text", "--color"], Format::Text, false),
             (vec!["--format", "text", "--no-color"], Format::Text, true),
         ] {
-            assert_report_format(&home.run(&["status"], &flags), expected, no_color);
+            assert_report_format(
+                &home.run(&["status", "Test network"], &flags),
+                expected,
+                no_color,
+            );
         }
         for command in [
             vec!["init", "Test network"],
-            vec!["rename", "configured-host"],
-            vec!["invite", "Laptop"],
-            vec!["policy", "--max-peers", "100"],
+            vec!["rename", "Test network", "configured-host"],
+            vec!["invite", "Test network", "Laptop"],
+            vec!["policy", "Test network", "--max-peers", "100"],
         ] {
             assert_report_format(
                 &home.run(&command, &[]),
@@ -419,10 +383,13 @@ fn command_line_overrides_type_and_color_independently_without_persisting() {
             );
         }
         home.run(
-            &["rename", "cli-override"],
+            &["rename", "Test network", "cli-override"],
             &["--format", "json", "--no-color"],
         );
-        assert_eq!(Config::load(&home.config()).unwrap().format, configured);
+        assert_eq!(
+            networks::GlobalConfig::load(&home.config()).unwrap().format,
+            configured
+        );
     }
     assert!(Cli::try_parse_from(["esp", "status", "--color", "--no-color"]).is_err());
 }
@@ -455,30 +422,24 @@ fn text_init_hint_follows_fields_without_a_key_or_color() {
 }
 
 #[tokio::test]
-async fn running_transport_preserves_format_edits_on_disk() {
+async fn running_transport_preserves_transport_edits_on_disk() {
     let home = Home::new();
-    let mut cfg = create_creator_config(
-        &SecretKey::generate(),
-        Uuid::new_v4().to_string(),
-        "local".into(),
-        "LOCAL1".into(),
-        100,
-    )
-    .unwrap();
-    cfg.save(&home.config()).unwrap();
-    let actor = spawn_config_actor(home.config(), cfg.clone());
-    for format in format_configs() {
-        cfg.format = format;
-        cfg.save(&home.config()).unwrap();
+    home.report(&["init", "Test network"], &[]);
+    let path = home.network();
+    let mut cfg = Config::load(&path).unwrap();
+    let actor = spawn_config_actor(path.clone(), cfg.clone());
+    for ports in [Some(vec![]), Some(vec![80, 443]), None] {
+        cfg.transport.ports = ports.clone();
+        cfg.save(&path).unwrap();
         actor.rename("renamed".into()).await.unwrap();
-        cfg = Config::load(&home.config()).unwrap();
-        assert_eq!(cfg.format, format);
+        cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.transport.ports, ports);
         assert_eq!(cfg.name, "renamed");
     }
 }
 
 #[test]
-fn init_requires_a_valid_network_label_and_can_label_existing_networks() {
+fn init_requires_a_valid_network_label_and_creates_independent_networks() {
     assert!(Cli::try_parse_from(["esp", "init"]).is_err());
     for label in ["", "  ", "line\nbreak", "\x1b[31m", &"x".repeat(65)] {
         let home = Home::new();
@@ -488,34 +449,31 @@ fn init_requires_a_valid_network_label_and_can_label_existing_networks() {
             .output()
             .unwrap();
         assert!(!result.status.success());
-        assert!(!home.config().exists());
+        assert_eq!(
+            fs::read_dir(home.0.join(ESP_DIR).join("networks"))
+                .map(|r| r.count())
+                .unwrap_or(0),
+            0
+        );
     }
     let home = Home::new();
-    let cfg = create_creator_config(
-        &SecretKey::generate(),
-        Uuid::new_v4().to_string(),
-        "host".into(),
-        "LOCAL1".into(),
-        100,
-    )
-    .unwrap();
-    cfg.save(&home.config()).unwrap();
-    let report = home.report(&["init", "  Office / Lab  "], &["--no-color"]);
-    assert_eq!(report["network_label"], "Office / Lab");
-    let updated = Config::load(&home.config()).unwrap();
-    assert_eq!(updated.network_id, cfg.network_id);
+    let first = home.report(&["init", "Test network"], &["--no-color"]);
+    let other = home.report(&["init", "  Office / Lab  "], &["--no-color"]);
+    assert_eq!(other["network_label"], "Office / Lab");
+    assert_ne!(first["network_id"], other["network_id"]);
+    assert_ne!(first["node_id"], other["node_id"]);
     assert_eq!(
-        updated.network_policy.admin_label.as_deref(),
-        Some("Office / Lab")
+        first,
+        home.report(
+            &["init", "Test network", "--max-peers", "50"],
+            &["--no-color"]
+        )
     );
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_esp"))
-        .env("HOME", &home.0)
-        .args(["init", "different"])
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
     assert_eq!(
-        Config::load(&home.config()).unwrap().network_policy,
-        updated.network_policy
+        Config::load(&home.network())
+            .unwrap()
+            .network_policy
+            .max_peers,
+        100
     );
 }
