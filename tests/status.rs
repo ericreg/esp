@@ -85,7 +85,7 @@ fn detailed_status_retains_counts_and_respects_explicit_peer_records() {
     assert_eq!(empty, "daemon: serving");
 }
 #[test]
-fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
+fn status_cli_defaults_to_colorized_text_and_supports_format_options() {
     let home = PathBuf::from("/tmp").join(format!(
         "esp-s-{}",
         &Uuid::new_v4().simple().to_string()[..12]
@@ -109,6 +109,8 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
         vec![],
         vec!["--no-color"],
         vec!["--peers"],
+        vec!["--format", "json"],
+        vec!["--format", "json", "--no-color", "--peers"],
         vec!["--format", "text"],
         vec!["--format", "text", "--no-color", "--peers"],
     ] {
@@ -126,7 +128,7 @@ fn status_cli_defaults_to_highlighted_json_and_supports_format_options() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(stdout.contains('\x1b'), !args.contains(&"--no-color"));
         let plain = strip_colors(&stdout);
-        if args.contains(&"text") {
+        if !args.contains(&"json") {
             assert!(plain.contains("transport: not_running"));
             assert!(plain.contains("connected_peers: unknown"));
         } else {

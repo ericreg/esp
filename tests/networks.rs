@@ -41,7 +41,7 @@ impl Profile {
         let result = self
             .command()
             .args(args)
-            .arg("--no-color")
+            .args(["--format", "json", "--no-color"])
             .output()
             .await
             .unwrap();
@@ -67,7 +67,7 @@ async fn concurrent_init_is_serialized_and_networks_have_separate_identities() {
         children.push(
             profile
                 .command()
-                .args(["init", "Work", "--no-color"])
+                .args(["init", "Work", "--format", "json", "--no-color"])
                 .spawn()
                 .unwrap(),
         );

@@ -140,7 +140,14 @@ async fn originator_invite_commands_issue_fresh_codes_without_transport() {
         let output = timeout(
             Duration::from_secs(5),
             home.command()
-                .args(["invite", "Test network", "Test peer", "--no-color"])
+                .args([
+                    "invite",
+                    "Test network",
+                    "Test peer",
+                    "--format",
+                    "json",
+                    "--no-color",
+                ])
                 .output(),
         )
         .await
@@ -222,7 +229,7 @@ async fn simultaneous_proxy_processes_start_and_reuse_one_background_transport()
 
     let initialized = home
         .command()
-        .args(["init", "Shared network", "--no-color"])
+        .args(["init", "Shared network", "--format", "json", "--no-color"])
         .output()
         .await
         .unwrap();

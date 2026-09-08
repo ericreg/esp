@@ -122,7 +122,7 @@ impl Home {
 
     fn report(&self, command: &[&str], flags: &[&str]) -> Value {
         let stdout = self.run(command, flags);
-        if flags.contains(&"text") {
+        if !flags.contains(&"json") {
             assert_eq!(stdout.contains('\x1b'), !flags.contains(&"--no-color"));
             let plain = strip_colors(&stdout);
             let fields = plain
@@ -153,7 +153,7 @@ impl Drop for Home {
 }
 
 #[test]
-fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
+fn command_reports_default_to_colorized_text_and_support_json() {
     for flags in [
         vec![],
         vec!["--format", "json"],
@@ -166,7 +166,7 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
         let init = home.report(&["init", "Test network"], &flags);
         assert_eq!(init["network_label"], "Test network");
         assert_eq!(init["esp_config"], home.network().display().to_string());
-        if flags.contains(&"text") {
+        if !flags.contains(&"json") {
             assert!(init.get("next_step").is_none());
             let text = home.run(&["init", "Test network"], &flags);
             assert!(text.contains("esp invite 'Test network'"));
@@ -187,7 +187,7 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
         let policy = home.report(&["policy", "Test network", "--max-peers", "200"], &flags);
         assert_eq!(
             policy["max_peers"],
-            if flags.contains(&"text") {
+            if !flags.contains(&"json") {
                 json!("200")
             } else {
                 json!(200)
@@ -226,6 +226,41 @@ fn command_reports_are_json_by_default_and_plain_snake_case_text_on_request() {
 }
 
 #[test]
+fn invite_output_names_destination_and_prints_complete_join_command() {
+    let home = Home::new();
+    home.run(&["init", "rtn"], &[]);
+    for flags in [
+        vec![],
+        vec!["--no-color"],
+        vec!["--format", "json", "--no-color"],
+    ] {
+        let stdout = home.run(&["invite", "rtn", "  mbp  "], &flags);
+        assert_eq!(stdout.contains('\x1b'), !flags.contains(&"--no-color"));
+        let plain = strip_colors(&stdout);
+        let (code, hint) = if flags.contains(&"json") {
+            let report: Value = serde_json::from_str(&plain).unwrap();
+            (
+                report["invite_code"].as_str().unwrap().to_owned(),
+                report["next_step"].as_str().unwrap().to_owned(),
+            )
+        } else {
+            let (field, hint) = plain.trim_end().split_once("\n\n").unwrap();
+            (
+                field.strip_prefix("invite_code: ").unwrap().to_owned(),
+                hint.to_owned(),
+            )
+        };
+        Invite::decode(&code).unwrap();
+        assert_eq!(
+            hint,
+            format!(
+                "Copy this join code and run it on the host “mbp” with the command\n\nesp join {code}"
+            )
+        );
+    }
+}
+
+#[test]
 fn join_report_contains_all_fields_and_formats_ports_and_identity() {
     let key = SecretKey::generate();
     let mut cfg = create_creator_config(
@@ -257,7 +292,12 @@ fn join_report_contains_all_fields_and_formats_ports_and_identity() {
             "network_label": "Test network",
         })
     );
-    let colored = Options::default().render(&report).unwrap();
+    let colored = Options {
+        format: Format::Json,
+        no_color: false,
+    }
+    .render(&report)
+    .unwrap();
     assert!(colored.contains('\x1b'));
     assert_eq!(
         serde_json::from_str::<Value>(&strip_colors(&colored)).unwrap(),
@@ -305,7 +345,13 @@ fn config_format_defaults_roundtrips_and_rejects_legacy_settings() {
     assert_eq!(output::read_format(&home.config()).unwrap(), None);
     home.report(&["init", "Test network"], &[]);
     let mut cfg = networks::GlobalConfig::load(&home.config()).unwrap();
-    assert_eq!(cfg.format, FormatConfig::default());
+    assert_eq!(
+        cfg.format,
+        FormatConfig {
+            kind: Format::Text,
+            colorize: true
+        }
+    );
     for format in format_configs() {
         cfg.format = format;
         cfg.save(&home.config()).unwrap();
@@ -414,7 +460,12 @@ fn text_init_hint_follows_fields_without_a_key_or_color() {
             assert!(text.starts_with("\x1b[1;37mconnection_id:\x1b[0m \x1b[94mH9mx5Y\x1b[0m\n"));
         }
     }
-    let json = Options::default().render(&report).unwrap();
+    let json = Options {
+        format: Format::Json,
+        no_color: false,
+    }
+    .render(&report)
+    .unwrap();
     assert_eq!(
         serde_json::from_str::<Value>(&strip_colors(&json)).unwrap()["next_step"],
         report["next_step"]

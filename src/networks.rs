@@ -1249,15 +1249,19 @@ pub(super) async fn execute(command: Command) -> Result<()> {
             output,
         } => {
             let output = output.resolve_from_config()?;
+            let host = normalize_connection_name(&name)?;
             match scoped(
                 &network,
                 LocalControlRequest::IssueInvite { name, ports, role },
             )
             .await?
             {
-                LocalControlOk::Invite { code } => {
-                    output.print(&serde_json::json!({ "invite_code": code }))
-                }
+                LocalControlOk::Invite { code } => output.print(&serde_json::json!({
+                    "invite_code": code,
+                    "next_step": format!(
+                        "Copy this join code and run it on the host “{host}” with the command\n\nesp join {code}"
+                    ),
+                })),
                 _ => bail!("unexpected invite response"),
             }
         }

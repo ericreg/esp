@@ -9,8 +9,8 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 #[value(rename_all = "snake_case")]
 pub enum Format {
-    #[default]
     Json,
+    #[default]
     Text,
 }
 
@@ -28,7 +28,7 @@ fn default_colorize() -> bool {
 impl Default for FormatConfig {
     fn default() -> Self {
         Self {
-            kind: Format::Json,
+            kind: Format::Text,
             colorize: true,
         }
     }
@@ -36,7 +36,7 @@ impl Default for FormatConfig {
 
 #[derive(Args, Debug, Clone, Copy, Default)]
 pub(super) struct Arguments {
-    /// Override format.type in the config (default: json).
+    /// Override format.type in the config (default: text).
     #[arg(long, value_enum)]
     pub(super) format: Option<Format>,
     /// Disable colorization, overriding the config.

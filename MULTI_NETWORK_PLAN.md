@@ -34,7 +34,7 @@ Global `~/.esp/config.yml`:
 ```yaml
 version: 3
 format:
-  type: json
+  type: text
   colorize: true
 transport:
   ports: [22]

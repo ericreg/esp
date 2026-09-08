@@ -26,7 +26,8 @@ esp invite "Home network" "laptop"
 esp daemon
 ```
 
-Copy the `invite_code` field to the second machine:
+The invite output names the destination host and prints the complete `esp join`
+command. Copy that command and run it on the second machine:
 
 ```sh
 esp join INVITE_CODE
@@ -103,7 +104,7 @@ Global preferences live in `~/.esp/config.yml`:
 ```yaml
 version: 3
 format:
-  type: json
+  type: text
   colorize: true
 transport:
   ports: [22]
@@ -131,17 +132,18 @@ Directories use mode `0700`, files use `0600`, and writes are atomic. esp reject
 symlinked state paths, linked secret files, and files with group/world access.
 Do not copy network identities between machines.
 
-Report commands default to highlighted JSON. `--format json|text` overrides the
+Report commands default to colorized text. `--format json|text` overrides the
 global format; `--color` and `--no-color` independently override colorization.
 Text output uses snake_case keys and groups networks into separate blocks.
 Colored text uses bold white keys and light-blue values. Preferences change on
 the next command and CLI overrides are not saved. Scalar legacy format settings
-are rejected.
+are rejected. Existing profiles keep their saved preferences; set `format.type` to
+`text` and `format.colorize` to `true` in `~/.esp/config.yml` to use colorized text.
 
 ```sh
 esp status --no-color
 esp status "Home network" --peers --format text
-esp invite "Home network" "laptop" --no-color | jq -r .invite_code
+esp invite "Home network" "laptop" --format json --no-color | jq -r .invite_code
 ```
 
 `status` lists networks in label order, including role, transport state, and peer
