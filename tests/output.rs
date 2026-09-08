@@ -198,9 +198,6 @@ fn command_reports_default_to_colorized_text_and_support_json() {
             cfg.secret_key().unwrap().public().to_string()
         );
         assert!(policy.get("policy_issued_at").is_some());
-        let invite = home.report(&["invite", "Test network", "Laptop"], &flags);
-        Invite::decode(invite["invite_code"].as_str().unwrap()).unwrap();
-
         let mut cfg = Config::load(&home.network()).unwrap();
         let peer = Peer {
             node_id: SecretKey::generate().public(),
@@ -232,31 +229,32 @@ fn invite_output_names_destination_and_prints_complete_join_command() {
     for flags in [
         vec![],
         vec!["--no-color"],
+        vec!["--format", "text"],
+        vec!["--format", "text", "--no-color"],
+        vec!["--format", "json"],
         vec!["--format", "json", "--no-color"],
     ] {
         let stdout = home.run(&["invite", "rtn", "  mbp  "], &flags);
         assert_eq!(stdout.contains('\x1b'), !flags.contains(&"--no-color"));
         let plain = strip_colors(&stdout);
-        let (code, hint) = if flags.contains(&"json") {
+        let message = "Copy this join code and run it on the host “mbp” with the command";
+        let code = if flags.contains(&"json") {
             let report: Value = serde_json::from_str(&plain).unwrap();
-            (
-                report["invite_code"].as_str().unwrap().to_owned(),
-                report["next_step"].as_str().unwrap().to_owned(),
-            )
+            assert_eq!(report.as_object().unwrap().len(), 2);
+            assert_eq!(
+                report["message"],
+                format!("{message}\n\nesp join INVITE_CODE")
+            );
+            report["invite_code"].as_str().unwrap().to_owned()
         } else {
-            let (field, hint) = plain.trim_end().split_once("\n\n").unwrap();
-            (
-                field.strip_prefix("invite_code: ").unwrap().to_owned(),
-                hint.to_owned(),
-            )
+            plain
+                .trim_end()
+                .strip_prefix(&format!("{message}\n\nesp join "))
+                .unwrap()
+                .to_owned()
         };
         Invite::decode(&code).unwrap();
-        assert_eq!(
-            hint,
-            format!(
-                "Copy this join code and run it on the host “mbp” with the command\n\nesp join {code}"
-            )
-        );
+        assert_eq!(plain.matches(&code).count(), 1);
     }
 }
 
@@ -382,6 +380,13 @@ fn assert_report_format(stdout: &str, format: Format, no_color: bool) {
     let plain = strip_colors(stdout);
     if format == Format::Text {
         assert!(!plain.starts_with('{'));
+        if plain.starts_with("Copy this join code") {
+            assert!(plain.contains("\n\nesp join "));
+            if !no_color {
+                assert!(stdout.contains("\x1b[94m"));
+            }
+            return;
+        }
         let fields = plain.split("\n\n").next().unwrap();
         assert!(fields.lines().all(|line| line.contains(": ")));
         if !no_color {

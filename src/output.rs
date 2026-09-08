@@ -86,6 +86,24 @@ pub(super) struct Options {
 }
 
 impl Options {
+    pub(super) fn print_invite(&self, host: &str, code: &str) -> Result<()> {
+        let message =
+            format!("Copy this join code and run it on the host “{host}” with the command");
+        if self.format == Format::Json {
+            return self.print(&serde_json::json!({
+                "invite_code": code,
+                "message": format!("{message}\n\nesp join INVITE_CODE"),
+            }));
+        }
+        let command = format!("esp join {code}");
+        if self.no_color {
+            println!("{message}\n\n{command}");
+        } else {
+            println!("{message}\n\n\x1b[94m{command}\x1b[0m");
+        }
+        Ok(())
+    }
+
     pub(super) fn print(&self, report: &Value) -> Result<()> {
         println!("{}", self.render(report)?);
         Ok(())

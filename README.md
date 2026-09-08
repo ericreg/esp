@@ -27,7 +27,8 @@ esp daemon
 ```
 
 The invite output names the destination host and prints the complete `esp join`
-command. Copy that command and run it on the second machine:
+command once. Copy that command and run it on the second machine. JSON output
+contains `invite_code` and `message`; the message uses an `INVITE_CODE` placeholder:
 
 ```sh
 esp join INVITE_CODE

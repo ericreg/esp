@@ -1256,12 +1256,7 @@ pub(super) async fn execute(command: Command) -> Result<()> {
             )
             .await?
             {
-                LocalControlOk::Invite { code } => output.print(&serde_json::json!({
-                    "invite_code": code,
-                    "next_step": format!(
-                        "Copy this join code and run it on the host “{host}” with the command\n\nesp join {code}"
-                    ),
-                })),
+                LocalControlOk::Invite { code } => output.print_invite(&host, &code),
                 _ => bail!("unexpected invite response"),
             }
         }
