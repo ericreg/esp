@@ -1,6 +1,6 @@
 # esp
 
-`esp` carries TCP traffic over iroh so you can SSH between machines without
+`esp` carries TCP traffic and file shares over iroh so you can SSH between machines without
 opening inbound SSH ports or configuring a VPN. SSH still authenticates users
 and encrypts the SSH session.
 
@@ -57,6 +57,111 @@ it runs updates that daemon without restarting the other endpoints. The daemon
 can start with no networks. An invalid network appears as an error in status
 while healthy networks keep running.
 
+## File shares (experimental)
+
+The file-sharing implementation includes an in-process NFS server and an embedded
+local Turso database for file handles and recovery metadata. Neither machine needs
+an NFS server installation, `nfsd`, or Linux `nfs-utils`. File contents and xattrs
+stay in the host filesystem; nothing is sent to a Turso cloud service.
+
+On the host:
+
+```sh
+# Every active peer in this network can read the directory.
+esp share "Home network" files ~/Files
+
+# Replace the policy: every active peer can read and write.
+esp share "Home network" files ~/Files --access rw
+
+# Replace the policy: only these peers can read and write.
+esp share "Home network" files ~/Files --access rw --peers laptop,desktop
+esp shares "Home network"
+```
+
+There is no `deny` permission. Omitting `--peers` means all active network peers;
+providing it means an allowlist. Peer names, connection IDs, and node IDs work,
+and `--peers` can be repeated. Repeating `share` preserves its UUID and replaces
+its path and policy, including resetting access to `ro` if `--access` is omitted.
+The command starts the shared background transport if necessary. It does not
+enable unrelated inbound TCP forwarding or require granting TCP port 2049.
+Share a dedicated data directory: exporting your home directory can expose SSH
+keys, ESP credentials, and other private files to the selected peers.
+
+The same directory can be published in multiple networks, with independent
+registrations and policies:
+
+```sh
+esp share "Work network" files ~/Files --access ro
+```
+
+On a client:
+
+```sh
+esp shares "Home network" server
+esp mount "Home network" server files
+esp mounts
+# Alternatively choose an empty, private destination:
+esp mount "Home network" server files /absolute/path/to/destination
+esp unmount /absolute/path/to/destination
+# On the host, stop publishing:
+esp unshare "Home network" files
+```
+
+Without a destination, ESP creates
+`~/esp/<network>/<peer>-<connection-id>/<share>` with private directories, and
+reports the actual path. Existing destinations must be empty, owned by the user,
+and private. Symlinks and existing mounts are rejected. Unmounting removes an
+ESP-created destination only if it is empty; it does not delete the host's files.
+`--force` requests a forced OS unmount and should be reserved for failed mounts.
+
+Mount requirements and behavior:
+
+- Linux needs the kernel NFSv4.2 client and the modern Linux mount API. ESP calls
+  that API directly; it does not invoke `mount.nfs`.
+- macOS needs built-in NFSv4.1 support and `/sbin/mount_nfs`. Older clients that
+  only support NFSv4.0 are not supported. macOS interoperability is not yet
+  validated; the current [Apple client source](https://github.com/apple-oss-distributions/NFS/blob/main/mount_nfs/mount_nfs.c)
+  includes v4.1 version negotiation.
+- The daemon runs as the normal user. Only mounting/unmounting invokes the
+  hidden executable helper via `sudo`, which can prompt for a password. Do not
+  run the entire daemon as root or grant blanket passwordless sudo to ESP.
+- The loopback bridge requires privileged client source ports. On Linux,
+  `net.ipv4.ip_unprivileged_port_start` must be at least 1024. ESP reports an
+  error instead of changing this system setting. AUTH_SYS requests are limited
+  to the mounting UID and local root; other local users do not inherit access.
+- Remote files are presented with the mounting user's UID/GID. Host operations
+  run as the host daemon user. Remote ownership changes are rejected. Read-only
+  policy is enforced by the server on each operation, including live downgrades.
+- Mounts are **hard mounts**: filesystem calls may block while the network or
+  host is unavailable. Unsharing, changing the export root, removing an allowed
+  peer, or revoking membership ends affected streams. These actions do not
+  automatically unmount the client filesystem.
+- Mount registrations and listener ports persist in the global YAML file.
+  Daemon restart restores the same ports. If a reboot removed the OS mount,
+  ESP attempts a non-interactive remount; when privileges are unavailable,
+  `esp mounts` reports the error and `esp mount` can be rerun to authorize it.
+  ESP does not install a startup service or a sudo policy.
+
+This is an initial implementation, not a certified general-purpose NFS server.
+It supports ordinary files, directories, symlinks, hard links, byte-range OFD
+locks, timestamps, and named attributes backed by native user xattrs (up to
+64 KiB, or the backing filesystem's smaller limit). Linux exposes `user.NAME`
+as named attribute `NAME`; privileged xattr namespaces are not exported.
+Atomic xattr rename, device files, sockets, FIFOs, remote chown, delegations,
+callbacks, pNFS, Kerberos, and advanced v4.2 operations are unsupported.
+Names must be UTF-8. File handles persist when the backing filesystem supplies
+birth timestamps; otherwise they intentionally go stale after a server restart.
+Recovery uses a 90-second lease/grace period. Do not remove the private
+`~/.esp/nfs/` metadata while shares are in use.
+
+Protocol and relay tests run with `cargo test`. The opt-in
+`kernel_nfs_mount` test in `tests/shares.rs` requires an explicitly privileged
+job. Build with `cargo test --test shares --no-run`, then run the printed test
+executable using `sudo TEST_EXECUTABLE --ignored --exact kernel_nfs_mount`.
+It mounts only a newly created temporary export and cleans up afterward.
+Actual Linux kernel mounts, macOS mounts, and crash/power-loss behavior still
+need platform validation before production use.
+
 ## SSH and forwarding
 
 ```sh
@@ -80,7 +185,8 @@ precedence. Ambiguous names or labels fail and show IDs for disambiguation.
 `esp proxy` starts one shared outgoing-only helper when needed. All local proxy
 processes use `~/.esp/.esp.sock`, protected by the persistent
 `~/.esp/.esp.lock`. Each network has its own iroh endpoint. The helper exits
-30 seconds after the last local session ends.
+30 seconds after the last local session ends, unless shares or persistent mount
+registrations require it to remain available.
 
 Running `esp daemon` promotes an existing helper in place, enabling inbound
 forwarding while preserving active sessions. The foreground command owns the

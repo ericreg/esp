@@ -58,6 +58,7 @@ fn joined_admin_issues_unique_invites_without_saving_codes() {
         connection_id: "DEF456".to_string(),
     };
     let mut cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -116,6 +117,7 @@ fn resolving_duplicate_names_requires_connection_id() {
     let first_peer_key = SecretKey::generate();
     let second_peer_key = SecretKey::generate();
     let cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -160,6 +162,7 @@ fn connection_ids_are_case_sensitive_base62() {
     let secret_key = SecretKey::generate();
     let peer_key = SecretKey::generate();
     let cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -191,6 +194,7 @@ fn advertised_peer_lists_are_bounded() {
     let secret_key = SecretKey::generate();
     let remote_key = SecretKey::generate();
     let mut cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,

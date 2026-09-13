@@ -49,6 +49,8 @@ fn validate_ports(ports: &[u16]) -> Result<()> {
 #[serde(deny_unknown_fields)]
 pub(super) struct GlobalConfig {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<shares::mounts::Registration>,
     #[serde(default)]
     pub format: output::FormatConfig,
     #[serde(default)]
@@ -58,6 +60,7 @@ impl Default for GlobalConfig {
     fn default() -> Self {
         Self {
             version: 3,
+            mounts: Vec::new(),
             format: output::FormatConfig::default(),
             transport: TransportSettings::default(),
         }
@@ -75,6 +78,21 @@ impl GlobalConfig {
         validate_ports(&cfg.transport.ports)?;
         if cfg.transport.max_connections_per_peer == 0 {
             bail!("max_connections_per_peer must be positive");
+        }
+        if cfg.mounts.len() > 100 {
+            bail!("at most 100 mount registrations are supported");
+        }
+        let mut ids = HashSet::new();
+        let mut ports = HashSet::new();
+        let mut paths = HashSet::new();
+        for mount in &cfg.mounts {
+            mount.validate()?;
+            if !ids.insert(&mount.id)
+                || !ports.insert(mount.port)
+                || !paths.insert(&mount.mountpoint)
+            {
+                bail!("duplicate mount identifier, port, or destination");
+            }
         }
         Ok(cfg)
     }
@@ -254,6 +272,7 @@ impl Store {
 }
 fn pending_config(invite: &Invite) -> Config {
     Config {
+        shares: Vec::new(),
         version: 3,
         transport: TransportOverrides::default(),
         destruction: None,
@@ -287,6 +306,11 @@ fn pending_config(invite: &Invite) -> Config {
 #[derive(Debug, PartialEq, Eq, Encode, Decode)]
 #[cbor(array)]
 pub(super) enum Request {
+    #[n(36)]
+    Files {
+        #[n(0)]
+        request: String,
+    },
     #[n(30)]
     Network {
         #[n(0)]
@@ -370,6 +394,7 @@ impl Runtime {
                 CONTROL_ALPN.to_vec(),
                 TCP_ALPN.to_vec(),
                 destruction::ALPN.to_vec(),
+                shares::ALPN.to_vec(),
             ])
             .relay_mode(RelayMode::Default)
             .bind()
@@ -417,8 +442,9 @@ struct Entry {
     error: Option<String>,
 }
 pub(super) struct Manager {
-    store: Store,
-    global: GlobalConfig,
+    pub(super) store: Store,
+    pub(super) global: GlobalConfig,
+    pub(super) mounts: shares::mounts::Listeners,
     flags: TransportOverrides,
     serving: bool,
     entries: HashMap<String, Entry>,
@@ -436,6 +462,7 @@ impl Manager {
             flags,
             serving,
             entries: HashMap::new(),
+            mounts: shares::mounts::Listeners::default(),
         };
         for path in manager.store.paths()? {
             let id = path
@@ -445,6 +472,7 @@ impl Manager {
                 .to_string();
             manager.add(&id).await;
         }
+        shares::mounts::restore(&mut manager).await;
         Ok(manager)
     }
     async fn add(&mut self, id: &str) {
@@ -577,6 +605,10 @@ impl Manager {
     }
     pub(super) async fn lifecycle(&mut self, request: Request) -> Result<Response> {
         match request {
+            Request::Files { request } => {
+                let value = shares::manager(self, serde_json::from_str(&request)?).await?;
+                Ok(Response::report(value))
+            }
             Request::Init { label, max_peers } => {
                 let cfg = self.store.init(&label, max_peers)?;
                 self.global = GlobalConfig::load(&self.store.root.join(CONFIG_FILE))?;
@@ -626,6 +658,7 @@ impl Manager {
         }
     }
     pub(super) async fn stop(&mut self) {
+        self.mounts.stop();
         for (_, entry) in self.entries.drain() {
             if let Some(runtime) = entry.runtime {
                 runtime.stop().await;
@@ -791,7 +824,7 @@ pub(super) async fn send(_request: &Request) -> Result<Option<Response>> {
 }
 
 #[cfg(unix)]
-async fn call(request: Request) -> Result<Response> {
+pub(super) async fn call(request: Request) -> Result<Response> {
     let store = Store::local()?;
     // Validate old versions before creating or mutating any network state.
     GlobalConfig::load(&store.root.join(CONFIG_FILE))?;
@@ -818,6 +851,10 @@ async fn call(_request: Request) -> Result<Response> {
 
 async fn offline(store: &Store, request: Request) -> Result<Response> {
     match request {
+        Request::Files { request } => {
+            let request = serde_json::from_str(&request)?;
+            Ok(Response::report(shares::offline(store, request)?))
+        }
         Request::Init { label, max_peers } => Ok(Response::report(identity_report(
             store,
             &store.init(&label, max_peers)?,
@@ -1024,7 +1061,9 @@ pub(super) async fn serve_manager(
             }
             _ = sessions.join_next(), if !sessions.is_empty() => { idle.as_mut().reset(tokio::time::Instant::now() + idle_duration); }
             _ = &mut idle, if sessions.is_empty() => {
-                if !manager.lock().await.serving { break Ok(()); }
+                let manager = manager.lock().await;
+                let has_shares = manager.entries.values().any(|e| e.runtime.as_ref().is_some_and(|r| r.actor.files.has_shares()));
+                if !manager.serving && !has_shares && manager.global.mounts.is_empty() { break Ok(()); }
                 idle.as_mut().reset(tokio::time::Instant::now() + idle_duration);
             }
         }
@@ -1173,6 +1212,7 @@ async fn scoped(label: &str, request: LocalControlRequest) -> Result<LocalContro
 pub(super) async fn execute(command: Command) -> Result<()> {
     GlobalConfig::load(&config_path()?)?;
     match command {
+        Command::Files(command) => shares::execute(command).await,
         Command::Init {
             network_label,
             max_peers,

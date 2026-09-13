@@ -129,6 +129,68 @@ fn assert_reached_transport(output: &std::process::Output) {
 }
 
 #[tokio::test]
+async fn share_command_starts_transport_and_persists_policy() {
+    let home = TransportHome::new();
+    let export = home.dir.join("export");
+    fs::create_dir(&export).unwrap();
+    let result = timeout(
+        Duration::from_secs(15),
+        home.command()
+            .args(["share", "Test network", "files"])
+            .arg(&export)
+            .args(["--format", "json", "--no-color"])
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["share"]["access"], "ro");
+    let cfg = Config::load(&home.network()).unwrap();
+    assert_eq!(cfg.shares.len(), 1);
+    let first = cfg.shares[0].id.clone();
+    let result = home
+        .command()
+        .args(["share", "Test network", "files"])
+        .arg(&export)
+        .args(["--access", "rw"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let cfg = Config::load(&home.network()).unwrap();
+    assert_eq!(cfg.shares[0].id, first);
+    assert_eq!(cfg.shares[0].access, shares::Access::Rw);
+    let result = home
+        .command()
+        .args(["shares", "Test network", "--format", "json", "--no-color"])
+        .output()
+        .await
+        .unwrap();
+    assert!(result.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["shares"][0]["audience"], "all peers");
+    let result = home
+        .command()
+        .args(["unshare", "Test network", "files"])
+        .output()
+        .await
+        .unwrap();
+    assert!(result.status.success());
+    assert!(Config::load(&home.network()).unwrap().shares.is_empty());
+    home.stop().await;
+}
+
+#[tokio::test]
 async fn originator_invite_commands_issue_fresh_codes_without_transport() {
     let home = TransportHome::new();
     let path = home.network();

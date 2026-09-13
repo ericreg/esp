@@ -88,6 +88,7 @@ impl ProxyFixture {
             MembershipCertificate::issue(&cfg, &local_key, &peer, &[port], MembershipRole::Peer)
                 .unwrap();
         let remote_cfg = Config {
+            shares: Vec::new(),
             transport: networks::TransportOverrides::default(),
             destruction: None,
             version: CONFIG_VERSION,
@@ -127,7 +128,11 @@ impl ProxyFixture {
                 .alpns(if index == 0 && idle.is_some() {
                     vec![CONTROL_ALPN.to_vec()]
                 } else {
-                    vec![CONTROL_ALPN.to_vec(), TCP_ALPN.to_vec()]
+                    vec![
+                        CONTROL_ALPN.to_vec(),
+                        TCP_ALPN.to_vec(),
+                        shares::ALPN.to_vec(),
+                    ]
                 })
                 .relay_mode(RelayMode::Custom(relay_map.clone()))
                 .address_lookup(lookup.clone())
@@ -217,6 +222,220 @@ async fn exchange(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
     })
     .await
     .context("echo timed out")?
+}
+
+#[tokio::test]
+async fn nfs_relay_acl_changes_and_fragmented_rpc() {
+    let fixture = ProxyFixture::new(8).await;
+    let export = fixture.dir.join("export");
+    fs::create_dir(&export).unwrap();
+    let update = |access, peers| shares::Update::Put {
+        name: "files".into(),
+        path: export.clone(),
+        access,
+        peers,
+    };
+    fixture
+        .remote_actor
+        .request(|respond| ConfigActorCommand::Shares {
+            update: update(shares::Access::Ro, None),
+            respond,
+        })
+        .await
+        .unwrap();
+    let report = shares::remote_list(&fixture.local, &fixture.actor, "remote-host")
+        .await
+        .unwrap();
+    assert_eq!(report["shares"][0]["access"], "ro");
+    assert!(report["shares"][0].get("path").is_none());
+    let id = report["shares"][0]["id"].as_str().unwrap().to_owned();
+    let mut tunnel = shares::open(
+        &fixture.local,
+        &fixture.actor,
+        "remote-host",
+        Some(id.clone()),
+        Uuid::new_v4().to_string(),
+        1000,
+        1000,
+    )
+    .await
+    .unwrap();
+    let mut rpc = nfs::xdr::Encoder::default();
+    for word in [77, 0, 2, 100003, 4, 0, 0, 0, 0, 0] {
+        rpc.u32(word);
+    }
+    // A policy update while reading the record marker must not discard bytes.
+    let marker = (0x80000000u32 | rpc.0.len() as u32).to_be_bytes();
+    tunnel.send.write_all(&marker[..2]).await.unwrap();
+    fixture
+        .remote_actor
+        .request(|respond| ConfigActorCommand::Shares {
+            update: update(shares::Access::Rw, Some(vec!["local".into()])),
+            respond,
+        })
+        .await
+        .unwrap();
+    tunnel.send.write_all(&marker[2..]).await.unwrap();
+    tunnel.send.write_all(&rpc.0).await.unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        nfs::xdr::read_record(&mut tunnel.recv),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.len(), 24);
+    assert_eq!(&response[..4], &77u32.to_be_bytes());
+    let report = shares::remote_list(&fixture.local, &fixture.actor, "remote-host")
+        .await
+        .unwrap();
+    assert_eq!(report["shares"][0]["id"], id);
+    assert_eq!(report["shares"][0]["access"], "rw");
+    // Remove access using a different valid member identity in the allowlist.
+    let mut snapshot = fixture
+        .remote_actor
+        .request(|respond| ConfigActorCommand::Snapshot { respond })
+        .await
+        .unwrap();
+    snapshot.shares[0].peers = Some(vec![fixture.remote.id()]);
+    fixture.remote_actor.files.update(&snapshot);
+    let ended = timeout(
+        Duration::from_secs(5),
+        nfs::xdr::read_record(&mut tunnel.recv),
+    )
+    .await
+    .unwrap();
+    assert!(ended.is_err() || ended.unwrap().is_none());
+    assert!(
+        shares::open(
+            &fixture.local,
+            &fixture.actor,
+            "remote-host",
+            Some(id),
+            Uuid::new_v4().to_string(),
+            1000,
+            1000
+        )
+        .await
+        .is_err()
+    );
+    let report = shares::remote_list(&fixture.local, &fixture.actor, "remote-host")
+        .await
+        .unwrap();
+    assert!(report["shares"].as_array().unwrap().is_empty());
+    drop(tunnel);
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn nfs_path_replacement_and_unshare_close_existing_streams() {
+    let fixture = ProxyFixture::new(8).await;
+    for name in ["first", "second"] {
+        fs::create_dir(fixture.dir.join(name)).unwrap();
+    }
+    for name in ["first", "second"] {
+        fixture
+            .remote_actor
+            .request(|respond| ConfigActorCommand::Shares {
+                update: shares::Update::Put {
+                    name: "files".into(),
+                    path: fixture.dir.join(name),
+                    access: shares::Access::Rw,
+                    peers: None,
+                },
+                respond,
+            })
+            .await
+            .unwrap();
+        let mut tunnel = shares::open(
+            &fixture.local,
+            &fixture.actor,
+            "remote-host",
+            Some("files".into()),
+            Uuid::new_v4().to_string(),
+            1000,
+            1000,
+        )
+        .await
+        .unwrap();
+        if name == "first" {
+            fixture
+                .remote_actor
+                .request(|respond| ConfigActorCommand::Shares {
+                    update: shares::Update::Put {
+                        name: "files".into(),
+                        path: fixture.dir.join("second"),
+                        access: shares::Access::Rw,
+                        peers: None,
+                    },
+                    respond,
+                })
+                .await
+                .unwrap();
+        } else {
+            fixture
+                .remote_actor
+                .request(|respond| ConfigActorCommand::Shares {
+                    update: shares::Update::Remove {
+                        name: "files".into(),
+                    },
+                    respond,
+                })
+                .await
+                .unwrap();
+        }
+        let ended = timeout(
+            Duration::from_secs(5),
+            nfs::xdr::read_record(&mut tunnel.recv),
+        )
+        .await
+        .unwrap();
+        assert!(ended.is_err() || ended.unwrap().is_none());
+    }
+    fixture
+        .remote_actor
+        .request(|respond| ConfigActorCommand::Shares {
+            update: shares::Update::Put {
+                name: "files".into(),
+                path: fixture.dir.join("second"),
+                access: shares::Access::Ro,
+                peers: None,
+            },
+            respond,
+        })
+        .await
+        .unwrap();
+    let mut tunnel = shares::open(
+        &fixture.local,
+        &fixture.actor,
+        "remote-host",
+        Some("files".into()),
+        Uuid::new_v4().to_string(),
+        1000,
+        1000,
+    )
+    .await
+    .unwrap();
+    fixture.actor.revoke("remote-host".into()).await.unwrap();
+    timeout(Duration::from_secs(5), tunnel.active.cancelled())
+        .await
+        .unwrap();
+    assert!(
+        shares::open(
+            &fixture.local,
+            &fixture.actor,
+            "remote-host",
+            Some("files".into()),
+            Uuid::new_v4().to_string(),
+            1000,
+            1000
+        )
+        .await
+        .is_err()
+    );
+    drop(tunnel);
+    fixture.close().await;
 }
 
 async fn echo_server(listener: TcpListener) {
@@ -700,6 +919,7 @@ async fn join_bootstraps_cbor_membership_and_policy_over_relay() {
         connection_id: String::new(),
     };
     let mut cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: CONFIG_VERSION,

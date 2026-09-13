@@ -188,6 +188,7 @@ fn incomplete_join_is_not_saved() {
     let creator_cfg = creator_config(&creator_key);
     let member_key = SecretKey::generate();
     let pending = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -232,6 +233,7 @@ fn short_invite_join_bootstraps_policy_issuer_membership() {
     let invite = Invite::decode(&invite.code).unwrap();
     let member_key = SecretKey::generate();
     let mut join_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -359,6 +361,7 @@ fn joined_admin_cannot_issue_invite_for_ungranted_port() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -410,6 +413,7 @@ fn joined_peer_cannot_issue_invites() {
         connection_id: "ABC123".to_string(),
     };
     let mut member_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -595,6 +599,7 @@ fn joined_peer_cannot_revoke() {
         connection_id: "FED654".to_string(),
     };
     let mut member_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -784,6 +789,7 @@ fn non_admin_hello_does_not_advertise_directory() {
         connection_id: "FED654".to_string(),
     };
     let member_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,
@@ -942,6 +948,7 @@ fn joined_admin_can_update_network_policy() {
     )
     .unwrap();
     let mut admin_cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: 3,

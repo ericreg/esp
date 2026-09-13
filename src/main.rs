@@ -82,7 +82,9 @@ mod admin;
 mod cbor;
 mod destruction;
 mod networks;
+mod nfs;
 mod output;
+mod shares;
 mod status_output;
 #[cfg(unix)]
 mod transport;
@@ -96,6 +98,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(flatten)]
+    Files(shares::Commands),
     /// Create an independently stored network.
     Init {
         /// Admin label for this network.
@@ -199,6 +203,8 @@ enum Command {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u8,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<shares::Share>,
     #[serde(default)]
     pub transport: networks::TransportOverrides,
     #[serde(default)]
@@ -597,9 +603,14 @@ pub struct NetworkPolicyReport {
 #[derive(Clone)]
 struct ConfigActorHandle {
     sender: mpsc::Sender<ConfigActorCommand>,
+    files: std::sync::Arc<shares::Runtime>,
 }
 
 enum ConfigActorCommand {
+    Shares {
+        update: shares::Update,
+        respond: oneshot::Sender<Result<serde_json::Value>>,
+    },
     Snapshot {
         respond: oneshot::Sender<Result<Config>>,
     },
@@ -910,6 +921,9 @@ pub async fn run() -> Result<()> {
         ports: None,
         max_connections_per_peer: None,
     });
+    if let Command::Files(shares::Commands::MountHelper { ref request }) = command {
+        return shares::mounts::privileged(request);
+    }
     let is_daemon = matches!(command, Command::Daemon { .. } | Command::Admin { .. });
     #[cfg(unix)]
     let is_daemon = is_daemon || matches!(command, Command::ProxyTransport);
@@ -1059,6 +1073,7 @@ fn create_creator_config(
         network_label,
     )?;
     let cfg = Config {
+        shares: Vec::new(),
         transport: networks::TransportOverrides::default(),
         destruction: None,
         version: CONFIG_VERSION,
@@ -1550,6 +1565,8 @@ async fn handle_incoming_connection(
                 handle_control_connection(conn, actor, presence_id).await
             } else if alpn == TCP_ALPN {
                 handle_tcp_proxy_connection(conn, actor, allowed_ports, presence_id).await
+            } else if alpn == shares::ALPN {
+                shares::receive(conn, actor, presence_id).await
             } else {
                 conn.close(GRACEFUL_CLOSE, b"unknown alpn");
                 Ok(())
@@ -1712,19 +1729,31 @@ async fn sync_control_server(
 
 fn spawn_config_actor(path: PathBuf, cfg: Config) -> ConfigActorHandle {
     let (sender, receiver) = mpsc::channel(CONFIG_ACTOR_QUEUE);
-    tokio::spawn(run_config_actor(path, cfg, receiver));
-    ConfigActorHandle { sender }
+    let files = std::sync::Arc::new(shares::Runtime::new(path.clone(), &cfg));
+    tokio::spawn(run_config_actor(path, cfg, receiver, files.clone()));
+    ConfigActorHandle { sender, files }
 }
 
 async fn run_config_actor(
     path: PathBuf,
     mut cfg: Config,
     mut receiver: mpsc::Receiver<ConfigActorCommand>,
+    files: std::sync::Arc<shares::Runtime>,
 ) {
     let mut active_connections = HashMap::<EndpointId, HashMap<Uuid, oneshot::Sender<()>>>::new();
     let mut established = HashMap::<EndpointId, HashSet<Uuid>>::new();
     while let Some(command) = receiver.recv().await {
         match command {
+            ConfigActorCommand::Shares { update, respond } => {
+                let result = commit_config_change(&path, &mut cfg, |next| {
+                    let report = shares::apply(next, update)?;
+                    Ok((report, true))
+                });
+                if result.is_ok() {
+                    files.update(&cfg);
+                }
+                let _ = respond.send(result);
+            }
             ConfigActorCommand::Snapshot { respond } => {
                 let _ = respond.send(Ok(cfg.clone()));
             }
@@ -1757,6 +1786,7 @@ async fn run_config_actor(
                     cfg = next;
                     active_connections.clear();
                     established.clear();
+                    files.update(&cfg);
                     Ok(())
                 })();
                 let _ = respond.send(result);
@@ -2114,15 +2144,16 @@ impl ConfigActorHandle {
 
 impl ActiveConnectionGuard {
     async fn connected(&self) -> Result<()> {
-        ConfigActorHandle {
-            sender: self.sender.clone(),
-        }
-        .request(|respond| ConfigActorCommand::Connected {
-            node_id: self.node_id,
-            connection_id: self.connection_id,
-            respond,
-        })
-        .await
+        let (respond, receive) = oneshot::channel();
+        self.sender
+            .send(ConfigActorCommand::Connected {
+                node_id: self.node_id,
+                connection_id: self.connection_id,
+                respond,
+            })
+            .await
+            .map_err(|_| anyhow!("config actor stopped"))?;
+        receive.await.context("config actor dropped response")?
     }
 
     async fn cancelled(&mut self) {
@@ -3443,6 +3474,7 @@ impl Config {
         }
         validate_network_id(&self.network_id)?;
         self.transport.validate()?;
+        shares::validate(&self.shares)?;
         if let Some(record) = &self.destruction {
             return record.certificate.verify(self);
         }

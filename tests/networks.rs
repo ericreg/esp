@@ -267,6 +267,7 @@ fn pair(label: &str, ports: &[u16]) -> (Config, Config) {
         MembershipCertificate::issue(&origin, &key, &peer, ports, MembershipRole::Peer).unwrap();
     let other = Config {
         version: 3,
+        shares: Vec::new(),
         transport: TransportOverrides::default(),
         destruction: None,
         network_id: origin.network_id.clone(),
