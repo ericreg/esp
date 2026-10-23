@@ -100,23 +100,32 @@ esp daemon --ports 22,80,8080 --max-connections-per-peer 32
 
 ## Video sharing development
 
-The optional `video` feature currently provides read-only display discovery for
-Linux GNOME/Mutter. Build and run it from the graphical session:
+Experimental view-only sharing uses a Linux virtual display driver, software VP8,
+ESP's authenticated Iroh transport, and a native client window. The driver and
+userspace implementation are independent of the desktop environment. Host display
+compatibility and the macOS viewer still require interactive validation.
 
 ```sh
-cargo run --features video -- video displays
-cargo run --features video -- video displays --format json --no-color
+cargo build --release --features video-viewer --locked
+esp video displays
+esp video share my-network --display DISPLAY_ID --peer my-laptop
+esp video view my-network my-desktop
+esp video status my-network
+esp video stop my-network
 ```
 
-The report includes stable display IDs, current physical resolution, scaling,
-rotation, existing mirror groups, and a suggested encoded size. Displays that
-exceed the initial source limits or use unsupported color modes remain listed
-with a reason. API availability is reported separately from mirror support.
+The host needs the ESP virtual-display module and an active graphical logind
+session. Configure mirroring in normal display settings and confirm the source
+locally; automatic cross-GPU mirror verification is not implemented. No media is
+sent before that confirmation and initial driver capture. The client window is
+resizable, with F11 for fullscreen and no remote input forwarding. Closing the
+host share disconnects its virtual monitor.
 
-Virtual-mirror creation, encoding, transport, and viewing are still under
-development; see [the video sharing plan](VIDEO_SHARING_PLAN.md). Discovery does
-not change the display layout. The video tests use an isolated D-Bus service and
-require `dbus-daemon`; run them with `cargo test --features video`.
+See [driver setup, build dependencies, and validation](drivers/esp_video/README.md)
+and [the video sharing plan](VIDEO_SHARING_PLAN.md). ESP never loads modules or
+reboots automatically. SSH-only builds remain available without video features;
+`--features video` provides discovery and protocol/service support without codecs
+or windowing.
 
 ## Configuration
 

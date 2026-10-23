@@ -1,35 +1,8 @@
-//! Display identity and image sizing, independent of desktop and media libraries.
-
+//! Image limits and aspect-ratio-preserving sizing.
 use anyhow::{Result, ensure};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
-
 pub(super) const MAX_SOURCE_AXIS: u32 = 4096;
 pub(super) const MAX_SOURCE_PIXELS: u64 = 16_000_000;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(super) struct Identity {
-    pub connector: String,
-    pub vendor: String,
-    pub product: String,
-    pub serial: String,
-}
-
-impl Identity {
-    /// Include every backend identity field, so a changed reported identity on
-    /// the same connector cannot silently inherit a saved selection. Devices
-    /// reporting identical identities still need hotplug/generation tracking.
-    pub fn id(&self) -> String {
-        let mut hash = Sha256::new();
-        for field in [&self.connector, &self.vendor, &self.product, &self.serial] {
-            hash.update((field.len() as u64).to_be_bytes());
-            hash.update(field.as_bytes());
-        }
-        format!("mutter:{}", URL_SAFE_NO_PAD.encode(hash.finalize()))
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(super) struct Size {
     pub width: u32,
@@ -51,18 +24,6 @@ impl Size {
             "display exceeds the 16-megapixel source limit"
         );
         Ok(self)
-    }
-
-    pub fn transformed(self, transform: u32) -> Result<Self> {
-        ensure!(transform <= 7, "unknown display transform {transform}");
-        Ok(if transform % 2 == 1 {
-            Self {
-                width: self.height,
-                height: self.width,
-            }
-        } else {
-            self
-        })
     }
 
     /// Fit the physical pixels, never logical/DPI-scaled dimensions, within an
@@ -100,63 +61,9 @@ impl Size {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct Mode {
-    pub id: String,
-    pub pixels: Size,
-    pub refresh_hz: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct Placement {
-    pub x: i32,
-    pub y: i32,
-    pub scale: f64,
-    pub transform: u32,
-    pub primary: bool,
-    pub mirrored_connectors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(super) struct Display {
-    pub id: String,
-    pub identity: Identity,
-    pub name: String,
-    pub active: bool,
-    pub mode: Option<Mode>,
-    pub placement: Option<Placement>,
-    pub suggested_stream_size: Option<Size>,
-    pub source_unavailable_reason: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn selection_identity_detects_replacement_and_has_unambiguous_fields() {
-        let identity = Identity {
-            connector: "DP-1".into(),
-            vendor: "Vendor".into(),
-            product: "Monitor".into(),
-            serial: "123".into(),
-        };
-        let mut replacement = identity.clone();
-        replacement.serial = "456".into();
-        assert_ne!(identity.id(), replacement.id());
-        replacement = identity.clone();
-        replacement.connector = "DP-2".into();
-        assert_ne!(identity.id(), replacement.id());
-        let mut a = identity.clone();
-        a.vendor = "ab".into();
-        a.product = "c".into();
-        let mut b = identity.clone();
-        b.vendor = "a".into();
-        b.product = "bc".into();
-        assert_ne!(a.id(), b.id());
-        assert_eq!(identity.clone().id(), identity.id());
-    }
-
     #[test]
     fn fit_preserves_physical_aspect_ratio_without_upscaling() {
         let bounds = Size {
@@ -185,11 +92,9 @@ mod tests {
             }
         );
         let portrait = Size {
-            width: 3840,
-            height: 2160,
+            width: 2160,
+            height: 3840,
         }
-        .transformed(1)
-        .unwrap()
         .fit(bounds)
         .unwrap();
         assert_eq!(
@@ -244,17 +149,5 @@ mod tests {
             .fit(bounds)
             .is_err()
         );
-        assert!(bounds.transformed(8).is_err());
-        for transform in 0..8 {
-            let result = bounds.transformed(transform).unwrap();
-            assert_eq!(
-                (result.width, result.height),
-                if transform % 2 == 1 {
-                    (1080, 1920)
-                } else {
-                    (1920, 1080)
-                }
-            );
-        }
     }
 }

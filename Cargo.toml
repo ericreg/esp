@@ -5,7 +5,9 @@ edition = "2024"
 
 [features]
 default = []
-video = ["dep:zbus"]
+video = ["dep:zbus", "dep:video-drm"]
+video-codec = ["video"]
+video-viewer = ["video-codec", "dep:winit", "dep:softbuffer"]
 
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "std", "unstable-rendered-line-info"] }
@@ -28,10 +30,17 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.24.1", features = ["v4"] }
+winit = { version = "=0.30.13", optional = true }
+softbuffer = { version = "=0.4.8", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+video-drm = { version = "=0.14.1", package = "drm", optional = true }
 zbus = { version = "=5.19.0", optional = true, default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 iroh-relay = { version = "=1.0.3", features = ["server", "test-utils"] }
 tokio = { version = "1.53.1", features = ["test-util"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"

@@ -174,7 +174,7 @@ enum Command {
         #[command(flatten)]
         output: output::Arguments,
     },
-    /// Inspect local displays for experimental video sharing.
+    /// Share a virtual display with an authorized peer.
     #[cfg(feature = "video")]
     Video {
         #[command(subcommand)]
@@ -604,6 +604,8 @@ pub struct NetworkPolicyReport {
 
 #[derive(Clone)]
 struct ConfigActorHandle {
+    #[cfg(feature = "video")]
+    video: video::service::Service,
     sender: mpsc::Sender<ConfigActorCommand>,
 }
 
@@ -1556,6 +1558,11 @@ async fn handle_incoming_connection(
         result = async {
             if alpn == CONTROL_ALPN {
                 handle_control_connection(conn, actor, presence_id).await
+            } else if cfg!(feature = "video") && alpn == b"esp/video/cbor/1" {
+                #[cfg(feature = "video")]
+                { video::service::incoming(conn, actor, presence_id).await }
+                #[cfg(not(feature = "video"))]
+                { Ok(()) }
             } else if alpn == TCP_ALPN {
                 handle_tcp_proxy_connection(conn, actor, allowed_ports, presence_id).await
             } else {
@@ -1721,7 +1728,11 @@ async fn sync_control_server(
 fn spawn_config_actor(path: PathBuf, cfg: Config) -> ConfigActorHandle {
     let (sender, receiver) = mpsc::channel(CONFIG_ACTOR_QUEUE);
     tokio::spawn(run_config_actor(path, cfg, receiver));
-    ConfigActorHandle { sender }
+    ConfigActorHandle {
+        sender,
+        #[cfg(feature = "video")]
+        video: video::service::Service::default(),
+    }
 }
 
 async fn run_config_actor(
@@ -2122,15 +2133,16 @@ impl ConfigActorHandle {
 
 impl ActiveConnectionGuard {
     async fn connected(&self) -> Result<()> {
-        ConfigActorHandle {
-            sender: self.sender.clone(),
-        }
-        .request(|respond| ConfigActorCommand::Connected {
-            node_id: self.node_id,
-            connection_id: self.connection_id,
-            respond,
-        })
-        .await
+        let (respond, receive) = oneshot::channel();
+        self.sender
+            .send(ConfigActorCommand::Connected {
+                node_id: self.node_id,
+                connection_id: self.connection_id,
+                respond,
+            })
+            .await
+            .map_err(|_| anyhow!("config actor stopped"))?;
+        receive.await.context("config actor dropped response")?
     }
 
     async fn cancelled(&mut self) {

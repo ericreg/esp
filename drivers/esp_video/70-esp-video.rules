@@ -1,0 +1,2 @@
+# Allow the active local seat user to own the single capture endpoint.
+SUBSYSTEM=="misc", KERNEL=="esp-video", TAG+="uaccess"

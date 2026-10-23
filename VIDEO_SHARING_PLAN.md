@@ -1,6 +1,7 @@
 # ESP video sharing plan
 
-Status: implementation started, October 23, 2026.
+Status: experimental driver, video service, codec, and viewer implemented, October 23, 2026.
+Live display-stack compatibility and performance validation are pending.
 
 ESP will mirror one existing display into a virtual video output, encode its
 frames, and deliver them to a view-only client over the existing authenticated
@@ -21,30 +22,55 @@ primary or only display are outside this release. Session negotiation, health
 reports, and decoder recovery messages still travel from viewer to host; these
 are protocol messages, not remote user input.
 
-Planning defaults while platform and device preferences are unspecified:
+The selected architecture is an OS-visible virtual display driver. The host
+renders into that output as it would into a connected monitor; ESP consumes its
+frames, encodes them, and sends them over the network. Capture and streaming must
+not require GNOME, Mutter, KDE, wlroots, or desktop-specific discovery APIs.
 
-- Start with a Linux host and Linux/macOS viewers. First validate a specific
-  GNOME Wayland/Mutter version for hosting; broader Linux desktop support requires
-  additional backend validation. macOS hosting and Windows are later backends.
-- Interpret "virtual device" literally as an OS-visible virtual monitor that
-  mirrors the selected output. An internal capture stream is a simpler alternative,
-  but does not satisfy that literal requirement. The first implementation step
-  must establish the actual virtual-monitor path before the feature is advertised.
+- Linux hosting is the initial planning target, with Linux/macOS viewers; this
+  platform scope remains provisional. Other host OSes need their own display
+  device integration while sharing the media and network implementation.
+- Investigate existing Linux DRM/KMS virtual-display support before deciding
+  whether ESP needs its own kernel module. A driver-based architecture is selected;
+  the specific driver and userspace interface are not yet selected.
+- The virtual output must mirror exactly one existing output. Creating a new
+  output alone does not establish mirroring. Initial setup may use the host's
+  normal display settings; automatic desktop-specific layout configuration is
+  outside this design.
 
 This scope requires an existing, active graphical session and source display.
 Headless startup and sharing a login screen are later work.
 
 ### Implementation progress
 
-The optional `video` Cargo feature now exposes `esp video displays`. Its read-only
-Mutter backend enumerates displays, records stable identities and current layout,
-checks configuration/capture API availability, and computes a bounded stream
-size from physical pixels. Tests use synthetic layouts and an isolated D-Bus
-service. Existing display layout is not modified.
+- Added an ESP DRM/KMS virtual-display module and exclusive `/dev/esp-video`
+  frame interface. Closing the owning file disconnects the output. Compilation
+  passes against installed 6.18.55 and 7.2.9 kernel headers. Isolated VMs running
+  both kernels pass actual frame capture, repeated scanout, owner-death cleanup,
+  and module-unload tests. Real graphical-desktop mirroring remains untested.
+- Replaced Mutter discovery with read-only DRM enumeration and source identities
+  derived from device, connector, and EDID. No desktop-specific capture API remains.
+- Implemented foreground `share`, `view`, `status`, and `stop`, ephemeral peer
+  grants, mutual membership validation, revocation cancellation, bounded media
+  framing, presentation feedback, and direct/relayed Iroh video sessions.
+- Added a libvpx software VP8 wrapper with BT.601 limited-range conversion and a
+  winit/softbuffer viewer with resizing and F11 fullscreen. These are optional
+  Cargo features; the default build remains SSH-only.
+- The experimental host uses manual mirror setup and explicit local source
+  confirmation. It checks source and virtual-output activity/modes and logind
+  session/lock state. This is not automatic cross-GPU clone verification; later
+  layout changes cannot be fully detected through this interface.
+- Congestion ends the current connection/timeline, lowers bitrate and then frame
+  rate, and lets the viewer reconnect to the same share with a new decoder and
+  keyframe. Same-connection generation reset is deferred.
 
-The current development environment has no active graphical session. Actual
-virtual-mirror creation, capture, codec, and viewer validation remain in the first
-milestone; the discovery report explicitly labels mirror support unvalidated.
+Synthetic tests cover real direct and private forced-relay transport, grants,
+revocation, stop, stale shares, single-viewer limits, malformed media, presentation
+stalls, framing bounds, sizing, congestion policy, and codec color round trips.
+No test loads a module or alters the host display layout. Actual capture, cursor,
+lock reporting, display adoption, Linux-to-Mac presentation, and performance still
+require an interactive validation session. See
+[build and driver setup](drivers/esp_video/README.md).
 
 ## User workflow
 
@@ -52,102 +78,118 @@ These commands are proposed additions:
 
 | Command | Behavior |
 |---|---|
-| `esp video displays` | List locally available source displays and whether the backend supports creating a mirror. |
-| `esp video share NETWORK --display DISPLAY --peer PEER` | Create a mirror of that display and allow the selected network peer to view it. Run in the foreground. |
+| `esp video displays` | List driver-visible outputs, virtual-device capabilities, and mirror verification support. |
+| `esp video share NETWORK --display DISPLAY --peer PEER` | Create the virtual output, wait for local mirror confirmation and a driver frame, and allow the selected peer to view it. Run in the foreground. |
 | `esp video view NETWORK HOST` | Open the host's currently shared display in a view-only window. |
-| `esp video status [NETWORK]` | Report the share, selected source, viewer, stream format, connection state, and performance counters. |
+| `esp video status NETWORK` | Report the share, selected source, viewer, stream format, connection state, and performance counters. |
 | `esp video stop NETWORK` | Stop the local share and remove its virtual output. |
 
-`share` may accept `--fps`, `--max-size`, and `--bitrate` within the implementation
+`share` accepts `--fps`, `--max-size`, and `--bitrate` within the implementation
 limits below. Defaults target 30 FPS, a stream fitting within 1920 by 1080 pixels,
-and 4 Mbit/s. These are encoder limits, not changes to the physical display mode.
+and 4 Mbit/s (`--bitrate 4000`, in kbit/s). These are encoder limits, not changes to the physical display mode.
 
 The display must be chosen explicitly. Resolve its ID to a concrete backend
 identity before creating the virtual output. Detect stale IDs and require a new
 selection instead of falling back to another monitor. Resolve peer names once to
 the network UUID and full peer public key, following existing ambiguity rules.
 
-Show `preparing`, `ready`, `streaming`, and terminal errors clearly. Print `ready`
-only after mirror creation and capture are verified. Ctrl-C or loss of the sharing
+Show setup, waiting, readiness, and terminal errors clearly. Instruct the local
+user to select mirroring in normal display settings and type the selected source
+connector name to confirm. Print `ready` only after that local confirmation,
+virtual-output activation, and receipt of a driver frame. Automatic proof of the
+clone relationship remains a separate capability. Ctrl-C or loss of the sharing
 process ends the share. Closing the viewer releases its session while the host's
 foreground share remains ready for another connection from the same allowed peer.
 
-## Establish the virtual mirror backend first
+## Establish the virtual display driver first
 
-Creating an OS-visible monitor and capturing an existing monitor are distinct
-operations. The standard Linux ScreenCast portal describes `MONITOR` as capture
-of an existing monitor and `VIRTUAL` as extension with a new virtual monitor. It
-does not provide a general operation to configure that new monitor as a clone.
-[ScreenCast portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html).
+Expose a display device through Linux DRM/KMS, with monitor identity, supported
+modes, hotplug/lifetime behavior, and an explicit frame-delivery interface to the
+ESP sharing process. The driver receives rendered output; encoding, networking,
+and peer authorization stay in userspace. ESP must not read arbitrary physical-GPU
+memory or assume that a framebuffer represents the final composed image.
 
-The initial feasibility experiment should target GNOME Wayland:
+VKMS is a software KMS driver worth investigating. DRM writeback provides a
+mechanism for writing display output into memory. Neither establishes that a
+virtual device will be adopted by an existing desktop, mirror a physical GPU's
+output, or provide unattended frame access. These are feasibility gates rather
+than assumed capabilities.
+[VKMS documentation](https://kernel.org/doc/html/latest/gpu/vkms.html),
+[DRM/KMS documentation](https://docs.kernel.org/gpu/drm-kms.html).
 
-1. Enumerate the existing output and record its mode, scale, transform, layout,
-   and primary-display state.
-2. Investigate Mutter's `RecordVirtual` operation for creating an owned virtual
-   monitor with a mode compatible with the selected output. Obtain its PipeWire
-   stream and identify the new monitor without relying on a display index.
-3. Validate a clone configuration through `DisplayConfig`, then apply it
-   temporarily while preserving all existing outputs and the current primary.
-4. Confirm that the virtual monitor is visible to the OS, really mirrors only
-   the chosen source, and supplies matching captured pixels.
-5. Exercise normal shutdown, process death, source removal, and display-layout
-   changes before accepting this backend.
+The driver implementation and hardware validation must:
 
-These are candidate integration points, not evidence that every Mutter version
-supports the combination. Mutter explicitly marks its ScreenCast interface as
-private and offers no version compatibility promise. Pin and test supported
-versions, check capabilities at runtime, and isolate this code behind the display
-backend. `DisplayConfig` exposes configuration serials and verification/temporary
-application modes; use those to detect concurrent layout changes.
-[Mutter ScreenCast interface](https://github.com/GNOME/mutter/blob/main/data/dbus-interfaces/org.gnome.Mutter.ScreenCast.xml),
-[Mutter DisplayConfig interface](https://github.com/GNOME/mutter/blob/main/data/dbus-interfaces/org.gnome.Mutter.DisplayConfig.xml).
+1. Evaluate an existing virtual driver and identify any missing functionality
+   requiring a custom module. Record supported kernels, installation/loading
+   requirements, device permissions, and module-signing requirements where relevant.
+2. Expose one virtual monitor alongside the physical GPU without replacing the
+   active display server or taking its DRM master ownership. Verify that the host
+   detects and can drive the output through its normal display configuration.
+3. Configure a mirror through normal display settings and preserve the source's
+   mode, primary designation, and all other monitors. Prove how ESP identifies
+   and verifies the selected source and clone relationship without compositor
+   APIs. Cross-device mirroring may not be observable through DRM alone; resolving
+   this is a blocking design question, not permission to infer mirroring from size.
+4. Acquire complete virtual-output frames through a documented driver/userspace
+   interface. Specify buffer allocation, formats, stride, synchronization fences,
+   cursor/overlay composition, timestamps, and release semantics. Validate that
+   this works while the compositor owns display configuration.
+5. Exercise shutdown, owner death, source removal, mode changes, lock, and logout.
+   Test multiple desktop environments using the same ESP backend and record the
+   kernel/GPU/display-stack combinations that actually pass.
 
-Do not silently substitute an extended monitor or ordinary capture if mirroring
-is unavailable. Return `MirrorUnsupported`. If the experiment cannot meet the
-requirement, revise the host backend or explicitly change the virtual-device
-requirement before proceeding with that platform. KDE, wlroots, and X11 need
-their own verified approach; loading VKMS alone is not a complete mirror solution.
+Creating a monitor does not make it mirror another monitor: the host's display
+stack chooses what to render to it, just as with HDMI. The experimental implementation requires manual mirror setup and a local source
+confirmation before network frames are released. It verifies output activity and
+matching dimensions, which alone do not prove a clone relationship. Do not claim
+automatic mirroring or silently substitute ordinary screen capture. A future
+automatic mode must report `MirrorUnsupported` if the relationship cannot be
+verified.
 
-If an internal mirrored output is selected instead, use the ScreenCast portal
-with `MONITOR`, `multiple=false`, and exactly one returned stream. Keep the portal
-session alive and consume its authorized PipeWire connection. That alternative
-does not modify the host display layout and leaves the remaining media and
-transport design unchanged.
+The implementation must not require Mutter discovery, ScreenCast portal sessions,
+or PipeWire as its frame source. A userspace driver helper may manage local device
+access, but it must have a narrow interface and only the privileges needed for the
+owned virtual output. Never run the network transport or media decoder as root.
 
 ### Display ownership and cleanup
 
-- A `MirrorLease` owns the created output and capture session. Only the owning
+- A `MirrorLease` owns the created driver output and frame-delivery session. Only the owning
   sharing process may change or release it.
 - Keep the virtual output's mode compatible with the source; resize frames for
   transmission downstream. Never lower the physical display resolution to match
   the network stream.
-- Apply only temporary layout changes. On shutdown, remove the owned virtual
-  output and reconcile the surviving layout. Restore a saved configuration only
-  if it still matches the expected topology and configuration generation; do not
-  overwrite display changes made by the user in the meantime.
+- Keep the created output temporary. On shutdown, disconnect/remove that output
+  and let the host display stack reconcile the surviving layout. Do not overwrite
+  display changes made by the user or reapply saved desktop layouts.
 - Require automatic removal on owner/session death as a backend acceptance
   criterion. If a backend needs a cleanup helper, prove that helper's failure
   behavior before supporting it.
-- Source disconnection, capture permission loss, logout, or loss of a verified
-  mirror terminates the share. Never switch to another source automatically.
-- On source mode/scale/rotation changes, stop media, revalidate the mirror, and
-  begin a new stream generation. End the share if revalidation fails.
+- Source disconnection, driver access loss, logout, or virtual-output
+  deactivation terminates the share. Never switch to another source automatically.
+- On detectable source mode changes, stop the experimental share and require a
+  new local confirmation. Scale, rotation, and clone-layout changes that preserve
+  physical modes are not reliably observable through DRM enumeration; a stronger
+  backend must resolve this before claiming automatic revalidation.
 - Stop sharing when the source session locks. Require a new local `share` to
-  resume. The initial backend must provide a tested lock/session-loss signal.
+  resume. Validate an OS/session-level lock and logout signal independently of frame
+  capture. A driver alone cannot identify a locked desktop. If a reliable signal
+  is unavailable on a target, that target does not satisfy this release policy;
+  do not silently treat unchanged frames as a lock signal.
 
 ## Architecture and process boundaries
 
 ```mermaid
 flowchart LR
-    SOURCE["Selected physical output"] --> MIRROR["Owned virtual mirror"]
-    MIRROR --> CAPTURE["Capture and encode in sharing process"]
+    DESKTOP["Host display stack configured to mirror"] --> SOURCE["Selected physical output"]
+    DESKTOP --> MIRROR["ESP virtual display driver"]
+    MIRROR --> CAPTURE["Synchronized frames and userspace encoder"]
     CAPTURE -->|"Bounded local IPC"| HOST["Host ESP transport"]
     HOST -->|"Authenticated video protocol over Iroh"| CLIENT["Client ESP transport"]
     CLIENT -->|"Bounded local IPC"| VIEWER["Decode and display in viewer process"]
 ```
 
-Keep capture and GUI work in the user's graphical session. The shared transport
+Keep device/frame access in the local sharing process and GUI work in the viewer's
+graphical session. The shared transport
 continues to own network keys and Iroh endpoints. It authenticates sessions and
 forwards encoded frames; it does not create windows or load media codecs.
 
@@ -160,7 +202,9 @@ Define narrow interfaces for `DisplayBackend`, `MirrorLease`, `FrameSource`,
 `VideoEncoder`, and `VideoDecoder`. Backends report capabilities and typed errors.
 Raw frame metadata includes dimensions, stride, pixel format, orientation,
 color description, and a capture timestamp. Release capture buffers promptly;
-never hold a PipeWire buffer while awaiting network writes.
+never hold a driver-owned buffer while awaiting network writes. A slow encoder
+or network must not stall physical display presentation. Use bounded copies or
+explicit buffer ownership transfers and honor producer completion fences.
 
 ## Integration with the current ESP code
 
@@ -240,8 +284,8 @@ Initial limits are design targets to validate on reference hardware:
 
 Honor row stride and crop, convert orientation once, and test RGB/YUV conversion
 with known color patterns. Include the source cursor exactly once: request
-embedded capture when supported, otherwise compose supplied cursor metadata on
-the host. Unsupported cursor composition should produce an explicit limitation.
+a complete composed driver frame when supported, otherwise compose driver-provided
+cursor/plane metadata on the host. Unsupported cursor composition should produce an explicit limitation.
 Require an SDR capture path; reject unsupported HDR/color formats rather than
 silently applying an incorrect conversion. Lossy chroma subsampling may soften
 small colored text; lossless desktop modes and hardware codecs are later work.
@@ -254,33 +298,30 @@ per viewing session, with one bidirectional control stream and a host-to-viewer
 unidirectional media stream. Iroh 1.0.3 already exposes these stream operations
 and cancellation facilities. [Pinned Iroh API](https://docs.rs/iroh/1.0.3/iroh/endpoint/struct.Connection.html).
 
-Control messages use bounded CBOR with the existing 65,535-byte control-frame
-limit. Define stable numeric tags and typed errors for these messages:
+Setup messages use bounded CBOR with a 65,535-byte limit. The current protocol
+has `ClientHello` (membership identity and optional resume UUID) and
+`ServerResponse`, either a rejection or `ServerHello` containing the host identity,
+share UUID, and VP8 format limits. Both sides use the existing serialized config
+actor to validate membership, signed policy, and revocations. The client sends a
+one-byte ready acknowledgement only after validating the host.
 
-- `ClientHello`: protocol capabilities, network/membership proof, requested
-  viewing limits, and a resume share UUID when reconnecting.
-- `ServerHello`: server membership proof, active share UUID, source description,
-  and capabilities, released only after client authorization.
-- `Start` and `Ready`: mutually accepted codec, dimensions, color description,
-  frame rate, bitrate ceiling, and initial generation.
-- `ReceiverReport`, `RequestKeyframe`, `Ping`, `Pong`, `Stop`, and `Error`.
+The control stream then carries heartbeat requests/replies (byte `0`) and
+presentation acknowledgements (byte `1` followed by an eight-byte big-endian
+sequence). These messages never include keyboard, mouse, or display-control input.
+The host enables no incoming media streams; the viewer permits one media stream.
 
-Do not define any keyboard, pointer, clipboard, audio, or host display-control
-messages. Viewer-requested limits only affect the encoded stream, never the
-host's physical display configuration.
+Each media frame has a 22-byte binary header: version (`1`), keyframe flag,
+eight-byte sequence, eight-byte sender-relative capture timestamp, and four-byte
+payload length, followed by at most 2 MiB of VP8. Media does not use ESP's two-byte
+CBOR setup framing. Validate flags, lengths, dimensions, first-frame key status,
+and sequence progression before decoding. VP8 keyframe dimensions must match the
+negotiated format before invoking libvpx.
 
-Each media stream begins with a versioned header containing the share UUID,
-generation number, and full decoder configuration. A generation identifies an
-independent decoding timeline. Each frame carries a bounded binary header with
-sequence number, capture timestamp relative to session start, keyframe flag, and
-payload length, followed by encoded bytes. Use a four-byte length for media;
-video frames must not pass through ESP's two-byte CBOR setup framing.
-
-Validate lengths, integer arithmetic, dimensions, sequence progression, and
-bitstream keyframe dimensions before handing data to the decoder. The first
-frame of every generation must be a keyframe matching the negotiated format.
-Reject media before authorization, client-originated media, unexpected stream
-counts, and unsupported protocol versions.
+The current connection is one decoding timeline. Reset closes that connection;
+reconnection reauthenticates, requires the same share UUID, creates a new decoder,
+and requests a fresh keyframe. A new host share requires a new `view`. A later
+protocol can add generation IDs and coordinated media-stream replacement within
+one connection; that optimization is not implemented yet.
 
 ## Backpressure and recovery
 
@@ -295,24 +336,20 @@ including transport and IPC buffers, to prevent an increasingly delayed picture.
 - Decode dependent frames in sequence; obsolete decoded images can be skipped
   for presentation. Do not arbitrarily discard encoded interframes and then
   continue decoding their dependents.
-- Use media write deadlines and receiver reports, initially every 250 ms while
-  streaming. Reports echo the last presented sequence/timestamp. Measure backlog
-  in the sender's time domain without subtracting unsynchronized host clocks.
-  An unchanged desktop must not be mistaken for a stalled receiver.
-- If queued frame age exceeds 500 ms, a write cannot progress, or the decoder
-  reports lost state, abandon the current media stream, clear downstream queues,
-  increment the generation, and start a fresh stream with a forced keyframe.
-  Coordinate the switch on the control stream and reject late frames from old
-  generations. Bound overlap to one retiring and one active media stream. Allow
-  up to five seconds for the first keyframe of a generation before applying the
-  steady-state lag threshold; a keyframe burst must not create an immediate
-  reset loop. End the session if that bootstrap deadline expires.
-- A full encoded IPC queue must propagate a generation reset to the owner;
-  never silently lose an encoded frame inside a local bridge. Apply the same
-  bounds and reset rules on both local IPC hops.
-- Reduce bitrate and then frame rate within negotiated limits after sustained
-  congestion. Limit resets to one per second and report `NetworkTooSlow` after
-  repeated failure at the minimum supported rate instead of looping indefinitely.
+- Bound in-flight media to two frames using acknowledgements sent after actual
+  native-window presentation. Measure send-to-presentation-ack time in the host's
+  clock domain. `status` reports that round trip, bytes/frames sent, encoder targets,
+  and whether Iroh currently selects a direct or relayed path.
+- Allow five seconds for initial presentation, then enforce 500 ms write and
+  presentation-backlog bounds. A media gap, lagged broadcast receiver, or missed
+  deadline ends the current connection instead of forwarding broken interframes.
+- On media congestion, request a lower encoder bitrate; after reaching 500 kbit/s,
+  reduce frame rate down to 1 FPS. Reinitializing the encoder forces a keyframe.
+  Stop if the minimum rate still cannot sustain a connection. Reconnect attempts
+  are separated by one second and bounded to 30 seconds of unsuccessful recovery.
+- A full local encoder queue drops work before encoding. Owner IPC write failure
+  stops the share; viewer IPC write failure stops that viewing session. Neither
+  silently discards an already encoded dependent frame.
 
 Tune Iroh stream/connection windows so they do not hide an unbounded backlog.
 Choose changes supported by the pinned Iroh version and measure their effect on
@@ -331,32 +368,24 @@ explicit new `view`; revocation and local stop never trigger automatic restart.
 
 ## Local IPC and helper lifetime
 
-Add capability/version discovery before sending new streaming requests to a
-running helper. If an older helper cannot serve video, report that it needs a
-restart; do not kill it and interrupt active proxies. Peers without the video
-ALPN return `UnsupportedVideo` while other ESP services remain usable.
+A `video` manager request uses a new UUID-addressed CBOR variant, with operations
+for capability reporting, share registration, viewing, status, and stop. Helpers
+without video support fail the new request; the error directs users to restart an
+older helper manually. No automatic restart interrupts existing proxies.
 
-Use new UUID-addressed local manager requests for share registration, viewing,
-status, and stop. Each streaming local client holds a control/lease connection
-and a separate media connection for the current generation. Associate the media
-connection using a bounded, single-use attachment token issued on the private
-control connection and tied to that session. It is not a remote viewing grant.
+After bounded setup, each owner/viewer holds a full-duplex Unix connection. Owner
+media travels toward the helper, with keyframe/rate-reduction requests returning
+in the other direction. Viewer media travels out of the helper, with presentation
+acknowledgements returning. Fixed framing and write deadlines keep these bounded;
+status and stop use separate short-lived manager requests. No media I/O holds the
+manager lock.
 
-After setup, use dedicated, versioned local video framing with the same 2 MiB
-per-frame limit as the wire protocol. Resetting a generation closes and replaces
-its media connection, so partially written frames cannot corrupt the next
-generation or block stop/reset messages. Keep control traffic small and bounded.
-Share lifecycle changes remain serialized by the manager; media I/O never holds
-the manager or configuration actor lock.
-
-Reserve a preparing share before starting a media worker, but activate its
-viewing grant only after verified mirror/capture readiness. EOF from the owner's
-control connection removes the grant and cancels the remote viewer. EOF from the
-viewer's control connection cancels the outgoing video connection. A media EOF
-is recoverable only as part of an agreed generation reset; other media failures
-end that session. Manager/network shutdown closes these IPC connections; the
-sharing process responds by releasing its mirror. Unexpected shutdown cannot
-leave an advertised grant without a live owner.
+EOF from the owner's connection removes its grant and cancels the remote viewer.
+EOF from the viewer cancels its network connection. Stop, revocation, network
+removal, and manager shutdown cancel the registered connections and close local
+IPC. The sharing process joins its capture worker, closing the exclusive device
+file and disconnecting its monitor. Module removal and installation remain local
+administrative operations; ESP never loads modules or reboots automatically.
 
 Because grants and display selections are ephemeral, v1 needs no new persistent
 network configuration or signed certificate fields. New binary builds may add
@@ -379,7 +408,8 @@ and connection state without placing implementation details in the video image.
 
 Separate optional Cargo features for video protocol support, Linux hosting, and
 the viewer. Headless SSH-only builds must remain possible without desktop or
-codec dependencies. Document native library installation and package the macOS
+codec dependencies. Document driver installation, supported kernels, device access permissions,
+module signing when needed, and native library installation. Package the macOS
 viewer with a stable application identity and its native codec dependencies.
 Pin exact dependency versions during implementation and record license notices
 for the selected build; independently implemented ESP code does not require
@@ -390,42 +420,38 @@ reimplementing established codec algorithms.
 ```text
 src/video/
   mod.rs          commands, shared types, limits
-  protocol.rs     control messages and bounded media framing
-  service.rs      share grants, session state, authorization
-  transport.rs    Iroh sessions, generations, flow control
-  ipc.rs          local owner/viewer streaming
-  capture/mod.rs  display and frame-source interfaces
-  capture/mutter.rs  initial virtual-mirror feasibility/backend
-  codec.rs        owned libvpx encode/decode wrapper
-  viewer.rs       window lifecycle and presentation
-tests/video/      protocol, lifecycle, relay, and media tests
+  protocol.rs     setup types, limits, media framing, congestion policy
+  service.rs      grants, authorization, Iroh and local IPC, flow control
+  driver.rs       DRM discovery, exclusive capture, logind lifecycle
+  display.rs      source and encoded-size bounds
+  share.rs        local setup, capture/encoder worker, cleanup
+  codec.rs        libvpx wrapper and color conversion
+  vpx.c           small C boundary hiding native ABI structs
+  viewer.rs       decode, presentation feedback, window lifecycle
+  service_tests.rs  direct/private-relay and permission/lifecycle tests
+drivers/esp_video/  independent DRM/KMS module, UAPI and setup guide
+scripts/build-video-deps.sh  pinned private codec build
+third_party/libvpx/  codec license and patent grant
 ```
 
 Keep source-display creation independent from stream codecs and viewer rendering.
 A later primary-output mode should be a new backend capability and explicit
 local command, rather than a mode that can be selected remotely in v1.
 
-## Implementation sequence
+## Implementation and remaining validation
 
-1. **Prove display and codec feasibility.** Establish the platform/device
-   scope. On real hardware, create one OS-visible mirror, acquire frames,
-   remove it safely, and validate lock/hotplug behavior. Separately build a libvpx
-   encode/decode loop and the minimal window on Linux and macOS. Record supported
-   versions and dependency choices. A capture-only demo does not close this step
-   if an OS-visible mirror remains required.
-2. **Add the service and wire protocol with synthetic frames.** Implement
-   ephemeral grants, mutual membership validation, bounds, generation resets,
-   local capability negotiation, and helper lifetime. Exercise direct and forced
-   relay paths before integrating desktop capture.
-3. **Connect the real mirror and encoder.** Implement owned capture buffers,
-   scaling/color/cursor handling, bounded worker queues, and encoder recovery.
-   Expose share/status/stop commands and all terminal cleanup paths.
-4. **Complete the viewer and recovery behavior.** Integrate decoding and local
-   presentation, fullscreen, disconnect state, generation changes, liveness, and
-   reconnect to the same share. Validate Linux-to-Mac explicitly.
-5. **Validate performance and package the feature.** Run the acceptance matrix,
-   tune bounds using measured results, document backend limitations and required
-   packages, and publish only the OS/backend combinations that passed.
+1. **Validate the real display stack.** The independent module, userspace capture,
+   codec loop, and synthetic transport are implemented. Test desktop adoption,
+   manual clone setup, physical GPU buffer import, cursor/color handling,
+   lock/logout/hotplug, and preservation of existing display configuration.
+2. **Validate client presentation.** Run the native window on Linux and macOS,
+   including fullscreen, slow presentation, close, disconnect, and recovery.
+3. **Measure performance.** Run release builds with optimized libvpx through direct
+   and real relayed paths. Tune frame bounds and adaptation using CPU, memory,
+   bitrate, frame rate, and externally measured latency.
+4. **Harden and package.** Expand protocol fuzzing, installer/module-signing support,
+   and the supported kernel/GPU/desktop matrix. Keep automatic clone verification
+   and same-connection generation resets as explicitly deferred capabilities.
 
 ## Validation and acceptance
 
@@ -455,9 +481,12 @@ Hardware validation must prove the actual user-visible requirement:
 | Scenario | Acceptance condition |
 |---|---|
 | Several host monitors | Exactly the selected output is mirrored and streamed; no combined-desktop capture. |
+| Desktop independence | The same driver/userspace backend works across the declared Linux desktop environments without desktop-specific APIs. |
+| Driver coexistence | The active compositor retains display ownership; physical GPU outputs remain usable and slow streaming does not stall them. |
+| Mirror confirmation | No grant activates before explicit local confirmation and a live virtual output. Automatic clone verification remains unimplemented; test and document this limitation. |
 | OS-visible virtual display | It appears in display configuration as a clone of the source; source mode and primary designation are preserved. |
 | Normal and abnormal exit | The owned virtual output disappears; existing displays remain usable and no sharing grant survives. |
-| Source unplug, layout change, lock, logout | Safe stop or verified generation change; no automatic retargeting or exposure of a different display. |
+| Source unplug, layout change, lock, logout | Safe stop or explicit new local share; no automatic retargeting or exposure of a different display. |
 | Linux viewer and Apple Silicon Mac viewer | Both display the same live source with correct orientation, aspect ratio, and color. |
 | 1080p30 reference workload | Measure and record CPU, memory, actual FPS, average/peak bitrate, and readable desktop text. |
 | Low-latency LAN | Target median source-to-view latency below 150 ms and p95 below 300 ms on named reference hardware. |

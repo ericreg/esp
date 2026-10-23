@@ -320,6 +320,14 @@ pub(super) enum Request {
         #[n(1)]
         global: bool,
     },
+    #[cfg(feature = "video")]
+    #[n(36)]
+    Video {
+        #[n(0)]
+        id: String,
+        #[n(1)]
+        request: video::protocol::LocalRequest,
+    },
     #[n(35)]
     Promote {
         #[n(0)]
@@ -364,13 +372,20 @@ pub(super) struct Runtime {
 }
 impl Runtime {
     async fn start(path: PathBuf, cfg: Config, settings: TransportSettings) -> Result<Self> {
+        let alpns = vec![
+            CONTROL_ALPN.to_vec(),
+            TCP_ALPN.to_vec(),
+            destruction::ALPN.to_vec(),
+        ];
+        #[cfg(feature = "video")]
+        let alpns = {
+            let mut alpns = alpns;
+            alpns.push(video::protocol::ALPN.to_vec());
+            alpns
+        };
         let endpoint = Endpoint::builder(presets::N0)
             .secret_key(cfg.secret_key()?)
-            .alpns(vec![
-                CONTROL_ALPN.to_vec(),
-                TCP_ALPN.to_vec(),
-                destruction::ALPN.to_vec(),
-            ])
+            .alpns(alpns)
             .relay_mode(RelayMode::Default)
             .bind()
             .await?;
@@ -934,6 +949,22 @@ async fn handle(
             shutdown.notify_one();
         }
         return result;
+    }
+    #[cfg(feature = "video")]
+    if let Request::Video { id, request } = request {
+        let runtime = {
+            let manager = manager.lock().await;
+            manager
+                .runtime(&id)
+                .map(|r| (r.actor.clone(), r.endpoint.clone()))
+        };
+        return match runtime {
+            Ok((actor, endpoint)) => video::service::local(stream, actor, endpoint, request).await,
+            Err(e) => {
+                video::service::reply(&mut stream, video::protocol::Reply::Error(e.to_string()))
+                    .await
+            }
+        };
     }
     if let Request::Network { id, request } = request {
         let runtime = {
