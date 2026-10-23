@@ -1327,6 +1327,8 @@ pub(super) async fn execute(command: Command) -> Result<()> {
                 bail!("esp requires Unix sockets");
             }
         }
+        #[cfg(feature = "video")]
+        Command::Video { command } => video::execute(command).await,
         Command::Admin { network } => admin::run(network).await,
     }
 }

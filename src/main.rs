@@ -86,6 +86,8 @@ mod output;
 mod status_output;
 #[cfg(unix)]
 mod transport;
+#[cfg(feature = "video")]
+mod video;
 
 #[derive(Parser, Debug)]
 #[command(about = "A tiny iroh-backed SSH transport proxy")]
@@ -171,6 +173,12 @@ enum Command {
         role: MembershipRole,
         #[command(flatten)]
         output: output::Arguments,
+    },
+    /// Inspect local displays for experimental video sharing.
+    #[cfg(feature = "video")]
+    Video {
+        #[command(subcommand)]
+        command: video::Command,
     },
     /// Browse the network and revoke peers in an interactive terminal.
     Admin { network: Option<String> },

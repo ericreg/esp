@@ -1,6 +1,6 @@
 # ESP video sharing plan
 
-Status: proposed implementation plan, October 23, 2026.
+Status: implementation started, October 23, 2026.
 
 ESP will mirror one existing display into a virtual video output, encode its
 frames, and deliver them to a view-only client over the existing authenticated
@@ -33,6 +33,18 @@ Planning defaults while platform and device preferences are unspecified:
 
 This scope requires an existing, active graphical session and source display.
 Headless startup and sharing a login screen are later work.
+
+### Implementation progress
+
+The optional `video` Cargo feature now exposes `esp video displays`. Its read-only
+Mutter backend enumerates displays, records stable identities and current layout,
+checks configuration/capture API availability, and computes a bounded stream
+size from physical pixels. Tests use synthetic layouts and an isolated D-Bus
+service. Existing display layout is not modified.
+
+The current development environment has no active graphical session. Actual
+virtual-mirror creation, capture, codec, and viewer validation remain in the first
+milestone; the discovery report explicitly labels mirror support unvalidated.
 
 ## User workflow
 

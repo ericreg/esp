@@ -98,6 +98,26 @@ esp invite "Home network" "admin laptop" --role admin
 esp daemon --ports 22,80,8080 --max-connections-per-peer 32
 ```
 
+## Video sharing development
+
+The optional `video` feature currently provides read-only display discovery for
+Linux GNOME/Mutter. Build and run it from the graphical session:
+
+```sh
+cargo run --features video -- video displays
+cargo run --features video -- video displays --format json --no-color
+```
+
+The report includes stable display IDs, current physical resolution, scaling,
+rotation, existing mirror groups, and a suggested encoded size. Displays that
+exceed the initial source limits or use unsupported color modes remain listed
+with a reason. API availability is reported separately from mirror support.
+
+Virtual-mirror creation, encoding, transport, and viewing are still under
+development; see [the video sharing plan](VIDEO_SHARING_PLAN.md). Discovery does
+not change the display layout. The video tests use an isolated D-Bus service and
+require `dbus-daemon`; run them with `cargo test --features video`.
+
 ## Configuration
 
 Global preferences live in `~/.esp/config.yml`:
