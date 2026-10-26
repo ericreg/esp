@@ -12,9 +12,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand, ValueEnum};
 use iroh::{
-    Endpoint, EndpointId, RelayMode, SecretKey, Signature,
-    endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt, presets},
+    Endpoint, EndpointId, SecretKey, Signature,
+    endpoint::{Connection, Incoming, RecvStream, SendStream, VarInt},
 };
+#[cfg(test)]
+use iroh::{RelayMode, endpoint::presets};
 use minicbor::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -81,6 +83,7 @@ static DAEMON_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 mod admin;
 mod cbor;
 mod destruction;
+mod discovery;
 mod networks;
 mod output;
 mod status_output;
@@ -1343,9 +1346,7 @@ async fn handle_local_control_connection(
 
 async fn sync_joined_config_once(cfg: &mut Config, inviter: &Peer) -> Result<bool> {
     let secret_key = cfg.secret_key()?;
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret_key)
-        .relay_mode(RelayMode::Default)
+    let endpoint = discovery::endpoint_builder(secret_key)
         .bind()
         .await
         .context("failed to bind iroh endpoint for join sync")?;

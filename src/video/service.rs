@@ -114,7 +114,7 @@ pub async fn local(
         LocalRequest::Capabilities => {
             reply(
                 &mut stream,
-                Reply::Report("{\"version\":1,\"codec\":\"vp8\"}".into()),
+                Reply::Report("{\"version\":1,\"codec\":\"av1\"}".into()),
             )
             .await
         }

@@ -1,85 +1,263 @@
-//! Bounded, independently owned libvpx wrapper and BT.601 limited-range conversion.
+//! Bounded AV1 codecs and BT.601 limited-range conversion. No system codec library.
 use super::protocol::{Format, MAX_FRAME};
-use anyhow::{Result, ensure};
-use std::ffi::{c_int, c_void};
+use anyhow::{Result, anyhow, ensure};
+use rav1e::prelude::*;
+use std::{collections::VecDeque, ptr::NonNull};
 
-unsafe extern "C" {
-    fn esp_vpx_encoder(w: u32, h: u32, fps: u32, kbps: u32) -> *mut c_void;
-    fn esp_vpx_decoder(w: u32, h: u32) -> *mut c_void;
-    fn esp_vpx_free(ctx: *mut c_void);
-    fn esp_vpx_encode(
-        ctx: *mut c_void,
-        yuv: *const u8,
-        pts: i64,
-        force: c_int,
-        out: *mut u8,
-        capacity: usize,
-        len: *mut usize,
-        key: *mut c_int,
-    ) -> c_int;
-    fn esp_vpx_decode(ctx: *mut c_void, input: *const u8, len: usize, out: *mut u8) -> c_int;
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(6))
 }
-pub struct Codec {
-    ctx: *mut c_void,
+
+pub struct Encoded {
+    pub timestamp_us: u64,
+    pub data: Vec<u8>,
+    pub key: bool,
+}
+
+pub struct Encoder {
+    context: Context<u8>,
     format: Format,
+    threads: usize,
+    timestamps: VecDeque<u64>,
+    next_output: u64,
 }
-// Each context is exclusively moved to and used by a single bounded worker.
-unsafe impl Send for Codec {}
-impl Drop for Codec {
-    fn drop(&mut self) {
-        unsafe { esp_vpx_free(self.ctx) }
-    }
-}
-impl Codec {
-    pub fn encoder(format: Format) -> Result<Self> {
+impl Encoder {
+    pub fn new(format: Format, threads: usize) -> Result<Self> {
         format.validate()?;
-        let ctx = unsafe { esp_vpx_encoder(format.width, format.height, format.fps, format.kbps) };
-        ensure!(!ctx.is_null(), "libvpx encoder initialization failed");
-        Ok(Self { ctx, format })
+        ensure!(
+            (1..=64).contains(&threads),
+            "encoder threads must be between 1 and 64"
+        );
+        let mut config = EncoderConfig::with_speed_preset(10);
+        config.width = format.width as usize;
+        config.height = format.height as usize;
+        config.time_base = Rational {
+            num: 1,
+            den: format.fps as u64,
+        };
+        config.low_latency = true;
+        config.speed_settings.rdo_lookahead_frames = 1;
+        config.tiles = 16;
+        config.min_key_frame_interval = format.fps as u64;
+        config.max_key_frame_interval = format.fps as u64;
+        config.bitrate = (format.kbps * 1000) as i32;
+        config.quantizer = 255;
+        config.bit_depth = 8;
+        config.chroma_sampling = ChromaSampling::Cs420;
+        config.pixel_range = PixelRange::Limited;
+        let context = Config::new()
+            .with_encoder_config(config)
+            .with_threads(threads)
+            .new_context()?;
+        Ok(Self {
+            context,
+            format,
+            threads,
+            timestamps: VecDeque::new(),
+            next_output: 0,
+        })
     }
-    pub fn decoder(format: Format) -> Result<Self> {
-        format.validate()?;
-        let ctx = unsafe { esp_vpx_decoder(format.width, format.height) };
-        ensure!(!ctx.is_null(), "libvpx decoder initialization failed");
-        Ok(Self { ctx, format })
-    }
-    pub fn encode(&mut self, yuv: &[u8], pts: i64, force: bool) -> Result<(Vec<u8>, bool)> {
+    /// Output is delayed. The caller must continue feeding frames even on a static screen.
+    /// A reset discards only unpublished inputs and starts an independent decoding timeline.
+    pub fn encode(&mut self, yuv: &[u8], timestamp_us: u64, force: bool) -> Result<Vec<Encoded>> {
         ensure!(
             yuv.len() == self.format.yuv_bytes(),
             "invalid encoder input size"
         );
-        let mut out = vec![0; MAX_FRAME];
-        let mut len = 0;
-        let mut key = 0;
-        let result = unsafe {
-            esp_vpx_encode(
-                self.ctx,
-                yuv.as_ptr(),
-                pts,
-                force.into(),
-                out.as_mut_ptr(),
-                out.len(),
-                &mut len,
-                &mut key,
-            )
-        };
+        if force {
+            *self = Self::new(self.format, self.threads)?;
+        }
         ensure!(
-            result == 0 && len > 0 && len <= out.len(),
-            "libvpx encode failed: {result}"
+            self.timestamps.len() < 16,
+            "AV1 encoder input backlog exceeded"
         );
-        out.truncate(len);
-        Ok((out, key != 0))
+        let mut frame = self.context.new_frame();
+        let mut offset = 0;
+        for (i, plane) in frame.planes.iter_mut().enumerate() {
+            let w = (self.format.width as usize) >> usize::from(i > 0);
+            let h = (self.format.height as usize) >> usize::from(i > 0);
+            plane.copy_from_raw_u8(&yuv[offset..offset + w * h], w, 1);
+            offset += w * h;
+        }
+        self.context.send_frame(frame)?;
+        self.timestamps.push_back(timestamp_us);
+        self.receive()
     }
-    pub fn decode(&mut self, data: &[u8]) -> Result<Vec<u32>> {
+    fn receive(&mut self) -> Result<Vec<Encoded>> {
+        let mut packets = Vec::new();
+        loop {
+            match self.context.receive_packet() {
+                Ok(packet) => {
+                    ensure!(
+                        packet.input_frameno == self.next_output,
+                        "AV1 output reordered"
+                    );
+                    ensure!(
+                        !packet.data.is_empty() && packet.data.len() <= MAX_FRAME,
+                        "AV1 packet exceeds media limit"
+                    );
+                    let timestamp_us = self
+                        .timestamps
+                        .pop_front()
+                        .ok_or_else(|| anyhow!("unexpected AV1 output"))?;
+                    self.next_output += 1;
+                    packets.push(Encoded {
+                        timestamp_us,
+                        data: packet.data,
+                        key: packet.frame_type == FrameType::KEY,
+                    });
+                }
+                Err(EncoderStatus::Encoded) => continue,
+                Err(EncoderStatus::NeedMoreData | EncoderStatus::LimitReached) => break,
+                Err(error) => return Err(anyhow!("rav1e receive: {error:?}")),
+            }
+        }
+        Ok(packets)
+    }
+    #[cfg(test)]
+    pub fn finish(&mut self) -> Result<Vec<Encoded>> {
+        self.context.flush();
+        self.receive()
+    }
+}
+
+use rav1d::{
+    include::dav1d::{
+        data::Dav1dData,
+        dav1d::{Dav1dContext, Dav1dSettings},
+        picture::Dav1dPicture,
+    },
+    src::lib::*,
+};
+
+// rav1d's public interface retains dav1d's C ABI, but these calls execute Rust.
+// No native codec library is linked. Each allocation has an explicit Drop owner.
+pub struct Av1Decoder {
+    context: Option<Dav1dContext>,
+    width: usize,
+    height: usize,
+}
+// SAFETY: this wrapper uniquely owns the context. All public operations require
+// &mut self, pictures/data are released before returning, and rav1d owns and
+// synchronizes its internal workers. The raw C-ABI handle has no thread affinity.
+unsafe impl Send for Av1Decoder {}
+
+struct Data(Dav1dData);
+impl Drop for Data {
+    fn drop(&mut self) {
+        unsafe { dav1d_data_unref(Some(NonNull::from(&mut self.0))) }
+    }
+}
+struct Picture(Dav1dPicture);
+impl Drop for Picture {
+    fn drop(&mut self) {
+        unsafe { dav1d_picture_unref(Some(NonNull::from(&mut self.0))) }
+    }
+}
+impl Drop for Av1Decoder {
+    fn drop(&mut self) {
+        unsafe { dav1d_close(Some(NonNull::from(&mut self.context))) }
+    }
+}
+impl Av1Decoder {
+    pub fn new(format: Format) -> Result<Self> {
+        format.validate()?;
+        let mut settings = std::mem::MaybeUninit::<Dav1dSettings>::uninit();
+        // SAFETY: default_settings initializes the complete live settings allocation.
+        unsafe { dav1d_default_settings(NonNull::new(settings.as_mut_ptr()).unwrap()) };
+        let mut settings = unsafe { settings.assume_init() };
+        settings.n_threads = default_threads() as i32;
+        settings.max_frame_delay = 1;
+        settings.apply_grain = 0;
+        settings.frame_size_limit = format.width * format.height;
+        let mut this = Self {
+            context: None,
+            width: format.width as usize,
+            height: format.height as usize,
+        };
+        let code = unsafe {
+            dav1d_open(
+                Some(NonNull::from(&mut this.context)),
+                Some(NonNull::from(&mut settings)),
+            )
+        }
+        .0;
+        ensure!(code == 0, "rav1d open: {code}");
+        Ok(this)
+    }
+    pub fn decode(&mut self, bytes: &[u8], key: bool) -> Result<Vec<u32>> {
         ensure!(
-            !data.is_empty() && data.len() <= MAX_FRAME,
-            "invalid decoder input size"
+            !bytes.is_empty() && bytes.len() <= MAX_FRAME,
+            "invalid AV1 packet size"
         );
-        let mut yuv = vec![0; self.format.yuv_bytes()];
-        let result =
-            unsafe { esp_vpx_decode(self.ctx, data.as_ptr(), data.len(), yuv.as_mut_ptr()) };
-        ensure!(result == 0, "libvpx decode failed: {result}");
-        Ok(yuv_to_rgb(&yuv, self.format))
+        let mut data = Data(Dav1dData::default());
+        let mut picture = Picture(Dav1dPicture::default());
+        // SAFETY: data_create allocates bytes.len() writable bytes, owned by Data.
+        // The context remains open; all out pointers refer to live exclusive values.
+        unsafe {
+            let ptr = dav1d_data_create(Some(NonNull::from(&mut data.0)), bytes.len());
+            ensure!(!ptr.is_null(), "rav1d allocation failed");
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            let code = dav1d_send_data(self.context, Some(NonNull::from(&mut data.0))).0;
+            ensure!(
+                code == 0 && data.0.sz == 0,
+                "rav1d send: {code}; unconsumed bytes {}",
+                data.0.sz
+            );
+            let code = dav1d_get_picture(self.context, Some(NonNull::from(&mut picture.0))).0;
+            ensure!(
+                code == 0,
+                "rav1d receive: {code}; expected one immediate picture per packet"
+            );
+            ensure!(
+                picture.0.p.w == self.width as i32
+                    && picture.0.p.h == self.height as i32
+                    && picture.0.p.bpc == 8
+                    && picture.0.p.layout
+                        == rav1d::include::dav1d::headers::DAV1D_PIXEL_LAYOUT_I420,
+                "unexpected decoded dimensions/bit depth"
+            );
+            // Header remains owned by Picture until its Drop at the end of this call.
+            let header = picture
+                .0
+                .frame_hdr
+                .ok_or_else(|| anyhow!("missing AV1 frame header"))?;
+            ensure!(
+                (header.as_ref().frame_type
+                    == rav1d::include::dav1d::headers::DAV1D_FRAME_TYPE_KEY)
+                    == key,
+                "AV1 keyframe flag mismatch"
+            );
+            let mut planes = [vec![], vec![], vec![]];
+            for (i, plane) in planes.iter_mut().enumerate() {
+                let w = self.width >> usize::from(i > 0);
+                let h = self.height >> usize::from(i > 0);
+                let stride = picture.0.stride[usize::from(i > 0)];
+                ensure!(stride >= w as isize, "invalid decoded stride");
+                let ptr = picture.0.data[i]
+                    .ok_or_else(|| anyhow!("missing decoded plane"))?
+                    .as_ptr()
+                    .cast::<u8>();
+                plane.reserve(w * h);
+                // SAFETY: rav1d owns each returned 8-bit I420 plane until Picture drops.
+                for row in 0..h {
+                    plane.extend_from_slice(std::slice::from_raw_parts(
+                        ptr.offset(row as isize * stride),
+                        w,
+                    ));
+                }
+            }
+            let yuv = planes.concat();
+            Ok(yuv_to_rgb(
+                &yuv,
+                Format {
+                    width: self.width as u32,
+                    height: self.height as u32,
+                    fps: 30,
+                    kbps: 4000,
+                },
+            ))
+        }
     }
 }
 
@@ -150,29 +328,133 @@ fn yuv_to_rgb(yuv: &[u8], f: Format) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn known_colors_roundtrip() {
-        let f = Format {
+    fn format() -> Format {
+        Format {
             width: 64,
             height: 48,
             fps: 30,
             kbps: 4000,
-        };
-        let mut raw = vec![0; 64 * 48 * 4];
+        }
+    }
+    fn red(f: Format) -> Vec<u8> {
+        let mut raw = vec![0; f.width as usize * f.height as usize * 4];
         for pixel in raw.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[0, 0, 255, 0]);
         }
-        let yuv = xrgb_to_yuv(&raw, 64, 48, f).unwrap();
-        let mut enc = Codec::encoder(f).unwrap();
-        let mut dec = Codec::decoder(f).unwrap();
-        for pts in 0..3 {
-            let (packet, key) = enc.encode(&yuv, pts, pts == 0).unwrap();
-            assert!(pts != 0 || key);
-            let rgb = dec.decode(&packet).unwrap();
-            for px in rgb {
-                assert!((px >> 16) & 255 > 230);
-                assert!(px & 65535 < 0x1010);
+        xrgb_to_yuv(&raw, f.width, f.height, f).unwrap()
+    }
+    #[test]
+    fn delayed_av1_roundtrip_and_forced_restart() {
+        for threads in [1, 6] {
+            let f = format();
+            let yuv = red(f);
+            let mut enc = Encoder::new(f, threads).unwrap();
+            // Restart while the old stream still has unpublished buffered inputs.
+            for generation in 0..2 {
+                let mut dec = Av1Decoder::new(f).unwrap();
+                let mut packets = Vec::new();
+                for input in 0..12 {
+                    packets.extend(
+                        enc.encode(&yuv, generation * 1000 + input, input == 0)
+                            .unwrap(),
+                    );
+                }
+                assert!(
+                    !packets.is_empty(),
+                    "static content must produce output without flushing"
+                );
+                assert!(packets[0].key);
+                for (i, p) in packets.iter().enumerate() {
+                    assert_eq!(p.timestamp_us, generation * 1000 + i as u64);
+                    let rgb = dec.decode(&p.data, p.key).unwrap();
+                    assert!(
+                        rgb.into_iter()
+                            .all(|px| (px >> 16) & 255 > 230 && px & 65535 < 0x1010)
+                    );
+                }
+                if generation == 1 {
+                    let tail = enc.finish().unwrap();
+                    assert_eq!(packets.len() + tail.len(), 12);
+                    for p in tail {
+                        dec.decode(&p.data, p.key).unwrap();
+                    }
+                }
             }
         }
+    }
+    #[test]
+    fn periodic_keyframes_and_bitrate_reconfiguration() {
+        let f = Format {
+            width: 256,
+            height: 128,
+            fps: 5,
+            kbps: 500,
+        };
+        let mut decoder = Av1Decoder::new(f).unwrap();
+        for format in [
+            f,
+            Format {
+                kbps: 1000,
+                fps: 1,
+                ..f
+            },
+        ] {
+            let mut encoder = Encoder::new(format, 6).unwrap();
+            let yuv = red(format);
+            let mut packets = Vec::new();
+            for i in 0..16 {
+                packets.extend(encoder.encode(&yuv, i, false).unwrap());
+            }
+            packets.extend(encoder.finish().unwrap());
+            assert_eq!(packets.len(), 16);
+            assert!(packets[0].key);
+            let mut last_key = 0;
+            for (i, packet) in packets.iter().enumerate() {
+                if packet.key {
+                    last_key = i;
+                }
+                assert!(i - last_key < format.fps as usize);
+                decoder.decode(&packet.data, packet.key).unwrap();
+            }
+            if format.fps > 1 {
+                assert!(packets.iter().any(|p| !p.key));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_dimensions_key_flags_and_malformed_packets() {
+        let f = format();
+        let mut enc = Encoder::new(f, 2).unwrap();
+        let mut packets = enc.encode(&red(f), 123, false).unwrap();
+        packets.extend(enc.finish().unwrap());
+        let packet = &packets[0];
+        assert!(
+            Av1Decoder::new(f)
+                .unwrap()
+                .decode(&packet.data, false)
+                .is_err()
+        );
+        let wrong = Format {
+            width: 32,
+            height: 96,
+            ..f
+        };
+        assert!(
+            Av1Decoder::new(wrong)
+                .unwrap()
+                .decode(&packet.data, true)
+                .is_err()
+        );
+        for bytes in [
+            &[][..],
+            &[0xff; 10][..],
+            &packet.data[..packet.data.len() / 2],
+        ] {
+            assert!(Av1Decoder::new(f).unwrap().decode(bytes, true).is_err());
+        }
+        assert!(Encoder::new(f, 0).is_err());
+        assert!(Encoder::new(f, 65).is_err());
+        assert!((1..=6).contains(&default_threads()));
     }
 }

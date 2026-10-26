@@ -204,7 +204,7 @@ fn frame(sequence: u64) -> Frame {
         sequence,
         timestamp_us: sequence * 33333,
         key: true,
-        data: vec![0x10, 0, 0, 0x9d, 1, 0x2a, 64, 0, 48, 0].into(),
+        data: vec![0x12, 0].into(),
     }
 }
 async fn ack(client: &mut UnixStream, sequence: u64) {
@@ -406,7 +406,7 @@ async fn owner_exit_and_network_destruction_cancel_an_active_viewer() {
 #[cfg(feature = "video-codec")]
 #[tokio::test]
 async fn encoded_pixels_survive_direct_and_relayed_video() {
-    use crate::video::codec::{Codec, xrgb_to_yuv};
+    use crate::video::codec::{Av1Decoder, Encoder, xrgb_to_yuv};
     for relayed in [false, true] {
         let f = Fixture::new(relayed).await;
         let (mut owner, owner_task, _) = f.owner().await;
@@ -417,17 +417,21 @@ async fn encoded_pixels_survive_direct_and_relayed_video() {
             pixel.copy_from_slice(&[0, 0, 255, 0]);
         }
         let yuv = xrgb_to_yuv(&raw, 64, 48, format()).unwrap();
-        let mut encoder = Codec::encoder(format()).unwrap();
-        let mut decoder = Codec::decoder(format()).unwrap();
-        for sequence in 0..3 {
-            let (data, key) = encoder
-                .encode(&yuv, sequence as i64, sequence == 0)
-                .unwrap();
+        let mut encoder = Encoder::new(format(), 2).unwrap();
+        let mut decoder = Av1Decoder::new(format()).unwrap();
+        let mut packets = Vec::new();
+        for sequence in 0..8 {
+            packets.extend(encoder.encode(&yuv, sequence * 33333, false).unwrap());
+        }
+        packets.extend(encoder.finish().unwrap());
+        assert_eq!(packets.len(), 8);
+        for (sequence, packet) in packets.into_iter().enumerate() {
+            let sequence = sequence as u64;
             let frame = Frame {
                 sequence,
-                timestamp_us: sequence * 33333,
-                key,
-                data: data.into(),
+                timestamp_us: packet.timestamp_us,
+                key: packet.key,
+                data: packet.data.into(),
             };
             write_frame(&mut owner, &frame).await.unwrap();
             let received = timeout(Duration::from_secs(3), read_frame(&mut client))
@@ -435,7 +439,7 @@ async fn encoded_pixels_survive_direct_and_relayed_video() {
                 .unwrap()
                 .unwrap();
             assert_eq!(received.data, frame.data);
-            let pixels = decoder.decode(&received.data).unwrap();
+            let pixels = decoder.decode(&received.data, received.key).unwrap();
             assert!(
                 pixels
                     .into_iter()

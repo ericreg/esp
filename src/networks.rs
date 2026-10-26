@@ -383,10 +383,8 @@ impl Runtime {
             alpns.push(video::protocol::ALPN.to_vec());
             alpns
         };
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(cfg.secret_key()?)
+        let endpoint = discovery::endpoint_builder(cfg.secret_key()?)
             .alpns(alpns)
-            .relay_mode(RelayMode::Default)
             .bind()
             .await?;
         Ok(Self::attach(path, cfg, settings, endpoint))

@@ -100,7 +100,7 @@ esp daemon --ports 22,80,8080 --max-connections-per-peer 32
 
 ## Video sharing development
 
-Experimental view-only sharing uses a Linux virtual display driver, software VP8,
+Experimental view-only sharing uses a Linux virtual display driver, software AV1 (rav1e/rav1d),
 ESP's authenticated Iroh transport, and a native client window. The driver and
 userspace implementation are independent of the desktop environment. Host display
 compatibility and the macOS viewer still require interactive validation.
@@ -113,6 +113,12 @@ esp video view my-network my-desktop
 esp video status my-network
 esp video stop my-network
 ```
+
+AV1 encoding defaults to at most six worker threads; use `--threads N` to override
+that limit (1–64). Assembly optimizations are enabled by default; x86-64 builds
+need NASM. Use `--no-default-features --features video-viewer` for Rust-only codecs.
+This is an AV1-only breaking change with unchanged protocol identifiers; upgrade
+both endpoints and restart helpers.
 
 The host needs the ESP virtual-display module and an active graphical logind
 session. Configure mirroring in normal display settings and confirm the source

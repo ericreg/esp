@@ -25,10 +25,10 @@ pub struct Format {
 impl Format {
     pub fn validate(self) -> Result<()> {
         ensure!(
-            (2..=1920).contains(&self.width)
-                && (2..=1080).contains(&self.height)
-                && self.width % 2 == 0
-                && self.height % 2 == 0,
+            (16..=1920).contains(&self.width)
+                && (16..=1080).contains(&self.height)
+                && self.width.is_multiple_of(2)
+                && self.height.is_multiple_of(2),
             "unsupported video dimensions"
         );
         ensure!(
@@ -151,26 +151,10 @@ impl Frame {
             !self.data.is_empty() && self.data.len() <= MAX_FRAME,
             "invalid video frame length"
         );
-        ensure!(self.data.len() >= 3, "truncated VP8 frame header");
-        let tag = u32::from_le_bytes([self.data[0], self.data[1], self.data[2], 0]);
-        let key = tag & 1 == 0;
-        ensure!(tag & 16 != 0, "invisible VP8 frame is unsupported");
-        ensure!(
-            key == self.key && (!need_key || key),
-            "expected VP8 keyframe"
-        );
-        if key {
-            ensure!(
-                self.data.len() >= 10 && self.data[3..6] == [0x9d, 0x01, 0x2a],
-                "invalid VP8 keyframe"
-            );
-            let w = u16::from_le_bytes([self.data[6], self.data[7]]) & 0x3fff;
-            let h = u16::from_le_bytes([self.data[8], self.data[9]]) & 0x3fff;
-            ensure!(
-                u32::from(w) == format.width && u32::from(h) == format.height,
-                "VP8 dimensions differ from negotiated format"
-            );
-        }
+        format.validate()?;
+        // Codec-independent services validate the envelope. rav1d validates actual
+        // dimensions, bit depth and keyframe flags before the viewer presents pixels.
+        ensure!(!need_key || self.key, "expected AV1 keyframe");
         Ok(())
     }
 }
@@ -249,7 +233,7 @@ mod tests {
         assert_eq!((previous.kbps, previous.fps), (500, 1));
     }
     #[test]
-    fn rejects_keyframe_dimension_changes() {
+    fn rejects_missing_keyframe_and_invalid_format() {
         let format = Format {
             width: 64,
             height: 48,
@@ -260,12 +244,10 @@ mod tests {
             sequence: 0,
             timestamp_us: 0,
             key: true,
-            data: vec![0x10, 0, 0, 0x9d, 1, 0x2a, 64, 0, 48, 0].into(),
+            data: vec![0x12, 0].into(),
         };
         frame.validate(format, true).unwrap();
-        let mut data = frame.data.to_vec();
-        data[6] = 65;
-        frame.data = data.into();
+        frame.key = false;
         assert!(frame.validate(format, true).is_err());
         assert!(
             Format {

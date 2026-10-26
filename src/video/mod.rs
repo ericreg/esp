@@ -38,6 +38,9 @@ pub(super) enum Command {
         /// Average target bitrate in kbit/s.
         #[arg(long,default_value_t=4000,value_parser=clap::value_parser!(u32).range(500..=12000))]
         bitrate: u32,
+        /// Encoder worker limit (default: available CPUs, capped at six).
+        #[arg(long, default_value_t=codec::default_threads() as u32, value_parser=clap::value_parser!(u32).range(1..=64))]
+        threads: u32,
     },
     /// Open a resizable view-only window (F11 toggles fullscreen).
     #[cfg(feature = "video-viewer")]
@@ -73,7 +76,19 @@ pub(super) async fn execute(command: Command) -> Result<()> {
             fps,
             max_size,
             bitrate,
-        } => share::run(network, display, peer, fps, max_size, bitrate).await,
+            threads,
+        } => {
+            share::run(
+                network,
+                display,
+                peer,
+                fps,
+                max_size,
+                bitrate,
+                threads as usize,
+            )
+            .await
+        }
         #[cfg(feature = "video-viewer")]
         Command::View { network, host } => viewer::run(network, host).await,
         Command::Status { network, output } => {

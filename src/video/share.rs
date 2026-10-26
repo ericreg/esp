@@ -1,5 +1,5 @@
 use super::{
-    codec::{self, Codec},
+    codec::{self, Encoder},
     display::Size,
     driver,
     protocol::*,
@@ -23,6 +23,7 @@ pub async fn run(
     fps: u32,
     max_size: String,
     kbps: u32,
+    threads: usize,
 ) -> Result<()> {
     ensure!(
         std::io::stdin().is_terminal(),
@@ -36,8 +37,8 @@ pub async fn run(
         height: h.parse()?,
     };
     ensure!(
-        (2..=1920).contains(&bounds.width) && (2..=1080).contains(&bounds.height),
-        "maximum encoded size is 1920x1080"
+        (16..=1920).contains(&bounds.width) && (16..=1080).contains(&bounds.height),
+        "encoded bounds must be between 16x16 and 1920x1080"
     );
     let store = crate::networks::Store::local()?;
     let cfg = store.select(&network)?;
@@ -109,7 +110,9 @@ pub async fn run(
     let Reply::Ready { share, .. } = reply else {
         anyhow::bail!("unexpected video registration response");
     };
-    println!("Ready — share {share}; Ctrl-C stops sharing and disconnects the virtual monitor.");
+    println!(
+        "Ready — share {share}; AV1 encoder: {threads} threads. Ctrl-C stops sharing and disconnects the virtual monitor."
+    );
     let quality = Arc::new(AtomicU32::new(0));
     let worker_quality = quality.clone();
     let force = Arc::new(AtomicBool::new(true));
@@ -127,14 +130,14 @@ pub async fn run(
     // Device access and CPU encoding never run on Tokio's networking workers.
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut current = format;
-        let mut codec = Codec::encoder(current)?;
+        let mut codec = Encoder::new(current, threads)?;
         let mut applied_quality = 0;
         let start = Instant::now();
         let mut seq = 0u64;
         let mut period = Duration::from_secs_f64(1.0 / fps as f64);
         let mut deadline = Instant::now();
         let mut last = Some(first_frame);
-        let mut dirty = true;
+        let mut pending = std::collections::VecDeque::new();
         let mut last_output = Instant::now();
         while !worker_cancelled.load(Ordering::Acquire) {
             let desired = worker_quality.load(Ordering::Acquire);
@@ -145,40 +148,49 @@ pub async fn run(
                     "network too slow at minimum video rate; start a new local share to retry"
                 );
                 current = reduced;
-                codec = Codec::encoder(current)?;
+                codec = Encoder::new(current, threads)?;
+                pending.clear();
                 period = Duration::from_secs_f64(1.0 / current.fps as f64);
                 applied_quality = desired;
                 worker_force.store(true, Ordering::Release);
             }
             if let Some(raw) = capture.read()? {
                 last = Some(raw);
-                dirty = true;
             }
-            if let Some(raw) = &last
-                && (dirty
-                    || worker_force.load(Ordering::Acquire)
-                    || last_output.elapsed() >= Duration::from_secs(5))
-            {
-                // Acquire queue capacity before advancing interframe references.
+            if let Some(raw) = &last {
+                // Reserve before advancing references. Never drop encoded interframes.
+                // Keep feeding static images: rav1e needs subsequent inputs to emit
+                // buffered frames, including the final change before a screen goes idle.
                 if let Ok(permit) = frames.try_reserve() {
-                    let yuv =
-                        codec::xrgb_to_yuv(raw, capture.size.width, capture.size.height, format)?;
-                    let (data, key) = codec.encode(
-                        &yuv,
-                        seq as i64,
-                        worker_force.swap(false, Ordering::AcqRel),
-                    )?;
-                    let frame = Frame {
-                        sequence: seq,
-                        timestamp_us: start.elapsed().as_micros() as u64,
-                        key,
-                        data: data.into(),
-                    };
-                    frame.validate(format, seq == 0)?;
-                    permit.send(Ok(frame));
-                    seq += 1;
-                    last_output = Instant::now();
-                    dirty = false;
+                    let force = worker_force.swap(false, Ordering::AcqRel);
+                    if force {
+                        pending.clear();
+                    }
+                    if pending.is_empty() {
+                        let yuv = codec::xrgb_to_yuv(
+                            raw,
+                            capture.size.width,
+                            capture.size.height,
+                            format,
+                        )?;
+                        pending.extend(codec.encode(
+                            &yuv,
+                            start.elapsed().as_micros() as u64,
+                            force,
+                        )?);
+                    }
+                    if let Some(packet) = pending.pop_front() {
+                        let frame = Frame {
+                            sequence: seq,
+                            timestamp_us: packet.timestamp_us,
+                            key: packet.key,
+                            data: packet.data.into(),
+                        };
+                        frame.validate(format, seq == 0)?;
+                        permit.send(Ok(frame));
+                        seq += 1;
+                        last_output = Instant::now();
+                    }
                 }
             }
             ensure!(

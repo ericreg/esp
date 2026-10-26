@@ -7,6 +7,9 @@ use iroh::{EndpointAddr, RelayConfig, address_lookup::memory::MemoryLookup};
 use iroh_relay::server::{Server, testing};
 use tokio::{net::TcpListener, task::JoinHandle};
 
+#[path = "proxy/discovery.rs"]
+mod discovery_tests;
+
 async fn open_local_proxy(path: &Path, target: String, port: u16) -> Result<UnixStream> {
     request_local_proxy(UnixStream::connect(path).await?, target, port).await
 }
@@ -33,6 +36,14 @@ impl ProxyFixture {
     }
 
     async fn with_transport_idle(max_connections: usize, idle: Option<Duration>) -> Self {
+        Self::with_resolver(max_connections, idle, None).await
+    }
+
+    async fn with_resolver(
+        max_connections: usize,
+        idle: Option<Duration>,
+        resolver: Option<iroh::dns::DnsResolver>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "esp-p-{}",
             &Uuid::new_v4().simple().to_string()[..12]
@@ -51,7 +62,16 @@ impl ProxyFixture {
         relay_config.relay.as_mut().unwrap().tls = None;
         relay_config.quic = None;
         let relay = Server::spawn(relay_config).await.unwrap();
-        let relay_url = relay.http_url().unwrap();
+        let relay_url = if resolver.is_some() {
+            format!(
+                "http://relay.esp.invalid:{}",
+                relay.http_url().unwrap().port().unwrap()
+            )
+            .parse()
+            .unwrap()
+        } else {
+            relay.http_url().unwrap()
+        };
         let relay_map = iroh::RelayMap::from(RelayConfig::new(relay_url.clone(), None));
         let lookup = MemoryLookup::new();
         let local_key = SecretKey::generate();
@@ -122,8 +142,8 @@ impl ProxyFixture {
             lookup.add_endpoint_info(
                 EndpointAddr::new(key.public()).with_relay_url(relay_url.clone()),
             );
-            let endpoint = Endpoint::builder(presets::Minimal)
-                .secret_key(key)
+            let mut builder = discovery::endpoint_builder(key)
+                .clear_address_lookup()
                 .alpns(if index == 0 && idle.is_some() {
                     vec![CONTROL_ALPN.to_vec()]
                 } else {
@@ -131,10 +151,11 @@ impl ProxyFixture {
                 })
                 .relay_mode(RelayMode::Custom(relay_map.clone()))
                 .address_lookup(lookup.clone())
-                .clear_ip_transports()
-                .bind()
-                .await
-                .unwrap();
+                .clear_ip_transports();
+            if let Some(resolver) = &resolver {
+                builder = builder.dns_resolver(resolver.clone());
+            }
+            let endpoint = builder.bind().await.unwrap();
             timeout(Duration::from_secs(5), endpoint.online())
                 .await
                 .unwrap();

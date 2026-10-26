@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = []
+default = ["video-asm"]
 video = ["dep:zbus", "dep:video-drm"]
-video-codec = ["video"]
+video-codec = ["video", "dep:rav1e", "dep:rav1d"]
+# Weak dependency features keep SSH-only builds free of codecs.
+video-asm = ["rav1e?/asm", "rav1d?/asm", "rav1d?/asm_arm64_dotprod", "rav1d?/asm_arm64_i8mm", "rav1d?/asm_arm64_sve2"]
 video-viewer = ["video-codec", "dep:winit", "dep:softbuffer"]
 
 [dependencies]
@@ -33,6 +35,9 @@ uuid = { version = "1.24.1", features = ["v4"] }
 winit = { version = "=0.30.13", optional = true }
 softbuffer = { version = "=0.4.8", optional = true }
 
+rav1e = { version = "=0.8.1", optional = true, default-features = false, features = ["threading"] }
+rav1d = { version = "=1.1.0", optional = true, git = "https://github.com/memorysafety/rav1d", rev = "782dab2135ea64a057c097088a13eb8ed3cc3320", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 video-drm = { version = "=0.14.1", package = "drm", optional = true }
 zbus = { version = "=5.19.0", optional = true, default-features = false, features = ["tokio"] }
@@ -40,7 +45,3 @@ zbus = { version = "=5.19.0", optional = true, default-features = false, feature
 [dev-dependencies]
 iroh-relay = { version = "=1.0.3", features = ["server", "test-utils"] }
 tokio = { version = "1.53.1", features = ["test-util"] }
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"

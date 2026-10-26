@@ -53,7 +53,7 @@ Headless startup and sharing a login screen are later work.
 - Implemented foreground `share`, `view`, `status`, and `stop`, ephemeral peer
   grants, mutual membership validation, revocation cancellation, bounded media
   framing, presentation feedback, and direct/relayed Iroh video sessions.
-- Added a libvpx software VP8 wrapper with BT.601 limited-range conversion and a
+- Added an AV1 rav1e/rav1d adapter with BT.601 limited-range conversion and a
   winit/softbuffer viewer with resizing and F11 fullscreen. These are optional
   Cargo features; the default build remains SSH-only.
 - The experimental host uses manual mirror setup and explicit local source
@@ -255,27 +255,35 @@ when the signed update reaches it.
 
 ## Capture format and codec
 
-Use VP8 through the upstream libvpx library as the initial portable codec. Own
-the wrapper, frame handling, transport, and session logic. Select and pin a
-maintained binding after a build experiment, or provide a small audited FFI
-boundary. Pin the native library as well and retain its license and patent-grant
-notices. libvpx provides VP8 encoding/decoding and uses a BSD-style license.
-[libvpx](https://github.com/webmproject/libvpx),
-[license](https://github.com/webmproject/libvpx/blob/main/LICENSE).
+Replace VP8 outright, retaining existing protocol identifiers with no legacy
+compatibility or codec negotiation. Upgrade both endpoints and restart helpers.
+Use rav1e 0.8.1 for AV1 encoding and rav1d 1.1.0 for decoding, compiled from
+Rust source with optional assembly. No system codec library is needed. The rav1d
+release commit is pinned to include the ARM assembly header missing from its
+published crate. Assembly is enabled by default through `video-asm`; CPU dispatch
+uses supported instructions. `--no-default-features --features video-viewer`
+builds without handwritten codec assembly.
 
-Start with software encoding and decoding, with zero lookahead, low-delay
-settings, no alternate-reference-frame buffering, and bounded codec threads.
-Force an independently decodable keyframe at attachment and each generation
-change; configure periodic keyframes at least once per second during motion.
-Validate actual encoder output rather than assuming every encode call emits
-exactly one displayed frame. [Encoder API](https://github.com/webmproject/libvpx/blob/main/vpx/vpx_encoder.h).
+Use speed 10, 16 requested tiles, low-latency mode, minimum RDO lookahead 1,
+and average bitrate control. The encoder thread limit defaults to the available
+CPU count capped at six; `esp video share --threads N` overrides it (1–64).
+Periodic keyframes occur at least once per second of submitted video. Attachment
+and quality changes reset the encoder, discard only unpublished buffered inputs,
+and begin a new independent stream. Output sequence numbers remain consecutive.
+
+rav1e delays output: our benchmark measured four additional inputs, about 133 ms
+at 30 FPS before processing and transport. Continue submitting static images to
+release the final changed frame. Track timestamps through buffered outputs, bound
+outstanding input/output queues, and stop feeding under backpressure. Do not
+assume a submitted input produces an immediate packet. See the
+[thread benchmark](tools/codec-bench/results/ryzen-9600x-threads/RESULTS.md).
 
 Initial limits are design targets to validate on reference hardware:
 
 | Parameter | Initial value or bound |
 |---|---|
 | Source dimensions | At most 4096 pixels per axis and 16 megapixels total; reject larger sources in v1. |
-| Encoded image | Fits within 1920 by 1080, preserves aspect ratio, uses even dimensions, and never upscales. |
+| Encoded image | Fits within 1920 by 1080, preserves aspect ratio, uses even dimensions of at least 16 pixels per axis, and never upscales. |
 | Frame rate | Default 30 FPS; configurable from 1 to 30. |
 | Target bitrate | Default 4 Mbit/s; configurable from 0.5 to 12 Mbit/s. This is an average target, not a per-frame size guarantee. |
 | Color | SDR, 8-bit YUV 4:2:0 with explicitly signaled matrix/range. |
@@ -292,7 +300,7 @@ small colored text; lossless desktop modes and hardware codecs are later work.
 
 ## Network protocol
 
-Introduce `esp/video/cbor/1` as an independent ALPN. Keep current network identity,
+Keep `esp/video/cbor/1` as the independent video ALPN. Keep current network identity,
 membership, invitation, and TCP protocol versions intact. Use one Iroh connection
 per viewing session, with one bidirectional control stream and a host-to-viewer
 unidirectional media stream. Iroh 1.0.3 already exposes these stream operations
@@ -301,7 +309,7 @@ and cancellation facilities. [Pinned Iroh API](https://docs.rs/iroh/1.0.3/iroh/e
 Setup messages use bounded CBOR with a 65,535-byte limit. The current protocol
 has `ClientHello` (membership identity and optional resume UUID) and
 `ServerResponse`, either a rejection or `ServerHello` containing the host identity,
-share UUID, and VP8 format limits. Both sides use the existing serialized config
+share UUID, and AV1 format limits. Both sides use the existing serialized config
 actor to validate membership, signed policy, and revocations. The client sends a
 one-byte ready acknowledgement only after validating the host.
 
@@ -312,10 +320,11 @@ The host enables no incoming media streams; the viewer permits one media stream.
 
 Each media frame has a 22-byte binary header: version (`1`), keyframe flag,
 eight-byte sequence, eight-byte sender-relative capture timestamp, and four-byte
-payload length, followed by at most 2 MiB of VP8. Media does not use ESP's two-byte
-CBOR setup framing. Validate flags, lengths, dimensions, first-frame key status,
-and sequence progression before decoding. VP8 keyframe dimensions must match the
-negotiated format before invoking libvpx.
+payload length, followed by at most 2 MiB of AV1. Media does not use ESP's two-byte
+CBOR setup framing. Validate flags, lengths, negotiated format bounds, first-frame
+key status, and sequence progression before decoding. The decoder enforces a frame-size allocation limit and validates decoded
+dimensions, 8-bit I420 layout and the actual keyframe flag before presentation.
+Services without codecs validate the envelope; codec validation belongs to the viewer.
 
 The current connection is one decoding timeline. Reset closes that connection;
 reconnection reauthenticates, requires the same share UUID, creates a new decoder,
@@ -395,7 +404,7 @@ existing networks.
 ## Viewer and dependency boundaries
 
 Implement a small native viewer using `winit` and a `softbuffer` presentation
-backend initially. Decode VP8, convert to the window's pixel format, preserve
+backend initially. Decode AV1, convert to the window's pixel format, preserve
 aspect ratio with letterboxing, and support fullscreen and local close commands.
 The viewer's keys and pointer never become network input events. Softbuffer
 supports presenting CPU-rendered images through a cross-platform windowing layer.
@@ -425,13 +434,11 @@ src/video/
   driver.rs       DRM discovery, exclusive capture, logind lifecycle
   display.rs      source and encoded-size bounds
   share.rs        local setup, capture/encoder worker, cleanup
-  codec.rs        libvpx wrapper and color conversion
+  codec.rs        rav1e/rav1d wrappers and color conversion
   vpx.c           small C boundary hiding native ABI structs
   viewer.rs       decode, presentation feedback, window lifecycle
   service_tests.rs  direct/private-relay and permission/lifecycle tests
 drivers/esp_video/  independent DRM/KMS module, UAPI and setup guide
-scripts/build-video-deps.sh  pinned private codec build
-third_party/libvpx/  codec license and patent grant
 ```
 
 Keep source-display creation independent from stream codecs and viewer rendering.
@@ -446,7 +453,7 @@ local command, rather than a mode that can be selected remotely in v1.
    lock/logout/hotplug, and preservation of existing display configuration.
 2. **Validate client presentation.** Run the native window on Linux and macOS,
    including fullscreen, slow presentation, close, disconnect, and recovery.
-3. **Measure performance.** Run release builds with optimized libvpx through direct
+3. **Measure performance.** Run release builds with AV1 assembly enabled through direct
    and real relayed paths. Tune frame bounds and adaptation using CPU, memory,
    bitrate, frame rate, and externally measured latency.
 4. **Harden and package.** Expand protocol fuzzing, installer/module-signing support,

@@ -1,4 +1,4 @@
-use super::{codec::Codec, protocol::*, service};
+use super::{codec::Av1Decoder, protocol::*, service};
 use anyhow::{Context as _, Result, ensure};
 use std::{
     num::NonZeroU32,
@@ -214,7 +214,7 @@ async fn session(
         "host share changed; run view again"
     );
     *resume = Some(share);
-    let mut codec = Codec::decoder(format)?;
+    let mut codec = Av1Decoder::new(format)?;
     let mut first = true;
     let (acks, mut ack_rx) = tokio::sync::mpsc::channel::<u64>(2);
     let (mut read, mut write) = stream.split();
@@ -226,7 +226,7 @@ async fn session(
             let sequence = frame.sequence;
             // At most one decode worker and one replaceable presentation image.
             let (returned, pixels) = tokio::task::spawn_blocking(move || -> Result<_> {
-                let pixels = codec.decode(&frame.data)?;
+                let pixels = codec.decode(&frame.data, frame.key)?;
                 Ok((codec, pixels))
             })
             .await

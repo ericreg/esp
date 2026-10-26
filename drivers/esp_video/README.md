@@ -13,15 +13,16 @@ The default ESP build remains SSH-only. Feature combinations are:
 | Feature | Includes |
 |---|---|
 | `video` | DRM discovery, video service, local status/stop, protocol tests; no codecs or windowing. |
-| `video-codec` | Above plus Linux `share` and software VP8 through libvpx. |
+| `video-codec` | Above plus Linux `share` and software AV1 through rav1e/rav1d. |
 | `video-viewer` | Above plus the native `view` window using winit/softbuffer. |
 
-Install development files for libvpx 1.16.0 or newer and `pkg-config` to build
-the codec/viewer features. For a private dependency build without system changes,
-run `scripts/build-video-deps.sh /absolute/path/to/prefix`, then set
-`PKG_CONFIG_PATH=/absolute/path/to/prefix/lib/pkgconfig` when invoking Cargo.
-That helper builds a pinned, portable libvpx without assembly optimizations;
-use an optimized library build for performance measurements.
+The codec crates are compiled into ESP; no system codec library is required.
+Assembly optimizations are enabled by the default `video-asm` feature, with CPU
+features selected at runtime. On x86-64, install NASM (2.15.05 or newer); on Apple
+Silicon use Xcode Command Line Tools. For a Rust-only build, use
+`--no-default-features --features video-viewer`. SSH-only builds do not compile
+codec dependencies. The rav1d dependency pins its 1.1.0 release commit because
+that release's published crate omitted an ARM assembly header.
 
 ```sh
 cargo build --release --features video-viewer --locked
@@ -128,8 +129,26 @@ do not load the module, change host displays, or contact public relays.
 Before publishing host support, test actual monitor creation, manual mirror
 configuration, first-frame capture, cursor/SDR correctness, lock/logout/unplug,
 SIGKILL cleanup, slow viewers, and repeated start/stop with physical displays
-preserved. Measure performance using a release build and an optimized libvpx.
+preserved. Measure performance using a release build with assembly enabled.
 
-The module uses GPL-2.0-or-later. libvpx's license and patent grant are recorded
-under `third_party/libvpx`; other native viewer dependencies retain their upstream
-licenses as recorded by Cargo.
+The host uses rav1e speed 10, 16 requested tiles, low-latency mode and minimum
+RDO lookahead (1). `--threads` controls the encoder worker limit (1–64); the default
+is the available CPU count capped at six. For example:
+
+```sh
+esp video share work --display card0-DP-1 --peer laptop --threads 4
+```
+
+`--bitrate` remains an average target in kbit/s. Rate control and packet-size
+checks remain active. The encoder buffers inputs; at 30 FPS the measured four
+additional inputs represent about 133 ms before processing/network/presentation.
+Static screens continue feeding the encoder so the last change is delivered.
+Backpressure stops new inputs; encoded dependent frames are never dropped. A
+viewer attachment or congestion reset starts a new independently decodable stream.
+This is an AV1-only breaking change using the existing protocol identifiers.
+Upgrade both endpoints and restart helpers; no codec negotiation or VP8 fallback
+is provided.
+
+The module uses GPL-2.0-or-later. rav1e and rav1d retain their upstream BSD-style
+licenses; assembly sources retain their respective upstream notices. Cargo builds
+these sources directly. Viewer dependencies retain their upstream licenses.
