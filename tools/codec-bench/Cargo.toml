@@ -1,0 +1,26 @@
+[package]
+name = "esp-codec-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+asm = ["rav1e/asm", "rav1d/asm", "rav1d/asm_arm64_dotprod", "rav1d/asm_arm64_i8mm", "rav1d/asm_arm64_sve2"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+font8x8 = "=0.3.1"
+libc = "0.2"
+tempfile = "3"
+oxideav-vp8 = { version = "=0.2.7", default-features = false }
+rav1e = { version = "=0.8.1", default-features = false, features = ["threading"] }
+rav1d = { version = "=1.1.0", git = "https://github.com/memorysafety/rav1d", rev = "782dab2135ea64a057c097088a13eb8ed3cc3320", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
+
+[profile.release]
+debug = 1

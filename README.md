@@ -127,6 +127,10 @@ reboots automatically. SSH-only builds remain available without video features;
 `--features video` provides discovery and protocol/service support without codecs
 or windowing.
 
+The standalone [codec benchmark](tools/codec-bench/README.md) compares Rust VP8
+and AV1 implementations with and without AV1 assembly optimizations on Linux and
+macOS. It can export host-encoded streams for decode-only measurements on a Mac.
+
 ## Configuration
 
 Global preferences live in `~/.esp/config.yml`:

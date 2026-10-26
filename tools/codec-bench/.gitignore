@@ -1,0 +1,6 @@
+/target/
+/results/**
+!/results/ryzen-9600x/
+!/results/ryzen-9600x/RESULTS.md
+!/results/ryzen-9600x-threads/
+!/results/ryzen-9600x-threads/RESULTS.md
