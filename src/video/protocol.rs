@@ -46,9 +46,8 @@ impl Format {
         for _ in 0..steps.min(32) {
             if self.kbps > 500 {
                 self.kbps = (self.kbps * 3 / 4).max(500);
-            } else {
-                self.fps = (self.fps * 3 / 4).max(1);
             }
+            self.fps = (self.fps * 3 / 4).max(1);
         }
         self
     }
@@ -152,6 +151,19 @@ pub struct Frame {
     pub data: bytes::Bytes,
 }
 impl Frame {
+    /// A keyframe starts an independent timeline; dependent frames must be contiguous.
+    pub fn validate_after(&self, format: Format, previous: Option<u64>) -> Result<()> {
+        self.validate(format, previous.is_none())?;
+        if let Some(previous) = previous {
+            ensure!(self.sequence > previous, "non-monotonic video frame");
+            ensure!(
+                self.key || previous.checked_add(1) == Some(self.sequence),
+                "video frame gap requires an AV1 keyframe"
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, format: Format, need_key: bool) -> Result<()> {
         ensure!(
             !self.data.is_empty() && self.data.len() <= MAX_FRAME,
@@ -263,5 +275,31 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn only_forward_keyframes_can_bridge_a_sequence_gap() {
+        let format = Format {
+            width: 64,
+            height: 48,
+            fps: 30,
+            kbps: 4000,
+        };
+        let mut frame = Frame {
+            sequence: 20,
+            timestamp_us: 0,
+            key: false,
+            data: vec![1].into(),
+        };
+        assert!(frame.validate_after(format, Some(18)).is_err());
+        assert!(frame.validate_after(format, Some(19)).is_ok());
+        frame.key = true;
+        assert!(frame.validate_after(format, Some(18)).is_ok());
+        assert!(frame.validate_after(format, Some(20)).is_err());
+        assert!(frame.validate_after(format, Some(u64::MAX)).is_err());
     }
 }

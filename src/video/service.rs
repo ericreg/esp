@@ -97,6 +97,70 @@ async fn snapshot(actor: &ConfigActorHandle) -> Result<Config> {
     ensure_completed_join(&cfg)?;
     Ok(cfg)
 }
+
+/// Refresh a stale directory through existing authenticated admins, without
+/// creating another endpoint or restarting the shared SSH transport.
+async fn resolve_view_host(
+    actor: &ConfigActorHandle,
+    endpoint: &Endpoint,
+    host: &str,
+) -> Result<Peer> {
+    use futures_util::StreamExt;
+    let cfg = snapshot(actor).await?;
+    if let Ok(peer) = cfg.resolve_peer(host) {
+        return Ok(peer.clone());
+    }
+    let mut admins: Vec<_> = cfg
+        .peers
+        .iter()
+        .filter(|peer| {
+            find_membership_by_subject(&cfg, &[], peer.node_id).is_some_and(|membership| {
+                membership.role == MembershipRole::Admin
+                    && membership.matches_peer(&cfg, peer).is_ok()
+                    && verify_membership_chain(&cfg, membership, &[]).is_ok()
+            })
+        })
+        .cloned()
+        .collect();
+    admins.sort_by_key(|peer| peer.node_id != cfg.creator_node_id);
+    admins.truncate(4);
+    if admins.is_empty() {
+        return cfg.resolve_peer(host).cloned().context("peer lookup failed; no known authenticated admin is available to refresh the directory");
+    }
+    let mut refreshes = futures_util::stream::iter(admins.into_iter().map(|peer| async move {
+        timeout(
+            Duration::from_secs(8),
+            sync_known_peer_from_actor(endpoint, actor.clone(), &peer),
+        )
+        .await
+        .context("admin directory refresh timed out")?
+    }))
+    .buffer_unordered(4);
+    let mut errors = Vec::new();
+    while let Some(result) = refreshes.next().await {
+        if let Err(error) = result {
+            errors.push(format!("{error:#}"));
+        }
+        if let Ok(peer) = snapshot(actor).await?.resolve_peer(host) {
+            return Ok(peer.clone());
+        }
+    }
+    snapshot(actor)
+        .await?
+        .resolve_peer(host)
+        .cloned()
+        .with_context(|| {
+            if errors.is_empty() {
+                "peer is not listed by the known network admins after refreshing the directory"
+                    .into()
+            } else {
+                format!(
+                    "could not resolve peer after admin directory refresh: {}",
+                    errors.join("; ")
+                )
+            }
+        })
+}
 async fn authenticate(
     actor: &ConfigActorHandle,
     node: EndpointId,
@@ -155,7 +219,7 @@ pub async fn local(
                 let peer = cfg.resolve_peer(&peer)?.node_id;
                 let active = actor.register_connection(peer).await?;
                 let (input, input_requests) = mpsc::channel(128);
-                let (frames, _) = broadcast::channel(2);
+                let (frames, _) = broadcast::channel(8);
                 let (stop, _) = watch::channel(false);
                 let (keyframe, key_requests) = mpsc::channel(1);
                 let share = Arc::new(Share {
@@ -248,8 +312,8 @@ pub async fn local(
         }
         LocalRequest::View { host, resume } => {
             let setup = timeout(SETUP, async {
+                let peer = resolve_view_host(&actor, &endpoint, &host).await?;
                 let cfg = snapshot(&actor).await?;
-                let peer = cfg.resolve_peer(&host)?.clone();
                 let active = actor.register_connection(peer.node_id).await?;
                 let connection = endpoint.connect(peer.node_id, ALPN).await?;
                 let close = CloseConnectionOnDrop(connection.clone());
@@ -315,17 +379,9 @@ pub async fn local(
                 let mut previous = None;
                 loop {
                     let frame = timeout(LIVENESS, read_frame(&mut media)).await??;
-                    frame.validate(format, previous.is_none())?;
-                    anyhow::ensure!(
-                        previous.is_none_or(|seq: u64| seq.checked_add(1) == Some(frame.sequence)),
-                        "non-monotonic video frame"
-                    );
+                    frame.validate_after(format, previous)?;
                     previous = Some(frame.sequence);
-                    timeout(
-                        Duration::from_millis(500),
-                        write_frame(&mut local_write, &frame),
-                    )
-                    .await??;
+                    timeout(LIVENESS, write_frame(&mut local_write, &frame)).await??;
                 }
                 #[allow(unreachable_code)]
                 Ok::<(), anyhow::Error>(())
@@ -465,7 +521,6 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
     })
     .await
     .context("video server setup timed out")??;
-    let acknowledged = AtomicBool::new(false);
     let flight = Arc::new(Semaphore::new(2));
     let pending = Mutex::new(VecDeque::<(u64, std::time::Instant, OwnedSemaphorePermit)>::new());
     let share = viewer.0.clone();
@@ -474,42 +529,71 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
 
     let media = async {
         let mut media = conn.open_uni().await?;
-        let mut first = true;
         let mut previous = None;
+        let mut need_key = true;
+        let mut last_reduction = std::time::Instant::now() - Duration::from_secs(2);
         loop {
-            // Lag ends the decoding timeline; never forward dependent frames after a gap.
-            let frame = timeout(LIVENESS, frames.recv()).await??;
-            if first && !frame.key {
-                continue;
-            }
-            frame.validate(share.format, first)?;
-            anyhow::ensure!(
-                previous.is_none_or(|seq| frame.sequence == seq + 1),
-                "video encoder sequence gap"
-            );
-            first = false;
-            previous = Some(frame.sequence);
-            let deadline = if acknowledged.load(Ordering::Acquire) {
-                Duration::from_millis(500)
-            } else {
-                Duration::from_secs(5)
+            // Wait for presentation credit BEFORE selecting a frame. A brief stall
+            // must not disconnect input or blank the viewer. Memory stays bounded.
+            let waiting = flight.clone().acquire_owned();
+            tokio::pin!(waiting);
+            let permit = match timeout(Duration::from_millis(500), &mut waiting).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    frames = share.frames.subscribe();
+                    need_key = true;
+                    request_recovery(&share, &mut last_reduction);
+                    timeout(LIVENESS, &mut waiting)
+                        .await
+                        .context("video presentation stalled")??
+                }
             };
-            let permit = timeout(deadline, flight.clone().acquire_owned())
+            let key_deadline = tokio::time::Instant::now() + LIVENESS;
+            let frame = loop {
+                let frame = match tokio::time::timeout_at(key_deadline, frames.recv())
+                    .await
+                    .context("waiting for recoverable video frame timed out")?
+                {
+                    Ok(frame) => frame,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Dependent AV1 frames cannot survive a gap. Keep the
+                        // connection and last image; resume at a fresh keyframe.
+                        need_key = true;
+                        request_recovery(&share, &mut last_reduction);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if previous.is_some_and(|seq: u64| seq.checked_add(1) != Some(frame.sequence))
+                    && !need_key
+                    && !frame.key
+                {
+                    need_key = true;
+                    request_recovery(&share, &mut last_reduction);
+                }
+                if need_key && !frame.key {
+                    continue;
+                }
+                frame.validate_after(share.format, previous)?;
+                break frame;
+            };
+            need_key = false;
+            previous = Some(frame.sequence);
+            pending
+                .lock()
+                .unwrap()
+                .push_back((frame.sequence, std::time::Instant::now(), permit));
+            let started = std::time::Instant::now();
+            // A partial reliable-stream write cannot be abandoned and reused.
+            // Only a sustained stall closes it; ordinary congestion resyncs below.
+            timeout(LIVENESS, write_frame(&mut media, &frame))
                 .await
-                .context("video presentation too slow")??;
-            {
-                let mut pending = pending.lock().unwrap();
-                anyhow::ensure!(
-                    pending
-                        .front()
-                        .is_none_or(|(_, at, _)| at.elapsed() < deadline),
-                    "video presentation backlog exceeded"
-                );
-                pending.push_back((frame.sequence, std::time::Instant::now(), permit));
+                .context("video network stalled")??;
+            if started.elapsed() >= Duration::from_millis(500) {
+                frames = share.frames.subscribe();
+                need_key = true;
+                request_recovery(&share, &mut last_reduction);
             }
-            timeout(deadline, write_frame(&mut media, &frame))
-                .await
-                .context("video network too slow")??;
             share.sent.fetch_add(1, Ordering::Relaxed);
             share
                 .bytes
@@ -565,7 +649,6 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
                         pending.pop_front();
                     }
                     previous_ack = Some(sequence);
-                    acknowledged.store(true, Ordering::Release);
                 }
                 _ => bail!("invalid video control message"),
             }
@@ -574,13 +657,22 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
         Ok::<(), anyhow::Error>(())
     };
     tokio::select! {
-        result = media => {
-            if result.is_err() && share.keyframe.try_send(2).is_ok() {share.reductions.fetch_add(1,Ordering::Relaxed);}
-            result
-        },
+        result = media => result,
         result = control => result,
         result = input_stream => result,
         _ = stop.changed() => Ok(()),
+    }
+}
+
+// Requests are coalesced; repeated lag cannot reset the encoder every frame.
+fn request_recovery(share: &Share, last_reduction: &mut std::time::Instant) {
+    if last_reduction.elapsed() >= Duration::from_secs(1) {
+        if share.keyframe.try_send(2).is_ok() {
+            share.reductions.fetch_add(1, Ordering::Relaxed);
+            *last_reduction = std::time::Instant::now();
+        }
+    } else {
+        let _ = share.keyframe.try_send(1);
     }
 }
 

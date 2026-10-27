@@ -30,7 +30,9 @@ set -- "${QEMU:-qemu-system-x86_64}" -enable-kvm -cpu host -m 512M -smp 2 \
     -no-reboot -kernel "$kernel_image" -initrd "$guest_dir/initrd" \
     -append 'console=ttyS0 rdinit=/init panic=-1 loglevel=4 esp_console_test=1'
 if [ -n "${QEMU_DATA_DIR:-}" ]; then set -- "$@" -L "$QEMU_DATA_DIR"; fi
-timeout 45 "$@" > "$guest_dir/log" 2>&1
+vm_status=0
+timeout 45 "$@" > "$guest_dir/log" 2>&1 || vm_status=$?
 cat "$guest_dir/log"
+[ "$vm_status" -eq 0 ] || exit "$vm_status"
 grep -q '^ESP_DRIVER_TEST_PASSED' "$guest_dir/log"
 if grep -Eq 'BUG:|WARNING:|ESP_DRIVER_TEST_FAILED|Kernel panic' "$guest_dir/log"; then exit 1; fi

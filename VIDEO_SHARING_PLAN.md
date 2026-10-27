@@ -66,9 +66,11 @@ the console guide governs `serve` where their lifecycle and capture rules differ
   confirmation. It checks source and virtual-output activity/modes and logind
   session/lock state. This is not automatic cross-GPU clone verification; later
   layout changes cannot be fully detected through this interface.
-- Congestion ends the current connection/timeline, lowers bitrate and then frame
-  rate, and lets the viewer reconnect to the same share with a new decoder and
-  keyframe. Same-connection generation reset is deferred.
+- Brief congestion recovers on the same connection at an AV1 keyframe, keeping
+  input and the last image alive while lowering bitrate and frame rate. Sequence
+  gaps are allowed only on forward keyframes; dependent frames remain contiguous.
+- Text-console snapshots use the ESP module to exclude fbcon writers and VT/mode
+  changes while copying pixels, then convert and encode outside the kernel locks.
 - Added a systemd-managed Rust `serve` command, fbcon/VT capture, physical DRM
   plane readback through EGL/GBM or linear CPU mapping, and headless fbdev support.
   VM tests cover text rendering, real uinput keystrokes, synthetic graphical
@@ -347,11 +349,14 @@ key status, and sequence progression before decoding. The decoder enforces a fra
 dimensions, 8-bit I420 layout and the actual keyframe flag before presentation.
 Services without codecs validate the envelope; codec validation belongs to the viewer.
 
-The current connection is one decoding timeline. Reset closes that connection;
-reconnection reauthenticates, requires the same share UUID, creates a new decoder,
-and requests a fresh keyframe. A new host share requires a new `view`. A later
-protocol can add generation IDs and coordinated media-stream replacement within
-one connection; that optimization is not implemented yet.
+A forward sequence gap is permitted only at a keyframe. The viewer creates a
+fresh decoder for that keyframe while retaining the previous image until the
+new frame is decoded. This recovers congestion without replacing the connection
+or input generation. Duplicates, backward sequences, and dependent-frame gaps
+are rejected. Both helpers and viewers need this implementation; no legacy
+negotiation or protocol-version bump is added. Console/source changes and capture
+failure still close the connection and clear the viewer. Reconnection requires
+the same share UUID and renewed authentication; a new share requires a new `view`.
 
 ## Backpressure and recovery
 
@@ -361,8 +366,9 @@ including transport and IPC buffers, to prevent an increasingly delayed picture.
 
 - Drop obsolete raw frames before encoding; the encoder then references only
   frames actually admitted to the media timeline.
-- Limit encoded queues to two frames and 4 MiB in aggregate at each process
-  boundary. Keep one decode operation and one pending presentation buffer.
+- Keep the local encoder channel at one frame and the host broadcast ring at
+  eight frames (at most 16 MiB of encoded payload). Retain at most two frames in
+  flight, one decode operation, and one replaceable presentation image.
 - Decode dependent frames in sequence; obsolete decoded images can be skipped
   for presentation. Do not arbitrarily discard encoded interframes and then
   continue decoding their dependents.
@@ -370,13 +376,18 @@ including transport and IPC buffers, to prevent an increasingly delayed picture.
   native-window presentation. Measure send-to-presentation-ack time in the host's
   clock domain. `status` reports that round trip, bytes/frames sent, encoder targets,
   and whether Iroh currently selects a direct or relayed path.
-- Allow five seconds for initial presentation, then enforce 500 ms write and
-  presentation-backlog bounds. A media gap, lagged broadcast receiver, or missed
-  deadline ends the current connection instead of forwarding broken interframes.
-- On media congestion, request a lower encoder bitrate; after reaching 500 kbit/s,
-  reduce frame rate down to 1 FPS. Reinitializing the encoder forces a keyframe.
-  Stop if the minimum rate still cannot sustain a connection. Reconnect attempts
-  are separated by one second and bounded to 30 seconds of unsuccessful recovery.
+- Wait for presentation credit before choosing a frame. A 500 ms credit stall
+  requests recovery and discards queued dependencies without disconnecting.
+  Queue overflow also requests a keyframe; never forward dependent frames after
+  a gap. Retain the last image during this recovery, but clear it on actual
+  disconnect, source transition, capture failure, or revocation.
+- Bound presentation-credit, network-write, and keyframe waits to 15 seconds
+  (credit gets an initial 500 ms grace period). A partially written reliable
+  frame is never abandoned and followed by another frame on the same stream.
+- Congestion feedback reduces bitrate and FPS together, at most once per second,
+  down to 500 kbit/s and 1 FPS. Reinitializing the encoder forces a keyframe.
+  Actual disconnects retry after one second, bounded to 30 seconds without a
+  successfully decoded frame; a slow failing handshake does not reset that bound.
 - A full local encoder queue drops work before encoding. Owner IPC write failure
   stops the share; viewer IPC write failure stops that viewing session. Neither
   silently discards an already encoded dependent frame.
@@ -485,8 +496,8 @@ local command, rather than a mode that can be selected remotely in v1.
    and real relayed paths. Tune frame bounds and adaptation using CPU, memory,
    bitrate, frame rate, and externally measured latency.
 4. **Harden and package.** Expand protocol fuzzing, installer/module-signing support,
-   and the supported kernel/GPU/desktop matrix. Keep automatic clone verification
-   and same-connection generation resets as explicitly deferred capabilities.
+   and the supported kernel/GPU/desktop matrix. Automatic clone verification
+   remains deferred; congestion recovery within an existing connection is implemented.
 
 ## Validation and acceptance
 

@@ -442,6 +442,34 @@ mod tests {
         let after = source.read().unwrap();
         assert_ne!(before.pixels, after.pixels);
         assert!(after.pixels.iter().any(|b| *b != 0));
+        // fbcon fills the entire screen while holding console_lock. Alternating
+        // clears must yield a complete red OR blue snapshot, never mixed rows.
+        tty.write_all(b"\x1b[?25l\x1b[41m\x1b[2J").unwrap();
+        let red = source.read().unwrap().pixels;
+        tty.write_all(b"\x1b[44m\x1b[2J").unwrap();
+        let blue = source.read().unwrap().pixels;
+        assert_ne!(red, blue);
+        let mut writer = tty.try_clone().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = done.clone();
+        let redraw = std::thread::spawn(move || {
+            while !writer_done.load(Ordering::Acquire) {
+                writer.write_all(b"\x1b[41m\x1b[2J").unwrap();
+                std::thread::yield_now();
+                writer.write_all(b"\x1b[44m\x1b[2J").unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let mut consistent = true;
+        for _ in 0..80 {
+            let image = source.read().unwrap();
+            consistent &= image.pixels == red || image.pixels == blue;
+        }
+        done.store(true, Ordering::Release);
+        redraw.join().unwrap();
+        assert!(consistent, "snapshot mixed concurrent framebuffer redraws");
+        tty.write_all(b"\x1b[0m\x1b[2J\x1b[H\x1b[?25h").unwrap();
+        eprintln!("ESP_CONSOLE_SNAPSHOT_PASSED: concurrent fbcon redraws are consistent");
         let mut device = uinput::Device::new().unwrap();
         std::thread::sleep(Duration::from_millis(150));
         let event_path = |wanted: &str| {

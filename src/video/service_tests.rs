@@ -64,10 +64,33 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(relayed: bool) -> Self {
+        Self::with_directory(relayed, false).await
+    }
+    async fn with_directory(relayed: bool, console: bool) -> Self {
         let dir = std::env::temp_dir().join(format!("esp-video-{}", Uuid::new_v4()));
         fs::create_dir(&dir).unwrap();
         // Membership currently requires a port; the acceptor enables no TCP serving.
-        let (a, b) = pair("Video test", &[22]);
+        let (mut a, b) = pair("Video test", &[22]);
+        if console {
+            let mut peer = Peer {
+                node_id: SecretKey::generate().public(),
+                name: "amd-console".into(),
+                connection_id: "CNSOLE".into(),
+            };
+            let membership = MembershipCertificate::issue(
+                &a,
+                &a.secret_key().unwrap(),
+                &peer,
+                &[22],
+                MembershipRole::Peer,
+            )
+            .unwrap();
+            // The admin label remains resolvable even before the admin learns
+            // the console's updated hostname after enrollment.
+            peer.name = "amd".into();
+            a.peers.push(peer);
+            a.memberships.push(membership);
+        }
         a.save(&dir.join("a.yml")).unwrap();
         b.save(&dir.join("b.yml")).unwrap();
         let lookup = MemoryLookup::new();
@@ -93,7 +116,7 @@ impl Fixture {
         for cfg in [&a, &b] {
             let mut builder = Endpoint::builder(presets::Minimal)
                 .secret_key(cfg.secret_key().unwrap())
-                .alpns(vec![ALPN.to_vec()])
+                .alpns(vec![ALPN.to_vec(), CONTROL_ALPN.to_vec()])
                 .relay_mode(mode.clone())
                 .address_lookup(lookup.clone());
             if relayed {
@@ -315,7 +338,7 @@ async fn stalled_presentation_ends_timeline() {
     }
     write_frame(&mut owner, &frame(3)).await.unwrap();
     assert!(
-        timeout(Duration::from_secs(3), read_frame(&mut client))
+        timeout(Duration::from_secs(18), read_frame(&mut client))
             .await
             .unwrap()
             .is_err()
@@ -579,4 +602,120 @@ async fn local_helper_failure_preserves_cause_and_restart_guidance() {
     assert!(
         matches!(read_local_reply(&mut client).await.unwrap(), Reply::Error(e) if e == "host is not configured")
     );
+}
+
+#[tokio::test]
+async fn missing_console_is_discovered_from_signed_admin_directory() {
+    for relayed in [false, true] {
+        let f = Fixture::with_directory(relayed, true).await;
+        assert!(
+            snapshot(&f.client_actor)
+                .await
+                .unwrap()
+                .resolve_peer("amd-console")
+                .is_err()
+        );
+        let peer = resolve_view_host(&f.client_actor, &f.client, "amd-console")
+            .await
+            .unwrap();
+        assert_eq!(peer.connection_id, "CNSOLE");
+        let saved = Config::load(&f.dir.join("b.yml")).unwrap();
+        assert_eq!(
+            saved.resolve_peer("amd-console").unwrap().node_id,
+            peer.node_id
+        );
+        let membership = find_membership_by_subject(&saved, &[], peer.node_id).unwrap();
+        verify_membership_chain(&saved, membership, &[]).unwrap();
+        // Refreshing the directory cannot invent an unknown peer or grant video access.
+        assert!(
+            resolve_view_host(&f.client_actor, &f.client, "does-not-exist")
+                .await
+                .is_err()
+        );
+        assert_eq!(f.host_actor.video.status()["state"], "stopped");
+        f.close().await;
+    }
+}
+
+#[tokio::test]
+async fn lag_and_slow_presentation_recover_without_reconnecting() {
+    for relayed in [false, true] {
+        for slow in [false, true] {
+            let f = Fixture::new(relayed).await;
+            let (mut owner, owner_task, id) = f.owner_mode(true).await;
+            let (mut client, client_task, _) = f.view(None).await;
+            assert_eq!(
+                timeout(Duration::from_secs(3), owner.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                1
+            );
+            let share = f.host_actor.video.current().unwrap();
+            for seq in 0..2 {
+                write_frame(&mut owner, &frame(seq)).await.unwrap();
+                assert_eq!(read_frame(&mut client).await.unwrap().sequence, seq);
+            }
+            let epoch = share.input_epoch.load(Ordering::Acquire);
+            client.write_all(&[2]).await.unwrap();
+            input::write(&mut client, input::Event::Capture)
+                .await
+                .unwrap();
+            assert_eq!(
+                owner_input(&mut owner).await,
+                (epoch, input::Event::Capture)
+            );
+            // Both presentation credits are outstanding. Overflow the bounded
+            // queue with dependent frames, then resume the *same* local viewer.
+            for seq in 2..40 {
+                let mut next = frame(seq);
+                next.key = false;
+                write_frame(&mut owner, &next).await.unwrap();
+            }
+            if slow {
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            ack(&mut client, 1).await;
+            assert_eq!(
+                timeout(Duration::from_secs(3), owner.read_u8())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                2
+            );
+            assert_eq!(share.reductions.load(Ordering::Relaxed), 1);
+            // Dependent frames after the gap must never reach the decoder.
+            assert!(
+                timeout(Duration::from_millis(50), read_frame(&mut client))
+                    .await
+                    .is_err()
+            );
+            write_frame(&mut owner, &frame(40)).await.unwrap();
+            let recovered = timeout(Duration::from_secs(3), read_frame(&mut client))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.sequence, 40);
+            assert!(recovered.key);
+            ack(&mut client, 40).await;
+            let mut next = frame(41);
+            next.key = false;
+            write_frame(&mut owner, &next).await.unwrap();
+            assert_eq!(read_frame(&mut client).await.unwrap().sequence, 41);
+            ack(&mut client, 41).await;
+            assert!(!client_task.is_finished());
+            assert_eq!(share.id, id);
+            assert_eq!(share.input_epoch.load(Ordering::Acquire), epoch);
+            assert!(share.busy.load(Ordering::Acquire));
+            let motion = input::Event::Motion { x: 8, y: -4 };
+            client.write_all(&[2]).await.unwrap();
+            input::write(&mut client, motion).await.unwrap();
+            assert_eq!(owner_input(&mut owner).await, (epoch, motion));
+            drop(client);
+            let _ = timeout(Duration::from_secs(3), client_task).await.unwrap();
+            drop(owner);
+            let _ = owner_task.await;
+            f.close().await;
+        }
+    }
 }

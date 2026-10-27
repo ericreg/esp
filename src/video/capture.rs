@@ -5,7 +5,6 @@ use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
     os::fd::{AsFd, AsRawFd},
-    os::unix::fs::FileExt,
 };
 use video_drm::{
     Device as _,
@@ -86,24 +85,24 @@ struct Variable {
     colorspace: u32,
     reserved: [u32; 4],
 }
+/// Fixed-width ESP_VIDEO_CONSOLE_SNAPSHOT ABI (also valid for compat callers).
 #[repr(C)]
 #[derive(Default)]
-struct Fixed {
-    id: [u8; 16],
-    smem_start: libc::c_ulong,
-    smem_len: u32,
-    kind: u32,
-    kind_aux: u32,
-    visual: u32,
-    xpan: u16,
-    ypan: u16,
-    ywrap: u16,
-    line_length: u32,
-    mmio_start: libc::c_ulong,
-    mmio_len: u32,
-    accel: u32,
-    capabilities: u16,
-    reserved: [u16; 2],
+struct ConsoleSnapshot {
+    pixels: u64,
+    capacity: u32,
+    fb_fd: u32,
+    vt: u32,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u32,
+    red_offset: u32,
+    red_length: u32,
+    green_offset: u32,
+    green_length: u32,
+    blue_offset: u32,
+    blue_length: u32,
+    reserved: [u32; 2],
 }
 fn fb_map(console: u16, new: Option<u32>) -> Result<u32> {
     let fb = OpenOptions::new().read(true).write(true).open("/dev/fb0")?;
@@ -116,74 +115,113 @@ fn fb_map(console: u16, new: Option<u32>) -> Result<u32> {
     );
     Ok(map[1])
 }
-fn framebuffer(index: u32) -> Result<Image> {
+fn framebuffer(index: u32, vt: Terminal, device: Option<&File>) -> Result<Image> {
     let file = File::open(format!("/dev/fb{index}"))?;
+    // Size this allocation optimistically. The kernel revalidates the mode and
+    // capacity under the console lock, so a mode change cannot overrun it.
     let mut v = Variable::default();
-    let mut f = Fixed::default();
     ensure!(
         unsafe { libc::ioctl(file.as_raw_fd(), 0x4600, &mut v) } >= 0,
         "FBIOGET_VSCREENINFO failed"
-    );
-    ensure!(
-        unsafe { libc::ioctl(file.as_raw_fd(), 0x4602, &mut f) } >= 0,
-        "FBIOGET_FSCREENINFO failed"
     );
     let size = Size {
         width: v.x,
         height: v.y,
     }
     .validate_source()?;
-    ensure!(
-        [16, 24, 32].contains(&v.bpp)
-            && v.grayscale == 0
-            && v.nonstd == 0
-            && f.kind == 0
-            && f.visual == 2
-            && v.rotate == 0,
-        "unsupported framebuffer layout (requires packed truecolor RGB)"
-    );
-    let bytes = (v.bpp / 8) as usize;
-    ensure!(
-        v.ox.checked_add(v.x).is_some_and(|x| x <= v.vx)
-            && v.oy.checked_add(v.y).is_some_and(|y| y <= v.vy),
-        "framebuffer viewport out of bounds"
-    );
-    let pitch = f.line_length as usize;
-    ensure!(
-        (v.ox as usize + v.x as usize) * bytes <= pitch
-            && (v.oy as u64 + v.y as u64) * pitch as u64 <= f.smem_len as u64,
-        "framebuffer memory bounds"
-    );
-    let mut pixels = vec![0; size.width as usize * size.height as usize * 4];
-    let mut row = vec![0; v.x as usize * bytes];
-    for y in 0..v.y as usize {
-        file.read_exact_at(
-            &mut row,
-            ((y + v.oy as usize) * pitch + v.ox as usize * bytes) as u64,
-        )?;
-        for x in 0..v.x as usize {
-            let mut raw = [0; 4];
-            raw[..bytes].copy_from_slice(&row[x * bytes..(x + 1) * bytes]);
-            let value = u32::from_le_bytes(raw);
-            let at = (y * v.x as usize + x) * 4;
-            for (i, field) in [v.blue, v.green, v.red].into_iter().enumerate() {
-                ensure!(
-                    field.length > 0
-                        && field.length <= 16
-                        && field.offset + field.length <= v.bpp
-                        && field.msb_right == 0,
-                    "unsupported framebuffer channels"
-                );
-                let max = (1u32 << field.length) - 1;
-                pixels[at + i] = (((value >> field.offset) & max) * 255 / max) as u8;
-            }
+    let mut raw = vec![0; size.width as usize * size.height as usize * 4];
+    let owned;
+    let device = match device {
+        Some(device) => device,
+        None => {
+            owned = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/esp-video")
+                .context("console snapshots require the ESP kernel module")?;
+            &owned
         }
+    };
+    let mut snapshot = ConsoleSnapshot {
+        pixels: raw.as_mut_ptr() as u64,
+        capacity: raw.len() as u32,
+        fb_fd: file.as_raw_fd() as u32,
+        vt: u32::from(vt.number),
+        ..Default::default()
+    };
+    // SAFETY: the fixed-width request points at a live, exclusively borrowed
+    // buffer of capacity bytes. The kernel copies pixels before releasing it.
+    let result = unsafe {
+        libc::ioctl(
+            device.as_raw_fd(),
+            0xc0404502u32 as libc::c_ulong,
+            &mut snapshot,
+        )
+    };
+    if result < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENOTTY) {
+            bail!(
+                "loaded ESP module lacks consistent console snapshots; rebuild and reload the module"
+            );
+        }
+        return Err(error).context("capture synchronized framebuffer snapshot");
     }
+    // Reject a console/mapping change during the syscall before publishing pixels.
+    ensure!(
+        terminal()? == vt && fb_map(vt.number, None)? == index,
+        "console changed during framebuffer snapshot"
+    );
+    let (size, pixels) = snapshot.convert(&raw)?;
     Ok(Image {
         size,
         pixels,
         identity: format!("fb{index}"),
     })
+}
+impl ConsoleSnapshot {
+    fn convert(&self, raw: &[u8]) -> Result<(Size, Vec<u8>)> {
+        let size = Size {
+            width: self.width,
+            height: self.height,
+        }
+        .validate_source()?;
+        ensure!(
+            (2..=4).contains(&self.bytes_per_pixel),
+            "unsupported snapshot pixel size"
+        );
+        let bytes = self.bytes_per_pixel as usize;
+        let count = size.width as usize * size.height as usize;
+        ensure!(count * bytes <= raw.len(), "truncated console snapshot");
+        let channels = [
+            (self.blue_offset, self.blue_length),
+            (self.green_offset, self.green_length),
+            (self.red_offset, self.red_length),
+        ];
+        for (offset, length) in channels {
+            ensure!(
+                (1..=16).contains(&length)
+                    && offset
+                        .checked_add(length)
+                        .is_some_and(|end| end <= self.bytes_per_pixel * 8),
+                "unsupported framebuffer channels"
+            );
+        }
+        let mut pixels = vec![0; count * 4];
+        for (source, pixel) in raw[..count * bytes]
+            .chunks_exact(bytes)
+            .zip(pixels.as_chunks_mut::<4>().0)
+        {
+            let mut word = [0; 4];
+            word[..bytes].copy_from_slice(source);
+            let value = u32::from_le_bytes(word);
+            for (i, (offset, length)) in channels.into_iter().enumerate() {
+                let max = (1u32 << length) - 1;
+                pixel[i] = (((value >> offset) & max) * 255 / max) as u8;
+            }
+        }
+        Ok((size, pixels))
+    }
 }
 
 pub struct Source {
@@ -246,7 +284,11 @@ impl Source {
                     self.restored.entry(vt.number).or_insert(previous);
                     fb_map(vt.number, Some(fb))?;
                 }
-                let mut image = framebuffer(fb)?;
+                let mut image = framebuffer(
+                    fb,
+                    vt,
+                    self.virtual_display.as_ref().map(driver::Capture::device),
+                )?;
                 image.identity = format!("vt{}:text:{}", vt.number, image.identity);
                 return Ok(image);
             }
@@ -269,7 +311,11 @@ impl Source {
         self.restore();
         if !vt.graphics {
             let index = fb_map(vt.number, None)?;
-            let mut image = framebuffer(index)?;
+            let mut image = framebuffer(
+                index,
+                vt,
+                self.virtual_display.as_ref().map(driver::Capture::device),
+            )?;
             image.identity = format!("vt{}:text:{}", vt.number, image.identity);
             return Ok(image);
         }
@@ -607,4 +653,35 @@ fn scanout(
         pixels,
         identity: output.id.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn snapshot_abi_and_rgb_conversion_are_bounded() {
+        assert_eq!(std::mem::size_of::<ConsoleSnapshot>(), 64);
+        let mut snapshot = ConsoleSnapshot {
+            width: 2,
+            height: 2,
+            bytes_per_pixel: 2,
+            red_offset: 11,
+            red_length: 5,
+            green_offset: 5,
+            green_length: 6,
+            blue_offset: 0,
+            blue_length: 5,
+            ..Default::default()
+        };
+        let (_, pixels) = snapshot
+            .convert(&[0, 248, 224, 7, 31, 0, 255, 255])
+            .unwrap();
+        assert_eq!(
+            pixels,
+            [0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
+        );
+        assert!(snapshot.convert(&[0; 7]).is_err());
+        snapshot.red_offset = u32::MAX;
+        assert!(snapshot.convert(&[0; 8]).is_err());
+    }
 }

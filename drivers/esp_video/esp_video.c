@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* ESP virtual monitor. Userspace owns encoding, authentication and networking. */
 #include <linux/module.h>
+#include <linux/capability.h>
+#include <linux/console.h>
+#include <linux/tty.h>
+#include <linux/fb.h>
+#include <linux/file.h>
+#include <linux/kd.h>
+#include <linux/console_struct.h>
+#include <linux/major.h>
+#include <linux/vt_kern.h>
 #include <linux/version.h>
 #include <linux/compat.h>
 #include <linux/miscdevice.h>
@@ -207,12 +216,115 @@ static int esp_open(struct inode *inode, struct file *file)
 	file->private_data = esp;
 	return 0;
 }
+/* Snapshot the actual fbcon backing buffer, not a row-at-a-time userspace
+ * read. console_lock serializes fbcon drawing (including cursor/scroll/VT);
+ * info->lock serializes fbdev mode changes. No user faults or color conversion
+ * occur while either lock is held. An open fbdev file pins info and its driver. */
+static long esp_console_snapshot(void __user *arg)
+{
+    struct esp_video_console_snapshot req;
+    struct fb_info *info;
+    struct fb_var_screeninfo *v;
+    struct file *file;
+    u8 *pixels;
+    u64 end, available;
+    size_t row_bytes, bytes;
+    u32 y;
+    int ret = 0;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (copy_from_user(&req, arg, sizeof(req)))
+        return -EFAULT;
+    if (!req.capacity || req.capacity > ESP_VIDEO_MAX_PIXELS * 4 ||
+        req.reserved[0] || req.reserved[1] || !req.vt || req.vt > MAX_NR_CONSOLES)
+        return -EINVAL;
+    file = fget(req.fb_fd);
+    if (!file)
+        return -EBADF;
+    if (!(file->f_mode & FMODE_READ) || !S_ISCHR(file_inode(file)->i_mode) ||
+        imajor(file_inode(file)) != FB_MAJOR || !file->private_data) {
+        ret = -EINVAL;
+        goto put;
+    }
+    info = file->private_data;
+    pixels = kvmalloc(req.capacity, GFP_KERNEL);
+    if (!pixels) { ret = -ENOMEM; goto put; }
+    console_lock();
+    lock_fb_info(info);
+    if (fg_console + 1 != req.vt || !vc_cons[fg_console].d ||
+        vc_cons[fg_console].d->vc_mode != KD_TEXT) {
+        ret = -EAGAIN;
+        goto unlock;
+    }
+    if (info->state != FBINFO_STATE_RUNNING || !info->screen_base ||
+        !info->fbops) {
+        ret = -ENODEV;
+        goto unlock;
+    }
+    v = &info->var;
+    if (!v->xres || !v->yres || v->xres > ESP_VIDEO_MAX_AXIS ||
+        v->yres > ESP_VIDEO_MAX_AXIS || v->xres * v->yres > ESP_VIDEO_MAX_PIXELS ||
+        (v->bits_per_pixel != 16 && v->bits_per_pixel != 24 && v->bits_per_pixel != 32) ||
+        v->grayscale || v->nonstd || v->rotate ||
+        info->fix.type != FB_TYPE_PACKED_PIXELS || info->fix.visual != FB_VISUAL_TRUECOLOR ||
+        (u64)v->xoffset + v->xres > v->xres_virtual ||
+        (u64)v->yoffset + v->yres > v->yres_virtual) {
+        ret = -EOPNOTSUPP;
+        goto unlock;
+    }
+    req.width = v->xres;
+    req.height = v->yres;
+    req.bytes_per_pixel = v->bits_per_pixel / 8;
+    req.red_offset = v->red.offset; req.red_length = v->red.length;
+    req.green_offset = v->green.offset; req.green_length = v->green.length;
+    req.blue_offset = v->blue.offset; req.blue_length = v->blue.length;
+    if (v->red.msb_right || v->green.msb_right || v->blue.msb_right) {
+        ret = -EOPNOTSUPP;
+        goto unlock;
+    }
+    row_bytes = (size_t)req.width * req.bytes_per_pixel;
+    bytes = row_bytes * req.height;
+    end = ((u64)v->yoffset + v->yres - 1) * info->fix.line_length +
+          ((u64)v->xoffset + v->xres) * req.bytes_per_pixel;
+    available = info->screen_size ? info->screen_size : info->fix.smem_len;
+    if (((u64)v->xoffset + v->xres) * req.bytes_per_pixel > info->fix.line_length ||
+        end > available || bytes > req.capacity) {
+        ret = -ENOSPC;
+        goto unlock;
+    }
+    if (info->fbops->fb_sync) {
+        ret = info->fbops->fb_sync(info);
+        if (ret) goto unlock;
+    }
+    for (y = 0; y < req.height; y++) {
+        size_t offset = ((size_t)y + v->yoffset) * info->fix.line_length +
+                        v->xoffset * req.bytes_per_pixel;
+        if (info->flags & FBINFO_VIRTFB)
+            memcpy(pixels + y * row_bytes, info->screen_buffer + offset, row_bytes);
+        else
+            memcpy_fromio(pixels + y * row_bytes, info->screen_base + offset, row_bytes);
+    }
+unlock:
+    unlock_fb_info(info);
+    console_unlock();
+    if (!ret && (copy_to_user(u64_to_user_ptr(req.pixels), pixels, bytes) ||
+                 copy_to_user(arg, &req, sizeof(req))))
+        ret = -EFAULT;
+    kvfree(pixels);
+put:
+    fput(file);
+    return ret;
+}
+
 static long esp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct esp_device *esp = file->private_data;
 	struct esp_video_mode mode;
 	u8 *pixels;
 	size_t bytes;
+	if (cmd == ESP_VIDEO_CONSOLE_SNAPSHOT)
+		return esp_console_snapshot((void __user *)arg);
 	if (cmd != ESP_VIDEO_CONNECT)
 		return -ENOTTY;
 	if (copy_from_user(&mode, (void __user *)arg, sizeof(mode)))
@@ -284,14 +396,17 @@ static __poll_t esp_poll(struct file *file, poll_table *wait)
 static int esp_release(struct inode *inode, struct file *file)
 {
 	struct esp_device *esp = file->private_data;
+	bool connected;
 	mutex_lock(&esp->lock);
+	connected = esp->connected;
 	WRITE_ONCE(esp->connected, false);
 	vfree(esp->pixels);
 	esp->pixels = NULL;
 	esp->bytes = 0;
 	esp->width = esp->height = 0;
 	mutex_unlock(&esp->lock);
-	drm_kms_helper_hotplug_event(&esp->drm);
+	if (connected)
+		drm_kms_helper_hotplug_event(&esp->drm);
 	atomic_set(&esp->owner, 0);
 	wake_up_interruptible(&esp->wait);
 	drm_dev_put(&esp->drm);

@@ -75,6 +75,13 @@ esp video status my-network
 esp video stop my-network
 ```
 
+When a requested video host is missing from the local peer list, the updated
+helper refreshes the signed directory from known authenticated network admins
+before retrying lookup. This lets an existing viewer learn about a newly enrolled
+console identity without restarting the host's SSH service. Directory refresh
+does not grant viewing or input permission; the console's explicit peer grant
+still applies. Updating the executable does not update an already-running helper.
+
 The host creates a disconnected-until-owned virtual connector, then connects it
 at the selected source's physical pixel size. In normal display settings, mirror
 that source to the virtual display. ESP asks you to type the source connector
@@ -93,8 +100,22 @@ retry the same share UUID for up to 30 seconds; explicit rejection ends retries.
 
 Quality options on `share`: `--fps 1..30`, `--max-size WIDTHxHEIGHT` (at most
 1920x1080), and `--bitrate 500..12000` in kbit/s. Defaults are 30 FPS and
-4000 kbit/s. Congestion closes the current decoding timeline, requests a lower
-encoder bitrate (then frame rate), and reconnects with a fresh keyframe.
+4000 kbit/s. Brief congestion keeps the connection, input, and last image alive.
+ESP skips dependent frames after a gap and resumes at a fresh AV1 keyframe,
+reducing both bitrate and frame rate. A sustained stall still ends the session.
+Console/VT changes, capture failure, and permission loss still clear the image.
+
+Text-console capture requires the updated module's `ESP_VIDEO_CONSOLE_SNAPSHOT`
+ioctl. It copies the framebuffer under `console_lock` and the fbdev mode lock,
+then releases both locks before copying to userspace or converting/encoding.
+This excludes fbcon redraws, scrolling, cursor updates, and VT changes during the
+snapshot. Arbitrary userspace writes through a framebuffer mmap do not take
+these locks and are outside this guarantee. Physical GPU scanout also retains
+its separate driver-dependent consistency limits.
+
+Upgrade the host service, client/helper, and kernel module together. No reboot
+is required; see `CONSOLE_SERVICE.md` for stopping only the console service,
+reloading the module, and restarting it without stopping ESP SSH.
 
 Foreground `share` requires a uniquely identifiable active graphical logind session and
 polls its active/lock state. It stops on a lock signal, session loss, source

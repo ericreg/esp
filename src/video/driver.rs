@@ -204,6 +204,9 @@ impl Capture {
         .validate_source()?;
         Self::connect_size(size)
     }
+    pub(super) fn device(&self) -> &File {
+        &self.file
+    }
     pub fn connect_size(size: Size) -> Result<Self> {
         size.validate_source()?;
         let file=OpenOptions::new().read(true).write(true)

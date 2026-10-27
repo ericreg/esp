@@ -423,6 +423,36 @@ mod tests {
     }
 
     #[test]
+    fn lost_interframes_resume_with_a_fresh_keyframe_decoder() {
+        let f = Format { fps: 5, ..format() };
+        let mut encoder = Encoder::new(f, 2).unwrap();
+        let mut packets = Vec::new();
+        for i in 0..18 {
+            packets.extend(encoder.encode(&red(f), i, false).unwrap());
+        }
+        packets.extend(encoder.finish().unwrap());
+        let mut decoder = Av1Decoder::new(f).unwrap();
+        decoder.decode(&packets[0].data, true).unwrap();
+        let recovery = packets
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find(|(_, packet)| packet.key)
+            .unwrap()
+            .0;
+        assert!(packets[1..recovery].iter().any(|p| !p.key));
+        decoder = Av1Decoder::new(f).unwrap();
+        for packet in &packets[recovery..] {
+            let pixels = decoder.decode(&packet.data, packet.key).unwrap();
+            assert!(
+                pixels
+                    .iter()
+                    .all(|p| (p >> 16) & 255 > 230 && p & 65535 < 0x1010)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_wrong_dimensions_key_flags_and_malformed_packets() {
         let f = format();
         let mut enc = Encoder::new(f, 2).unwrap();

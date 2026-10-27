@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -77,6 +78,32 @@ int main(void) {
 	for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
 		CHECK(ioctl(capture, ESP_VIDEO_CONNECT, &invalid[i]) == -1 && errno == EINVAL);
 	CHECK(ioctl(capture, ESP_VIDEO_CONNECT, &mode) == 0);
+	/* New ioctl rejects malformed requests without wedging console/fb locks. */
+	_Static_assert(sizeof(struct esp_video_console_snapshot) == 64, "snapshot ABI");
+	int fbdev = open("/dev/fb0", O_RDONLY); CHECK(fbdev >= 0);
+	struct fb_var_screeninfo var;
+	CHECK(ioctl(fbdev, FBIOGET_VSCREENINFO, &var) == 0);
+	size_t snapshot_bytes = (size_t)var.xres * var.yres * 4;
+	uint8_t *snapshot_pixels = malloc(snapshot_bytes); CHECK(snapshot_pixels);
+	struct esp_video_console_snapshot snapshot = {
+		.pixels = ptr(snapshot_pixels), .capacity = snapshot_bytes,
+		.fb_fd = fbdev, .vt = 1,
+	};
+	snapshot.reserved[0] = 1;
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == -1 && errno == EINVAL);
+	snapshot.reserved[0] = 0; snapshot.fb_fd = -1;
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == -1 && errno == EBADF);
+	snapshot.fb_fd = fbdev; snapshot.vt = 63;
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == -1 && errno == EAGAIN);
+	snapshot.vt = 1; snapshot.capacity = 1;
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == -1 && errno == ENOSPC);
+	snapshot.capacity = snapshot_bytes; snapshot.pixels = 1;
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == -1 && errno == EFAULT);
+	snapshot.pixels = ptr(snapshot_pixels);
+	CHECK(ioctl(capture, ESP_VIDEO_CONSOLE_SNAPSHOT, &snapshot) == 0);
+	CHECK(snapshot.width == var.xres && snapshot.height == var.yres);
+	free(snapshot_pixels); close(fbdev);
+	puts("Console snapshot ABI, bounds, VT check, and fault recovery passed");
 	card = open("/dev/dri/card0", O_RDWR); CHECK(card >= 0);
 	CHECK(ioctl(card, DRM_IOCTL_SET_MASTER, 0) == 0);
 	CHECK(ioctl(card, DRM_IOCTL_MODE_GETRESOURCES, &resources) == 0);

@@ -24,6 +24,7 @@ struct State {
     image: Option<Image>,
     status: String,
     failure: Option<String>,
+    last_decoded: Option<Instant>,
     ack: Option<(u64, tokio::sync::mpsc::Sender<u64>)>,
     input: Option<tokio::sync::mpsc::Sender<input::Event>>,
     input_failed: bool,
@@ -341,7 +342,12 @@ pub async fn run(network: String, host: String) -> Result<()> {
             let started = Instant::now();
             let result = session(&network, &host, &mut resume, task_state.clone()).await;
             let terminal = result.as_ref().err().is_some_and(|e| e.is::<Rejected>());
-            if started.elapsed() > Duration::from_secs(5) {
+            if task_state
+                .lock()
+                .unwrap()
+                .last_decoded
+                .is_some_and(|at| at >= started)
+            {
                 failed_since = None;
                 last_reported = None;
             }
@@ -434,7 +440,7 @@ async fn session(
     );
     *resume = Some(share);
     let mut codec = Av1Decoder::new(format)?;
-    let mut first = true;
+    let mut previous = None;
     let (acks, mut ack_rx) = tokio::sync::mpsc::channel::<u64>(2);
     let (inputs, mut input_rx) = tokio::sync::mpsc::channel(128);
     {
@@ -447,11 +453,16 @@ async fn session(
     let decode = async {
         loop {
             let frame = tokio::time::timeout(LIVENESS, read_frame(&mut read)).await??;
-            frame.validate(format, first)?;
-            first = false;
+            frame.validate_after(format, previous)?;
+            let restart =
+                previous.is_some_and(|seq: u64| seq.checked_add(1) != Some(frame.sequence));
+            previous = Some(frame.sequence);
             let sequence = frame.sequence;
             // At most one decode worker and one replaceable presentation image.
             let (returned, pixels) = tokio::task::spawn_blocking(move || -> Result<_> {
+                if restart {
+                    codec = Av1Decoder::new(format)?;
+                }
                 let pixels = codec.decode(&frame.data, frame.key)?;
                 Ok((codec, pixels))
             })
@@ -460,6 +471,7 @@ async fn session(
             codec = returned;
             let mut s = state.lock().unwrap();
             s.failure = None;
+            s.last_decoded = Some(Instant::now());
             s.image = Some(Image {
                 width: format.width,
                 height: format.height,
