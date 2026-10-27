@@ -557,3 +557,26 @@ async fn view_only_grants_reject_input() {
     let _ = owner_task.await;
     f.close().await;
 }
+
+#[tokio::test]
+async fn local_helper_failure_preserves_cause_and_restart_guidance() {
+    let (mut client, server) = UnixStream::pair().unwrap();
+    drop(server);
+    let error = read_local_reply(&mut client).await.unwrap_err();
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("local ESP helper"));
+    assert!(diagnostic.contains("Updating the binary does not restart it"));
+    assert!(diagnostic.contains("active ESP SSH connections"));
+    assert!(error.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+    }));
+
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    reply(&mut server, Reply::Error("host is not configured".into()))
+        .await
+        .unwrap();
+    assert!(
+        matches!(read_local_reply(&mut client).await.unwrap(), Reply::Error(e) if e == "host is not configured")
+    );
+}

@@ -606,12 +606,7 @@ pub async fn connect_local(network: &str, request: LocalRequest) -> Result<(Unix
             "local video request",
         )
         .await?;
-        read_cbor_frame(
-            &mut stream,
-            CONTROL_LIMIT,
-            "local video response (restart older ESP helpers to enable video)",
-        )
-        .await
+        read_local_reply(&mut stream).await
     })
     .await
     .context("local video request timed out")??;
@@ -621,6 +616,12 @@ pub async fn connect_local(network: &str, request: LocalRequest) -> Result<(Unix
         _ => {}
     }
     Ok((stream, response))
+}
+
+async fn read_local_reply(stream: &mut UnixStream) -> Result<Reply> {
+    read_cbor_frame(stream, CONTROL_LIMIT, "local video response")
+        .await
+        .context("the local ESP helper did not return a valid video response; an older or incompatible helper may still be running. Updating the binary does not restart it. Inspect local ESP processes and ~/.esp/logs, then restart the helper using the updated binary (this interrupts its active ESP SSH connections)")
 }
 
 #[cfg(test)]

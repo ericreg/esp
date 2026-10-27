@@ -23,6 +23,7 @@ struct Image {
 struct State {
     image: Option<Image>,
     status: String,
+    failure: Option<String>,
     ack: Option<(u64, tokio::sync::mpsc::Sender<u64>)>,
     input: Option<tokio::sync::mpsc::Sender<input::Event>>,
     input_failed: bool,
@@ -335,28 +336,44 @@ pub async fn run(network: String, host: String) -> Result<()> {
     let task = tokio::spawn(async move {
         let mut resume = None;
         let mut failed_since = None;
+        let mut last_reported = None;
         loop {
             let started = Instant::now();
             let result = session(&network, &host, &mut resume, task_state.clone()).await;
             let terminal = result.as_ref().err().is_some_and(|e| e.is::<Rejected>());
             if started.elapsed() > Duration::from_secs(5) {
                 failed_since = None;
+                last_reported = None;
             }
+            let error = match result {
+                Err(error) => format!("{error:#}"),
+                Ok(()) => "video session ended".into(),
+            };
+            // Always report errors, even without RUST_LOG. Keep the complete
+            // anyhow cause chain out of the window title, where it gets truncated.
+            if last_reported.as_ref() != Some(&error) {
+                eprintln!("ESP video ({network}/{host}): {error}");
+                last_reported = Some(error.clone());
+            }
+            let first = *failed_since.get_or_insert_with(Instant::now);
+            let done = terminal || first.elapsed() > Duration::from_secs(30);
             {
                 let mut s = task_state.lock().unwrap();
                 s.input = None;
                 s.image = None;
                 s.ack = None;
-                s.status = format!(
-                    "disconnected: {}",
-                    result.err().map(|e| e.to_string()).unwrap_or_default()
+                s.failure = Some(error);
+                s.status = if done {
+                    "Disconnected — see terminal"
+                } else {
+                    "Reconnecting — see terminal"
+                }
+                .into();
+            }
+            if done {
+                eprintln!(
+                    "ESP video: stopped reconnecting; fix the reported error and run the viewer again."
                 );
-            }
-            if terminal {
-                break;
-            }
-            let first = *failed_since.get_or_insert_with(Instant::now);
-            if first.elapsed() > Duration::from_secs(30) {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -382,6 +399,9 @@ pub async fn run(network: String, host: String) -> Result<()> {
     let _ = task.await;
     result?;
     if let Some(e) = app.error {
+        anyhow::bail!(e);
+    }
+    if let Some(e) = app.state.lock().unwrap().failure.take() {
         anyhow::bail!(e);
     }
     Ok(())
@@ -439,6 +459,7 @@ async fn session(
             .context("video decoder worker failed")??;
             codec = returned;
             let mut s = state.lock().unwrap();
+            s.failure = None;
             s.image = Some(Image {
                 width: format.width,
                 height: format.height,
