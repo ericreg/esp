@@ -56,7 +56,7 @@ pub(super) enum Command {
         #[arg(long, default_value_t=codec::default_threads() as u32, value_parser=clap::value_parser!(u32).range(1..=64))]
         threads: u32,
     },
-    /// Open a resizable viewer; click to control if permitted, Ctrl+Alt+G to release.
+    /// Open a viewer; F10 locks aspect, F11 fullscreen, click to control, Ctrl+Alt+G releases.
     #[cfg(feature = "video-viewer")]
     View { network: String, host: String },
     /// Report the local share and its viewer/transport state.

@@ -1430,6 +1430,8 @@ dependencies = [
  "libc",
  "libloading",
  "minicbor",
+ "objc2-app-kit",
+ "objc2-foundation 0.2.2",
  "ratatui",
  "rav1d",
  "rav1e",

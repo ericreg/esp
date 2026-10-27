@@ -133,6 +133,13 @@ esp video view NETWORK CONSOLE_HOST
   click acquires control; it is not forwarded as a host click.
 - Press **Ctrl+Alt+G** to release control (Control+Option+G on Mac). Focus loss,
   disconnect, and window close also release control.
+- F10 toggles the window's video aspect-ratio lock while input is released.
+  It starts unlocked; the title shows `F10 aspect free` or `F10 aspect locked`.
+  Use Fn+F10 if macOS assigns the function key to a system action. Release remote
+  input with Ctrl+Alt+G first. While captured, F10 is forwarded to the host.
+  macOS constrains the content rectangle during dragging; other window systems
+  receive proportional resize requests, which tiling compositors may override.
+  The preference survives reconnects and is suspended while fullscreen/maximized.
 - F11 toggles local fullscreen while input is released. While captured, it goes
   to the host. Host shortcuts such as Ctrl+Alt+F2 can switch VTs; reconnect and
   click again after a console switch.

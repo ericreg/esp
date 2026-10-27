@@ -9,7 +9,7 @@ video = ["dep:zbus", "dep:video-drm"]
 video-codec = ["video", "dep:rav1e", "dep:rav1d", "dep:libloading"]
 # Weak dependency features keep SSH-only builds free of codecs.
 video-asm = ["rav1e?/asm", "rav1d?/asm", "rav1d?/asm_arm64_dotprod", "rav1d?/asm_arm64_i8mm", "rav1d?/asm_arm64_sve2"]
-video-viewer = ["video-codec", "dep:winit", "dep:softbuffer"]
+video-viewer = ["video-codec", "dep:winit", "dep:softbuffer", "dep:objc2-app-kit", "dep:objc2-foundation"]
 
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "std", "unstable-rendered-line-info"] }
@@ -43,6 +43,10 @@ rav1d = { version = "=1.1.0", optional = true, git = "https://github.com/memorys
 libloading = { version = "0.8", optional = true }
 video-drm = { version = "=0.14.1", package = "drm", optional = true }
 zbus = { version = "=5.19.0", optional = true, default-features = false, features = ["tokio"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.2.2", optional = true, default-features = false, features = ["NSView", "NSWindow"] }
+objc2-foundation = { version = "=0.2.2", optional = true, default-features = false, features = ["NSGeometry"] }
 
 [dev-dependencies]
 iroh-relay = { version = "=1.0.3", features = ["server", "test-utils"] }

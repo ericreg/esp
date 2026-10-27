@@ -6,8 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::io::AsyncWriteExt;
+#[path = "viewer_resize.rs"]
+mod resize;
+
 use winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
@@ -44,8 +48,53 @@ struct App {
     scroll_remainder: (f64, f64),
     queued_motion: (i32, i32),
     last_motion: Instant,
+    aspect_locked: bool,
+    video_size: Option<PhysicalSize<u32>>,
+    applied_aspect: Option<PhysicalSize<u32>>,
+    previous_size: Option<PhysicalSize<u32>>,
+    last_resize_request: Option<PhysicalSize<u32>>,
 }
 impl App {
+    fn update_aspect_lock(&mut self) -> Result<()> {
+        if let Some(image) = &self.state.lock().unwrap().image {
+            self.video_size = Some(PhysicalSize::new(image.width, image.height));
+        }
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
+        // Fullscreen/maximized sizes belong to the window manager. Keep the
+        // preference and reapply it when returning to an ordinary window.
+        let ratio = (self.aspect_locked && window.fullscreen().is_none() && !window.is_maximized())
+            .then_some(self.video_size)
+            .flatten();
+        if ratio != self.applied_aspect {
+            resize::set_native_aspect(window, ratio)?;
+            self.applied_aspect = ratio;
+            self.last_resize_request = None;
+            if ratio.is_some() {
+                self.constrain_size(window.inner_size());
+            }
+        }
+        Ok(())
+    }
+    fn constrain_size(&mut self, size: PhysicalSize<u32>) {
+        let previous = self.previous_size.replace(size);
+        let (Some(ratio), Some(window)) = (self.applied_aspect, &self.window) else {
+            return;
+        };
+        if window.fullscreen().is_some() || window.is_maximized() {
+            return;
+        }
+        let corrected = resize::constrain(size, previous, ratio);
+        if corrected != size && self.last_resize_request != Some(corrected) {
+            // Do not spin if a tiling compositor refuses the requested size.
+            self.last_resize_request = Some(corrected);
+            if let Some(actual) = window.request_inner_size(corrected) {
+                self.previous_size = Some(actual);
+            }
+        }
+    }
+
     fn send(&mut self, event: input::Event) {
         if !matches!(event, input::Event::Motion { .. }) {
             self.flush_motion();
@@ -147,7 +196,11 @@ impl App {
         } else {
             "View only"
         };
-        window.set_title(&format!("ESP Video — {} — {input_status}", state.status));
+        let aspect = if self.aspect_locked { "locked" } else { "free" };
+        window.set_title(&format!(
+            "ESP Video — F10 aspect {aspect} — {} — {input_status}",
+            state.status
+        ));
         if let Some(image) = &state.image {
             let scale = (size.width as f64 / image.width as f64)
                 .min(size.height as f64 / image.height as f64);
@@ -238,19 +291,29 @@ impl ApplicationHandler for App {
                         if let Some(code) = keymap::evdev(code) {
                             self.send(input::Event::Key { code, down });
                         }
-                    } else if !self.captured
-                        && down
-                        && !event.repeat
-                        && event.logical_key == Key::Named(NamedKey::F11)
-                    {
-                        if let Some(window) = &self.window {
-                            window.set_fullscreen(if window.fullscreen().is_some() {
-                                None
-                            } else {
-                                Some(Fullscreen::Borderless(window.current_monitor()))
-                            });
+                    } else if !self.captured && down && !event.repeat {
+                        if event.logical_key == Key::Named(NamedKey::F10) {
+                            self.aspect_locked = !self.aspect_locked;
+                        } else if event.logical_key == Key::Named(NamedKey::F11) {
+                            if let Some(window) = &self.window {
+                                window.set_fullscreen(if window.fullscreen().is_some() {
+                                    None
+                                } else {
+                                    Some(Fullscreen::Borderless(window.current_monitor()))
+                                });
+                            }
                         }
                     }
+                }
+            }
+            WindowEvent::Resized(size) => {
+                // AppKit applies the ratio during live resize. Other backends
+                // receive a proportional size request after each resize event.
+                #[cfg(not(target_os = "macos"))]
+                self.constrain_size(size);
+                #[cfg(target_os = "macos")]
+                {
+                    self.previous_size = Some(size);
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -307,6 +370,10 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.update_aspect_lock() {
+            eprintln!("ESP video: could not set window aspect ratio: {error:#}");
+            self.aspect_locked = false;
+        }
         if self.last_motion.elapsed() >= Duration::from_millis(8) {
             self.flush_motion();
         }
@@ -399,6 +466,11 @@ pub async fn run(network: String, host: String) -> Result<()> {
         scroll_remainder: (0., 0.),
         queued_motion: (0, 0),
         last_motion: Instant::now(),
+        aspect_locked: false,
+        video_size: None,
+        applied_aspect: None,
+        previous_size: None,
+        last_resize_request: None,
     };
     let result = event_loop.run_app(&mut app);
     task.abort();

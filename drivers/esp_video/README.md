@@ -101,6 +101,13 @@ configured with `--view-only`. Click to capture; Ctrl+Alt+G releases. Closing
 it leaves the host ready for the same explicitly allowed peer. Transient failures
 retry the same share UUID for up to 30 seconds; explicit rejection ends retries.
 
+Press F10 to toggle the video aspect-ratio lock while remote input is released
+(Ctrl+Alt+G releases it). On Mac, Fn+F10 may be needed. The title shows whether
+resizing is free or locked. F10 is forwarded to the host when input is captured.
+Fullscreen/maximized windows keep the display's shape and restore the lock on
+returning to a normal window. macOS uses a native live-resize constraint; other
+window managers may override proportional size requests.
+
 Quality options on `share`: `--fps 1..30`, `--max-size WIDTHxHEIGHT` (at most
 1920x1080), and `--bitrate 500..12000` in kbit/s. Defaults are 30 FPS and
 4000 kbit/s. Brief congestion keeps the connection, input, and last image alive.
