@@ -127,7 +127,7 @@ use rav1d::{
         dav1d::{Dav1dContext, Dav1dSettings},
         picture::Dav1dPicture,
     },
-    src::lib::*,
+    *,
 };
 
 // rav1d's public interface retains dav1d's C ABI, but these calls execute Rust.
@@ -450,6 +450,82 @@ mod tests {
                     .all(|p| (p >> 16) & 255 > 230 && p & 65535 < 0x1010)
             );
         }
+    }
+
+    #[test]
+    fn full_hd_frames_and_rate_changes_decode() {
+        let f = Format {
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            kbps: 4000,
+        };
+        let raw: Vec<u8> = (0..f.width * f.height)
+            .flat_map(|i| {
+                let x = i % f.width;
+                let y = i / f.width;
+                let ink = if ((x / 4) ^ (y / 8)) % 7 < 2 { 225 } else { 20 };
+                [ink, ink, ink, 0]
+            })
+            .collect();
+        let mut decoder = Av1Decoder::new(f).unwrap();
+        for steps in [0, 2, 12] {
+            let format = f.reduced(steps);
+            let yuv = xrgb_to_yuv(&raw, f.width, f.height, format).unwrap();
+            let mut encoder = Encoder::new(format, 6).unwrap();
+            let mut packets = Vec::new();
+            for i in 0..6 {
+                packets.extend(encoder.encode(&yuv, i, false).unwrap());
+            }
+            packets.extend(encoder.finish().unwrap());
+            assert_eq!(packets.len(), 6);
+            assert!(packets[0].key);
+            for packet in packets {
+                let pixels = decoder.decode(&packet.data, packet.key).unwrap();
+                assert_eq!(pixels.len(), (f.width * f.height) as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_tile_payload_returns_error_without_aborting() {
+        let f = Format {
+            width: 256,
+            height: 128,
+            fps: 5,
+            kbps: 4000,
+        };
+        let raw: Vec<u8> = (0..f.width * f.height)
+            .flat_map(|i| {
+                let x = i % f.width;
+                let y = i / f.width;
+                [
+                    (x.wrapping_mul(37) ^ y.wrapping_mul(13)) as u8,
+                    (x.wrapping_mul(17) ^ y.wrapping_mul(73)) as u8,
+                    (x.wrapping_mul(53) ^ y.wrapping_mul(31)) as u8,
+                    0,
+                ]
+            })
+            .collect();
+        let yuv = xrgb_to_yuv(&raw, f.width, f.height, f).unwrap();
+        let mut enc = Encoder::new(f, 2).unwrap();
+        let mut packets = enc.encode(&yuv, 0, false).unwrap();
+        packets.extend(enc.finish().unwrap());
+        let valid = &packets[0];
+        Av1Decoder::new(f)
+            .unwrap()
+            .decode(&valid.data, true)
+            .unwrap();
+        let mut errors = 0;
+        for fill in [0, 0xff, 0x55] {
+            let mut damaged = valid.data.clone();
+            let start = damaged.len() / 2;
+            damaged[start..].fill(fill);
+            if Av1Decoder::new(f).unwrap().decode(&damaged, true).is_err() {
+                errors += 1;
+            }
+        }
+        assert!(errors > 0, "fixture must exercise decoder error cleanup");
     }
 
     #[test]

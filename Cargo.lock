@@ -386,6 +386,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "av-data"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fca67ba5d317924c02180c576157afd54babe48a76ebc66ce6d34bb8ba08308e"
+dependencies = [
+ "byte-slice-cast",
+ "bytes",
+ "num-derive",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
 name = "av-scenechange"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -541,6 +554,12 @@ name = "by_address"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
+
+[[package]]
+name = "byte-slice-cast"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
 name = "bytemuck"
@@ -4063,10 +4082,11 @@ dependencies = [
 [[package]]
 name = "rav1d"
 version = "1.1.0"
-source = "git+https://github.com/memorysafety/rav1d?rev=782dab2135ea64a057c097088a13eb8ed3cc3320#782dab2135ea64a057c097088a13eb8ed3cc3320"
+source = "git+https://github.com/memorysafety/rav1d?rev=6c6f463785a546dea18fd9ca0f14634c2ee0557c#6c6f463785a546dea18fd9ca0f14634c2ee0557c"
 dependencies = [
  "assert_matches",
  "atomig",
+ "av-data",
  "bitflags 2.13.1",
  "cc",
  "cfg-if",
@@ -4075,7 +4095,8 @@ dependencies = [
  "parking_lot",
  "paste",
  "raw-cpuid",
- "strum 0.26.3",
+ "static_assertions",
+ "strum 0.27.2",
  "to_method",
  "zerocopy 0.7.35",
 ]
@@ -4904,11 +4925,11 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
-version = "0.26.3"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fec0f0aef304996cf250b31b5a10dee7980c85da9d759361292b8bca5a18f06"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
 dependencies = [
- "strum_macros 0.26.4",
+ "strum_macros 0.27.2",
 ]
 
 [[package]]
@@ -4922,14 +4943,13 @@ dependencies = [
 
 [[package]]
 name = "strum_macros"
-version = "0.26.4"
+version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c6bee85a5a24955dc440386795aa378cd9cf82acd5f764469152d2270e581be"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
 dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "rustversion",
  "syn 2.0.119",
 ]
 

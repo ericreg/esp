@@ -463,7 +463,14 @@ async fn session(
                 if restart {
                     codec = Av1Decoder::new(format)?;
                 }
-                let pixels = codec.decode(&frame.data, frame.key)?;
+                let pixels = codec.decode(&frame.data, frame.key).with_context(|| {
+                    format!(
+                        "AV1 decode failed at frame {} (keyframe={}, {} bytes)",
+                        frame.sequence,
+                        frame.key,
+                        frame.data.len()
+                    )
+                })?;
                 Ok((codec, pixels))
             })
             .await

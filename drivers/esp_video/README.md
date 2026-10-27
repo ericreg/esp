@@ -23,8 +23,11 @@ Assembly optimizations are enabled by the default `video-asm` feature, with CPU
 features selected at runtime. On x86-64, install NASM (2.15.05 or newer); on Apple
 Silicon use Xcode Command Line Tools. For a Rust-only build, use
 `--no-default-features --features video-viewer`. SSH-only builds do not compile
-codec dependencies. The rav1d dependency pins its 1.1.0 release commit because
-that release's published crate omitted an ARM assembly header.
+codec dependencies. The rav1d dependency pins upstream commit
+`6c6f463785a546dea18fd9ca0f14634c2ee0557c`, which includes the ARM assembly
+header missing from the published 1.1.0 crate and fixes a decoder-error cleanup
+panic. Its C-compatible function interface still executes Rust, with optional
+assembly; it does not link a system C codec library.
 
 ```sh
 cargo build --release --features video-viewer --locked

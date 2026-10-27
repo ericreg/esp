@@ -278,8 +278,9 @@ Replace VP8 outright, retaining existing protocol identifiers with no legacy
 compatibility or codec negotiation. Upgrade both endpoints and restart helpers.
 Use rav1e 0.8.1 for AV1 encoding and rav1d 1.1.0 for decoding, compiled from
 Rust source with optional assembly. No system codec library is needed. The rav1d
-release commit is pinned to include the ARM assembly header missing from its
-published crate. Assembly is enabled by default through `video-asm`; CPU dispatch
+upstream commit `6c6f463785a546dea18fd9ca0f14634c2ee0557c` is pinned to include
+the ARM assembly header missing from its published crate and the decode-error
+cleanup fix (a missing frame header previously caused a process-aborting panic). Assembly is enabled by default through `video-asm`; CPU dispatch
 uses supported instructions. `--no-default-features --features video-viewer`
 builds without handwritten codec assembly.
 
