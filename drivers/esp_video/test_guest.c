@@ -60,6 +60,17 @@ int main(void) {
 	puts("ESP driver isolated guest test starting");
 	module = open("/esp_video.ko", O_RDONLY); CHECK(module >= 0);
 	CHECK(syscall(SYS_finit_module, module, "", 0) == 0); close(module);
+	if (access("/console-test", X_OK) == 0) {
+		int status;
+		module = open("/uinput.ko", O_RDONLY); CHECK(module >= 0);
+		CHECK(syscall(SYS_finit_module, module, "", 0) == 0); close(module);
+		child = fork(); CHECK(child >= 0);
+		if (!child) {
+			execl("/console-test", "console-test", "video::console::tests::linux_console_devices_in_vm", "--exact", "--ignored", "--nocapture", NULL);
+			_exit(127);
+		}
+		CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
 	capture = open("/dev/esp-video", O_RDWR | O_NONBLOCK); CHECK(capture >= 0);
 	CHECK(open("/dev/esp-video", O_RDWR) == -1 && errno == EBUSY);
 	struct esp_video_mode invalid[] = { {0, 240}, {3, 240}, {4097, 2}, {4096, 4096} };

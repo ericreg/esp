@@ -8,6 +8,8 @@
 #include <linux/poll.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <drm/clients/drm_client_setup.h>
+#include <drm/drm_fbdev_shmem.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic_state_helper.h>
@@ -179,7 +181,7 @@ static const struct drm_encoder_funcs esp_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
 static const struct drm_mode_config_funcs esp_mode_config_funcs = {
-	.fb_create = drm_gem_fb_create,
+	.fb_create = drm_gem_fb_create_with_dirty,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
 };
@@ -191,6 +193,7 @@ static const struct drm_driver esp_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops = &esp_drm_fops,
 	DRM_GEM_SHMEM_DRIVER_OPS,
+	DRM_FBDEV_SHMEM_DRIVER_OPS,
 	.name = "esp_video", .desc = "ESP virtual display",
 	.major = 1, .minor = 0,
 };
@@ -343,6 +346,7 @@ static int esp_probe(struct platform_device *pdev)
 		.name = "esp-video", .fops = &esp_capture_fops, .mode = 0600 };
 	ret = misc_register(&esp->misc);
 	if (ret) { drm_dev_unregister(drm); return ret; }
+	drm_client_setup_with_fourcc(drm, DRM_FORMAT_XRGB8888);
 	platform_set_drvdata(pdev, esp);
 	return 0;
 }

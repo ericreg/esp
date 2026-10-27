@@ -1,4 +1,5 @@
 //! Ephemeral viewing grants and bounded bridges; no codecs or device access here.
+use super::input;
 use super::protocol::Format;
 use super::protocol::*;
 use crate::*;
@@ -16,6 +17,9 @@ struct Share {
     peer: EndpointId,
     display: String,
     format: Format,
+    allow_input: bool,
+    input: mpsc::Sender<(u64, input::Event)>,
+    input_epoch: AtomicU64,
     frames: broadcast::Sender<Frame>,
     stop: watch::Sender<bool>,
     keyframe: mpsc::Sender<u8>,
@@ -39,14 +43,24 @@ impl Drop for Owner {
         self.share.stop.send_replace(true);
     }
 }
-struct Viewer(Arc<Share>);
+struct Viewer(Arc<Share>, u64);
 impl Drop for Viewer {
     fn drop(&mut self) {
+        if self.0.allow_input {
+            let _ = self.0.input.try_send((self.1, input::Event::Release));
+        }
         *self.0.connection.lock().unwrap() = None;
         self.0.busy.store(false, Ordering::Release);
     }
 }
 impl Service {
+    pub fn reset_viewer(&self, reason: &str) {
+        if let Ok(share) = self.current() {
+            if let Some(conn) = share.connection.lock().unwrap().as_ref() {
+                conn.close(GRACEFUL_CLOSE, reason.as_bytes());
+            }
+        }
+    }
     pub fn stop(&self) {
         if let Some(share) = self.0.lock().unwrap().take() {
             share.stop.send_replace(true);
@@ -65,7 +79,7 @@ impl Service {
                 let connection = s.connection.lock().unwrap();
                 serde_json::json!({ "share":s.id,"display":s.display,"peer":s.peer.to_string(),
                     "state":if s.busy.load(Ordering::Acquire) {"streaming"} else {"ready"},
-                    "format_limits":s.format,"encoder_target":s.format.reduced(s.reductions.load(Ordering::Relaxed)),
+                    "allow_input":s.allow_input,"format_limits":s.format,"encoder_target":s.format.reduced(s.reductions.load(Ordering::Relaxed)),
                     "frames_sent":s.sent.load(Ordering::Relaxed),"bytes_sent":s.bytes.load(Ordering::Relaxed),
                     "last_presentation_roundtrip_ms":s.ack_us.load(Ordering::Relaxed)/1000,
                     "path":connection.as_ref().map(|c| c.paths().iter().find(|p|p.is_selected()).map(|p|if p.is_relay(){"relayed"}else{"direct"}).unwrap_or("connecting").to_string()) })
@@ -129,6 +143,7 @@ pub async fn local(
             peer,
             display,
             format,
+            allow_input,
         } => {
             let setup = async {
                 format.validate()?;
@@ -139,6 +154,7 @@ pub async fn local(
                 let cfg = snapshot(&actor).await?;
                 let peer = cfg.resolve_peer(&peer)?.node_id;
                 let active = actor.register_connection(peer).await?;
+                let (input, input_requests) = mpsc::channel(128);
                 let (frames, _) = broadcast::channel(2);
                 let (stop, _) = watch::channel(false);
                 let (keyframe, key_requests) = mpsc::channel(1);
@@ -147,6 +163,9 @@ pub async fn local(
                     peer,
                     display,
                     format,
+                    allow_input,
+                    input,
+                    input_epoch: AtomicU64::new(0),
                     frames,
                     stop,
                     keyframe,
@@ -172,10 +191,11 @@ pub async fn local(
                     },
                     active,
                     key_requests,
+                    input_requests,
                 ))
             }
             .await;
-            let (owner, mut active, mut key_requests) = match setup {
+            let (owner, mut active, mut key_requests, mut input_requests) = match setup {
                 Ok(value) => value,
                 Err(e) => return reply(&mut stream, Reply::Error(format!("{e:#}"))).await,
             };
@@ -185,6 +205,7 @@ pub async fn local(
                 Reply::Ready {
                     share: share.id.clone(),
                     format,
+                    allow_input,
                 },
             )
             .await?;
@@ -208,7 +229,19 @@ pub async fn local(
             };
             tokio::select! {
                 result = ingest => result,
-                result = async { while let Some(request)=key_requests.recv().await { write.write_all(&[request]).await?; } Ok::<(),anyhow::Error>(()) } => result,
+                result = async {
+                    loop {
+                        tokio::select! {
+                            Some(request)=key_requests.recv()=>write.write_all(&[request]).await?,
+                            Some((epoch,event))=input_requests.recv()=> {
+                                write.write_all(&[3]).await?;
+                                write.write_all(&epoch.to_be_bytes()).await?;
+                                input::write(&mut write,event).await?;
+                            }
+                        }
+                    }
+                    #[allow(unreachable_code)] Ok::<(),anyhow::Error>(())
+                } => result,
                 _ = stop.changed() => Ok(()),
                 _ = active.cancelled() => bail!("video share permission revoked"),
             }
@@ -240,25 +273,43 @@ pub async fn local(
                 active.connected().await?;
                 // No media is released until both sides have checked membership.
                 send.write_all(&[1]).await?;
-                Ok::<_, anyhow::Error>((close, send, recv, remote.share, remote.format, active))
+                Ok::<_, anyhow::Error>((
+                    close,
+                    send,
+                    recv,
+                    remote.share,
+                    remote.format,
+                    remote.allow_input,
+                    active,
+                ))
             })
             .await
             .context("video connection setup timed out")
             .and_then(|v| v);
-            let (connection, mut send, mut recv, share, format, mut active) = match setup {
-                Ok(v) => v,
-                Err(e) => {
-                    let rejection = if e.is::<Rejected>() {
-                        Reply::Rejected(e.to_string())
-                    } else {
-                        Reply::Error(format!("{e:#}"))
-                    };
-                    return reply(&mut stream, rejection).await;
-                }
-            };
-            reply(&mut stream, Reply::Ready { share, format }).await?;
+            let (connection, mut send, mut recv, share, format, allow_input, mut active) =
+                match setup {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let rejection = if e.is::<Rejected>() {
+                            Reply::Rejected(e.to_string())
+                        } else {
+                            Reply::Error(format!("{e:#}"))
+                        };
+                        return reply(&mut stream, rejection).await;
+                    }
+                };
+            reply(
+                &mut stream,
+                Reply::Ready {
+                    share,
+                    format,
+                    allow_input,
+                },
+            )
+            .await?;
             let (mut local_read, mut local_write) = stream.into_split();
             let (acks, mut ack_rx) = mpsc::channel::<u64>(2);
+            let (inputs, mut input_rx) = mpsc::channel(128);
             let media = async {
                 let mut media = timeout(SETUP, connection.0.accept_uni()).await??;
                 let mut previous = None;
@@ -281,15 +332,30 @@ pub async fn local(
             };
             let feedback = async {
                 loop {
-                    anyhow::ensure!(
-                        local_read.read_u8().await? == 1,
-                        "invalid local presentation acknowledgement"
-                    );
-                    acks.send(local_read.read_u64().await?)
-                        .await
-                        .map_err(|_| anyhow!("video control stopped"))?;
+                    match local_read.read_u8().await? {
+                        1 => acks
+                            .send(local_read.read_u64().await?)
+                            .await
+                            .map_err(|_| anyhow!("video control stopped"))?,
+                        2 => {
+                            anyhow::ensure!(allow_input, "host did not grant input control");
+                            let event = input::read(&mut local_read).await?;
+                            timeout(Duration::from_millis(100), inputs.send(event)).await??;
+                        }
+                        _ => bail!("invalid local viewer message"),
+                    }
                 }
                 #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
+            };
+            let input_stream = async {
+                if !allow_input {
+                    return std::future::pending::<Result<()>>().await;
+                }
+                let mut output = connection.0.open_uni().await?;
+                while let Some(event) = input_rx.recv().await {
+                    timeout(Duration::from_millis(500), input::write(&mut output, event)).await??;
+                }
                 Ok::<(), anyhow::Error>(())
             };
             let control = async {
@@ -313,6 +379,7 @@ pub async fn local(
                 result = media => result,
                 result = control => result,
                 result = feedback => result,
+                result = input_stream => result,
                 _ = active.cancelled() => bail!("video host revoked"),
             }
         }
@@ -323,7 +390,7 @@ pub async fn reply(stream: &mut UnixStream, value: Reply) -> Result<()> {
 }
 
 pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid) -> Result<()> {
-    conn.set_max_concurrent_uni_streams(VarInt::from_u32(0));
+    conn.set_max_concurrent_uni_streams(VarInt::from_u32(1));
     conn.set_max_concurrent_bi_streams(VarInt::from_u32(1));
     let (mut send, mut recv, viewer, mut frames) = timeout(SETUP, async {
         let (mut send, mut recv) = conn.accept_bi().await?;
@@ -352,12 +419,14 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
                     .is_ok(),
                 "video share already has a viewer"
             );
-            let viewer = Viewer(share.clone());
+            let epoch = share.input_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            let viewer = Viewer(share.clone(), epoch);
             let frames = share.frames.subscribe();
             let hello = ServerHello {
                 identity,
                 share: share.id.clone(),
                 format: share.format,
+                allow_input: share.allow_input,
             };
             Ok::<_, anyhow::Error>((viewer, frames, hello))
         }
@@ -449,6 +518,28 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
+    let input_stream = async {
+        let mut stream = conn.accept_uni().await?;
+        anyhow::ensure!(share.allow_input, "input control not authorized");
+        let mut window = std::time::Instant::now();
+        let mut count = 0;
+        loop {
+            let event = timeout(Duration::from_secs(2), input::read(&mut stream)).await??;
+            if window.elapsed() >= Duration::from_secs(1) {
+                window = std::time::Instant::now();
+                count = 0;
+            }
+            count += 1;
+            anyhow::ensure!(count <= 2000, "input rate exceeded");
+            timeout(
+                Duration::from_millis(100),
+                share.input.send((viewer.1, event)),
+            )
+            .await??;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
     let control = async {
         let mut previous_ack = None;
         loop {
@@ -488,6 +579,7 @@ pub async fn incoming(conn: Connection, actor: ConfigActorHandle, presence: Uuid
             result
         },
         result = control => result,
+        result = input_stream => result,
         _ = stop.changed() => Ok(()),
     }
 }

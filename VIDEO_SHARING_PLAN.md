@@ -1,10 +1,10 @@
 # ESP video sharing plan
 
-Status: experimental driver, video service, codec, and viewer implemented, October 23, 2026.
+Status: experimental driver, Rust console service, input forwarding, codec, and viewer implemented, October 26, 2026.
 Live display-stack compatibility and performance validation are pending.
 
-ESP will mirror one existing display into a virtual video output, encode its
-frames, and deliver them to a view-only client over the existing authenticated
+ESP can mirror one existing display into a virtual video output, encode its
+frames, and deliver them to a client over the existing authenticated
 Iroh transport. ESP will own the display integration, session protocol, lifecycle,
 and viewer implementation. Use independently selected libraries for codecs and
 windowing; do not copy RustDesk code or introduce a RustDesk dependency.
@@ -16,11 +16,14 @@ output, and one viewer at a time per exporting ESP process. The source machine
 may have several monitors, but only the explicitly selected monitor is shared.
 The viewer displays the stream in a resizable window with optional fullscreen.
 
-Keyboard and mouse forwarding, audio, clipboard, recording, USB forwarding,
-multi-monitor streaming, extended desktops, and making the virtual output the
-primary or only display are outside this release. Session negotiation, health
-reports, and decoder recovery messages still travel from viewer to host; these
-are protocol messages, not remote user input.
+The Rust system-console service extends the original foreground mirror design
+with keyboard/mouse forwarding, login/lock screens, active framebuffer consoles,
+and a headless virtual output. See [the console implementation and installation
+guide](CONSOLE_SERVICE.md) for the current capture paths and tested limitations.
+Audio, clipboard, recording, USB forwarding, multi-monitor streaming and remote
+desktop-layout management remain outside scope. Foreground `share` remains
+view-only and stops on session lock; the console service intentionally survives
+login/logout and lock.
 
 The selected architecture is an OS-visible virtual display driver. The host
 renders into that output as it would into a connected monitor; ESP consumes its
@@ -30,22 +33,25 @@ not require GNOME, Mutter, KDE, wlroots, or desktop-specific discovery APIs.
 - Linux hosting is the initial planning target, with Linux/macOS viewers; this
   platform scope remains provisional. Other host OSes need their own display
   device integration while sharing the media and network implementation.
-- Investigate existing Linux DRM/KMS virtual-display support before deciding
-  whether ESP needs its own kernel module. A driver-based architecture is selected;
-  the specific driver and userspace interface are not yet selected.
-- The virtual output must mirror exactly one existing output. Creating a new
+- ESP's DRM/KMS virtual-display module and `/dev/esp-video` are implemented,
+  including fbdev emulation for Linux virtual terminals.
+- For foreground sharing, the virtual output must mirror exactly one existing output. Creating a new
   output alone does not establish mirroring. Initial setup may use the host's
   normal display settings; automatic desktop-specific layout configuration is
   outside this design.
 
-This scope requires an existing, active graphical session and source display.
-Headless startup and sharing a login screen are later work.
+Foreground sharing requires an existing graphical session and source display.
+`serve` runs before user login and follows the existing active VT. Without a
+physical monitor it connects the ESP monitor; fbcon can use that framebuffer,
+and a graphical compositor must enable it to produce a graphical login screen.
+The remaining mirror-specific sections describe the foreground `share` workflow;
+the console guide governs `serve` where their lifecycle and capture rules differ.
 
 ### Implementation progress
 
 - Added an ESP DRM/KMS virtual-display module and exclusive `/dev/esp-video`
   frame interface. Closing the owning file disconnects the output. Compilation
-  passes against installed 6.18.55 and 7.2.9 kernel headers. Isolated VMs running
+  passes against installed 6.18.55 and 7.3.0 kernel headers. Isolated VMs running
   both kernels pass actual frame capture, repeated scanout, owner-death cleanup,
   and module-unload tests. Real graphical-desktop mirroring remains untested.
 - Replaced Mutter discovery with read-only DRM enumeration and source identities
@@ -63,6 +69,14 @@ Headless startup and sharing a login screen are later work.
 - Congestion ends the current connection/timeline, lowers bitrate and then frame
   rate, and lets the viewer reconnect to the same share with a new decoder and
   keyframe. Same-connection generation reset is deferred.
+- Added a systemd-managed Rust `serve` command, fbcon/VT capture, physical DRM
+  plane readback through EGL/GBM or linear CPU mapping, and headless fbdev support.
+  VM tests cover text rendering, real uinput keystrokes, synthetic graphical
+  scanout, and return to the same text console. Both AMD cards pass offscreen
+  DMA-BUF readback without host modesetting.
+- Added control-enabled grants and a separate reliable QUIC input stream, physical
+  key mapping, relative mouse/buttons/wheel, click-to-capture and Ctrl+Alt+G release,
+  bounded queues and an encoder-independent input watchdog.
 
 Synthetic tests cover real direct and private forced-relay transport, grants,
 revocation, stop, stale shares, single-viewer limits, malformed media, presentation
@@ -80,7 +94,8 @@ These commands are proposed additions:
 |---|---|
 | `esp video displays` | List driver-visible outputs, virtual-device capabilities, and mirror verification support. |
 | `esp video share NETWORK --display DISPLAY --peer PEER` | Create the virtual output, wait for local mirror confirmation and a driver frame, and allow the selected peer to view it. Run in the foreground. |
-| `esp video view NETWORK HOST` | Open the host's currently shared display in a view-only window. |
+| `esp video serve --config PATH --peer PEER` | Serve the active machine console as a system service, with keyboard/mouse input unless `--view-only`. |
+| `esp video view NETWORK HOST` | Open the host's shared screen; click to control when the grant permits input. |
 | `esp video status NETWORK` | Report the share, selected source, viewer, stream format, connection state, and performance counters. |
 | `esp video stop NETWORK` | Stop the local share and remove its virtual output. |
 
@@ -106,8 +121,10 @@ foreground share remains ready for another connection from the same allowed peer
 Expose a display device through Linux DRM/KMS, with monitor identity, supported
 modes, hotplug/lifetime behavior, and an explicit frame-delivery interface to the
 ESP sharing process. The driver receives rendered output; encoding, networking,
-and peer authorization stay in userspace. ESP must not read arbitrary physical-GPU
-memory or assume that a framebuffer represents the final composed image.
+and peer authorization stay in userspace. Foreground sharing consumes only the
+ESP output. System-console capture additionally exports the selected physical
+output's DRM scanout planes through the kernel API; its composition and display
+color-transform limitations are documented in the console guide.
 
 VKMS is a software KMS driver worth investigating. DRM writeback provides a
 mechanism for writing display output into memory. Neither establishes that a
@@ -315,8 +332,12 @@ one-byte ready acknowledgement only after validating the host.
 
 The control stream then carries heartbeat requests/replies (byte `0`) and
 presentation acknowledgements (byte `1` followed by an eight-byte big-endian
-sequence). These messages never include keyboard, mouse, or display-control input.
-The host enables no incoming media streams; the viewer permits one media stream.
+sequence). Input travels on a separate client-to-host unidirectional stream when
+the required `allow_input` field in the server hello permits it. Each fixed 12-byte
+record carries capture/release/heartbeat, a physical key, button, relative motion,
+or scroll; noncanonical/reserved bytes and out-of-range values are rejected.
+The host permits one incoming input stream; the viewer permits one media stream.
+Old peers/helpers must be upgraded; protocol identifiers remain unchanged.
 
 Each media frame has a 22-byte binary header: version (`1`), keyframe flag,
 eight-byte sequence, eight-byte sender-relative capture timestamp, and four-byte
@@ -406,7 +427,8 @@ existing networks.
 Implement a small native viewer using `winit` and a `softbuffer` presentation
 backend initially. Decode AV1, convert to the window's pixel format, preserve
 aspect ratio with letterboxing, and support fullscreen and local close commands.
-The viewer's keys and pointer never become network input events. Softbuffer
+Input is local until the user clicks a control-enabled console stream; focus loss
+or Ctrl+Alt+G releases it. Foreground mirror grants remain view-only. Softbuffer
 supports presenting CPU-rendered images through a cross-platform windowing layer.
 [Softbuffer](https://github.com/rust-windowing/softbuffer).
 
@@ -424,7 +446,7 @@ Pin exact dependency versions during implementation and record license notices
 for the selected build; independently implemented ESP code does not require
 reimplementing established codec algorithms.
 
-## Proposed module layout
+## Module layout
 
 ```text
 src/video/
@@ -434,11 +456,17 @@ src/video/
   driver.rs       DRM discovery, exclusive capture, logind lifecycle
   display.rs      source and encoded-size bounds
   share.rs        local setup, capture/encoder worker, cleanup
+  console.rs      Rust system-console service, lifecycle, encoder/input workers
+  capture.rs      active VT, fbcon, physical scanout and headless selection
+  gpu.rs          dynamic EGL/GBM DMA-BUF readback
+  input.rs        bounded physical input protocol and held-key state
+  uinput.rs       Linux keyboard/mouse injection and watchdog
+  keymap.rs       viewer physical key mapping
   codec.rs        rav1e/rav1d wrappers and color conversion
-  vpx.c           small C boundary hiding native ABI structs
   viewer.rs       decode, presentation feedback, window lifecycle
   service_tests.rs  direct/private-relay and permission/lifecycle tests
 drivers/esp_video/  independent DRM/KMS module, UAPI and setup guide
+packaging/systemd/  console unit and configuration example
 ```
 
 Keep source-display creation independent from stream codecs and viewer rendering.

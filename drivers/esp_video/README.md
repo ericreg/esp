@@ -2,7 +2,9 @@
 
 ESP exposes a single Linux DRM/KMS virtual monitor and reads its composed
 XRGB8888 frames through `/dev/esp-video`. Encoding, authentication, networking,
-and the client window run in unprivileged userspace. No compositor-specific
+and the client window run in userspace. Foreground sharing is unprivileged;
+the [machine-console service](../../CONSOLE_SERVICE.md) runs as root to access
+login screens, framebuffer consoles, physical scanout, and uinput. No compositor-specific
 capture service is used. This is an experimental implementation: compilation and
 synthetic network tests do not establish hardware/compositor compatibility.
 
@@ -13,7 +15,7 @@ The default ESP build remains SSH-only. Feature combinations are:
 | Feature | Includes |
 |---|---|
 | `video` | DRM discovery, video service, local status/stop, protocol tests; no codecs or windowing. |
-| `video-codec` | Above plus Linux `share` and software AV1 through rav1e/rav1d. |
+| `video-codec` | Above plus Linux `share`/`serve` and software AV1 through rav1e/rav1d. |
 | `video-viewer` | Above plus the native `view` window using winit/softbuffer. |
 
 The codec crates are compiled into ESP; no system codec library is required.
@@ -31,10 +33,13 @@ make -C drivers/esp_video
 
 Match the kernel's compiler: a Clang-built kernel may require
 `make -C drivers/esp_video LLVM=1`. To compile against another installed header
-tree, pass `KDIR=/lib/modules/KERNEL_VERSION/build`. This module has been compiled
-against the installed 6.18.55 and 7.2.9 CachyOS header trees. Isolated VMs running both kernels pass real pixel capture, repeated scanout
-updates, exclusive ownership, owner-death cleanup, and module unload. It has not
-been loaded into the host or validated with a running graphical desktop. Other kernel APIs may need changes.
+tree, pass `KDIR=/lib/modules/KERNEL_VERSION/build`. The updated module has been
+compiled and tested in isolated VMs against 6.18.55 and 7.3.0 CachyOS kernels.
+Tests cover pixel capture, repeated scanout updates, exclusive ownership,
+owner-death cleanup, module unload, fbcon text, and text/graphics transitions.
+It has not been validated with a running graphical desktop. Other kernel APIs
+may need changes. DRM fbdev emulation and framebuffer-console support must be
+enabled for text-console capture.
 
 ## Load in an interactive test session
 
@@ -52,7 +57,8 @@ Build the module for the **running** kernel. Secure Boot/module-signing policy
 may require signing it before loading. No reboot is part of the normal workflow.
 The udev rule gives the active seat user access to the capture endpoint. DRM
 output discovery also needs read access to the applicable `/dev/dri/card*` nodes.
-Run ESP as the graphical user; do not run its transport or viewer as root.
+Run foreground sharing and the viewer as the graphical user. The separate
+system-console service deliberately requires root; see its setup guide.
 
 ## Share and view
 
@@ -79,8 +85,9 @@ verification.** Do not change the mirror configuration while sharing; the virtua
 output streams whatever the host renders into it. Automatic verification remains
 a feasibility gate for a release claiming verified single-source mirroring.
 
-The viewer opens a resizable window; F11 toggles fullscreen. It sends presentation
-acknowledgements and health messages, with no keyboard/mouse forwarding. Closing
+The viewer opens a resizable window; F11 toggles fullscreen while input is released.
+Foreground shares are view-only; console-service grants also permit input unless
+configured with `--view-only`. Click to capture; Ctrl+Alt+G releases. Closing
 it leaves the host ready for the same explicitly allowed peer. Transient failures
 retry the same share UUID for up to 30 seconds; explicit rejection ends retries.
 
@@ -89,7 +96,7 @@ Quality options on `share`: `--fps 1..30`, `--max-size WIDTHxHEIGHT` (at most
 4000 kbit/s. Congestion closes the current decoding timeline, requests a lower
 encoder bitrate (then frame rate), and reconnects with a fresh keyframe.
 
-The host requires a uniquely identifiable active graphical logind session and
+Foreground `share` requires a uniquely identifiable active graphical logind session and
 polls its active/lock state. It stops on a lock signal, session loss, source
 disconnection/mode change, virtual-output deactivation, owner exit, or revocation.
 Lock reporting, cursor rendering, color, GPU buffer imports, and desktop adoption
@@ -123,7 +130,7 @@ and verifies cleanup after SIGKILL. Only the VM is powered off afterward.
 
 Rust tests exercise bounded framing, codec color round trips, mutual membership,
 ephemeral grants, single-viewer limits, stop/revocation, stalled presentation,
-and real direct and private forced-relay sessions using synthetic frames. They
+input forwarding/cleanup, and real direct and private forced-relay sessions using synthetic frames. They
 do not load the module, change host displays, or contact public relays.
 
 Before publishing host support, test actual monitor creation, manual mirror

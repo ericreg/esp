@@ -1,4 +1,4 @@
-use super::{codec::Av1Decoder, protocol::*, service};
+use super::{codec::Av1Decoder, input, keymap, protocol::*, service};
 use anyhow::{Context as _, Result, ensure};
 use std::{
     num::NonZeroU32,
@@ -8,10 +8,10 @@ use std::{
 use tokio::io::AsyncWriteExt;
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::{Fullscreen, Window, WindowId},
+    keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
+    window::{CursorGrabMode, Fullscreen, Window, WindowId},
 };
 
 struct Image {
@@ -24,14 +24,103 @@ struct State {
     image: Option<Image>,
     status: String,
     ack: Option<(u64, tokio::sync::mpsc::Sender<u64>)>,
+    input: Option<tokio::sync::mpsc::Sender<input::Event>>,
+    input_failed: bool,
+    generation: u64,
 }
 struct App {
     state: Arc<Mutex<State>>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     error: Option<String>,
+    captured: bool,
+    locked: bool,
+    generation: u64,
+    pressed: std::collections::HashSet<KeyCode>,
+    cursor: Option<(f64, f64)>,
+    motion_remainder: (f64, f64),
+    scroll_remainder: (f64, f64),
+    queued_motion: (i32, i32),
+    last_motion: Instant,
 }
 impl App {
+    fn send(&mut self, event: input::Event) {
+        if !matches!(event, input::Event::Motion { .. }) {
+            self.flush_motion();
+        }
+        let failed = {
+            let mut state = self.state.lock().unwrap();
+            let failed = state
+                .input
+                .as_ref()
+                .is_none_or(|tx| tx.try_send(event).is_err());
+            if failed {
+                state.input_failed = true;
+            }
+            failed
+        };
+        if failed {
+            self.ungrab();
+        }
+    }
+    fn flush_motion(&mut self) {
+        let (x, y) = std::mem::take(&mut self.queued_motion);
+        if self.captured && (x != 0 || y != 0) {
+            self.last_motion = Instant::now();
+            self.send(input::Event::Motion {
+                x: x.clamp(-32767, 32767),
+                y: y.clamp(-32767, 32767),
+            });
+        }
+    }
+    fn ungrab(&mut self) {
+        self.queued_motion = (0, 0);
+        self.captured = false;
+        self.cursor = None;
+        self.motion_remainder = (0., 0.);
+        self.scroll_remainder = (0., 0.);
+        if let Some(window) = &self.window {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+    }
+    fn release(&mut self) {
+        if self.captured {
+            self.send(input::Event::Release);
+        }
+        self.ungrab();
+    }
+    fn capture(&mut self) {
+        let state = self.state.lock().unwrap();
+        if state.input.is_none() || state.image.is_none() {
+            return;
+        }
+        self.generation = state.generation;
+        drop(state);
+        let Some(window) = &self.window else {
+            return;
+        };
+        self.locked = window.set_cursor_grab(CursorGrabMode::Locked).is_ok();
+        if !self.locked && window.set_cursor_grab(CursorGrabMode::Confined).is_err() {
+            return;
+        }
+        window.set_cursor_visible(false);
+        self.cursor = None;
+        self.captured = true;
+        self.send(input::Event::Capture);
+    }
+    fn motion(&mut self, x: f64, y: f64) {
+        self.motion_remainder.0 += x;
+        self.motion_remainder.1 += y;
+        let x = self.motion_remainder.0.clamp(-32767., 32767.).trunc() as i32;
+        let y = self.motion_remainder.1.clamp(-32767., 32767.).trunc() as i32;
+        self.motion_remainder.0 -= f64::from(x);
+        self.motion_remainder.1 -= f64::from(y);
+        if x != 0 || y != 0 {
+            self.queued_motion.0 = self.queued_motion.0.saturating_add(x);
+            self.queued_motion.1 = self.queued_motion.1.saturating_add(y);
+        }
+    }
     fn draw(&mut self) -> Result<()> {
         let Some(window) = &self.window else {
             return Ok(());
@@ -49,7 +138,14 @@ impl App {
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         buffer.fill(0);
         let mut state = self.state.lock().unwrap();
-        window.set_title(&format!("ESP Video — {}", state.status));
+        let input_status = if self.captured {
+            "Input captured — Ctrl+Alt+G releases"
+        } else if state.input.is_some() {
+            "Click video to control"
+        } else {
+            "View only"
+        };
+        window.set_title(&format!("ESP Video — {} — {input_status}", state.status));
         if let Some(image) = &state.image {
             let scale = (size.width as f64 / image.width as f64)
                 .min(size.height as f64 / image.height as f64);
@@ -108,18 +204,88 @@ impl ApplicationHandler for App {
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !event.repeat =>
-            {
-                if event.logical_key == Key::Named(NamedKey::F11) {
-                    if let Some(window) = &self.window {
-                        window.set_fullscreen(if window.fullscreen().is_some() {
-                            None
-                        } else {
-                            Some(Fullscreen::Borderless(window.current_monitor()))
+            WindowEvent::CloseRequested => {
+                self.release();
+                event_loop.exit();
+            }
+            WindowEvent::Focused(false) => {
+                self.release();
+                self.pressed.clear();
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic,
+                ..
+            } if !is_synthetic => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let down = event.state == ElementState::Pressed;
+                    if down {
+                        self.pressed.insert(code);
+                    } else {
+                        self.pressed.remove(&code);
+                    }
+                    let ctrl = self.pressed.contains(&KeyCode::ControlLeft)
+                        || self.pressed.contains(&KeyCode::ControlRight);
+                    let alt = self.pressed.contains(&KeyCode::AltLeft)
+                        || self.pressed.contains(&KeyCode::AltRight);
+                    if self.captured && down && code == KeyCode::KeyG && ctrl && alt {
+                        self.release();
+                        return;
+                    }
+                    if self.captured && !event.repeat {
+                        if let Some(code) = keymap::evdev(code) {
+                            self.send(input::Event::Key { code, down });
+                        }
+                    } else if !self.captured
+                        && down
+                        && !event.repeat
+                        && event.logical_key == Key::Named(NamedKey::F11)
+                    {
+                        if let Some(window) = &self.window {
+                            window.set_fullscreen(if window.fullscreen().is_some() {
+                                None
+                            } else {
+                                Some(Fullscreen::Borderless(window.current_monitor()))
+                            });
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if !self.captured {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.capture();
+                    }
+                } else {
+                    let button = match button {
+                        MouseButton::Left => Some(0),
+                        MouseButton::Right => Some(1),
+                        MouseButton::Middle => Some(2),
+                        MouseButton::Back => Some(3),
+                        MouseButton::Forward => Some(4),
+                        _ => None,
+                    };
+                    if let Some(button) = button {
+                        self.send(input::Event::Button {
+                            button,
+                            down: state == ElementState::Pressed,
                         });
                     }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.captured => {
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+                    MouseScrollDelta::PixelDelta(p) => (p.x / 40., p.y / 40.),
+                };
+                self.scroll_remainder.0 += x;
+                self.scroll_remainder.1 += y;
+                let x = self.scroll_remainder.0.clamp(-32767., 32767.).trunc() as i32;
+                let y = self.scroll_remainder.1.clamp(-32767., 32767.).trunc() as i32;
+                self.scroll_remainder.0 -= f64::from(x);
+                self.scroll_remainder.1 -= f64::from(y);
+                if x != 0 || y != 0 {
+                    self.send(input::Event::Scroll { x, y });
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -131,7 +297,24 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if self.captured {
+            if let DeviceEvent::MouseMotion { delta: (x, y) } = event {
+                self.motion(x, y);
+            }
+        }
+    }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.last_motion.elapsed() >= Duration::from_millis(8) {
+            self.flush_motion();
+        }
+        let lost = {
+            let s = self.state.lock().unwrap();
+            s.input.is_none() || s.generation != self.generation || s.input_failed
+        };
+        if self.captured && lost {
+            self.ungrab();
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -146,6 +329,7 @@ pub async fn run(network: String, host: String) -> Result<()> {
         image: None,
         status: "connecting".into(),
         ack: None,
+        ..State::default()
     }));
     let task_state = state.clone();
     let task = tokio::spawn(async move {
@@ -160,6 +344,7 @@ pub async fn run(network: String, host: String) -> Result<()> {
             }
             {
                 let mut s = task_state.lock().unwrap();
+                s.input = None;
                 s.image = None;
                 s.ack = None;
                 s.status = format!(
@@ -182,6 +367,15 @@ pub async fn run(network: String, host: String) -> Result<()> {
         window: None,
         surface: None,
         error: None,
+        captured: false,
+        locked: false,
+        generation: 0,
+        pressed: Default::default(),
+        cursor: None,
+        motion_remainder: (0., 0.),
+        scroll_remainder: (0., 0.),
+        queued_motion: (0, 0),
+        last_motion: Instant::now(),
     };
     let result = event_loop.run_app(&mut app);
     task.abort();
@@ -206,7 +400,12 @@ async fn session(
         },
     )
     .await?;
-    let Reply::Ready { share, format } = reply else {
+    let Reply::Ready {
+        share,
+        format,
+        allow_input,
+    } = reply
+    else {
         anyhow::bail!("unexpected video viewer response");
     };
     ensure!(
@@ -217,6 +416,13 @@ async fn session(
     let mut codec = Av1Decoder::new(format)?;
     let mut first = true;
     let (acks, mut ack_rx) = tokio::sync::mpsc::channel::<u64>(2);
+    let (inputs, mut input_rx) = tokio::sync::mpsc::channel(128);
+    {
+        let mut s = state.lock().unwrap();
+        s.generation += 1;
+        s.input_failed = false;
+        s.input = allow_input.then_some(inputs);
+    }
     let (mut read, mut write) = stream.split();
     let decode = async {
         loop {
@@ -248,10 +454,32 @@ async fn session(
         Ok::<(), anyhow::Error>(())
     };
     let feedback = async {
-        while let Some(sequence) = ack_rx.recv().await {
-            write.write_all(&[1]).await?;
-            write.write_all(&sequence.to_be_bytes()).await?;
+        let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            let message = tokio::select! {
+                Some(sequence)=ack_rx.recv()=>Ok(sequence),
+                Some(event)=input_rx.recv(), if allow_input =>Err(event),
+                _=heartbeat.tick(), if allow_input => {
+                    ensure!(!state.lock().unwrap().input_failed,"input queue overflow; releasing control");
+                    Err(input::Event::Heartbeat)
+                }
+            };
+            tokio::time::timeout(Duration::from_millis(500), async {
+                match message {
+                    Ok(sequence) => {
+                        write.write_all(&[1]).await?;
+                        write.write_all(&sequence.to_be_bytes()).await?;
+                    }
+                    Err(event) => {
+                        write.write_all(&[2]).await?;
+                        input::write(&mut write, event).await?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())
+            })
+            .await??;
         }
+        #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
     };
     tokio::select! {result=decode=>result,result=feedback=>result}

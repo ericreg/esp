@@ -1409,6 +1409,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "libc",
+ "libloading",
  "minicbor",
  "ratatui",
  "rav1d",

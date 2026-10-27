@@ -128,6 +128,12 @@ impl Fixture {
         }
     }
     async fn owner(&self) -> (UnixStream, tokio::task::JoinHandle<Result<()>>, String) {
+        self.owner_mode(false).await
+    }
+    async fn owner_mode(
+        &self,
+        allow_input: bool,
+    ) -> (UnixStream, tokio::task::JoinHandle<Result<()>>, String) {
         let (mut owner, server) = UnixStream::pair().unwrap();
         let task = tokio::spawn(local(
             server,
@@ -137,6 +143,7 @@ impl Fixture {
                 peer: "same-peer".into(),
                 display: "test-source".into(),
                 format: format(),
+                allow_input,
             },
         ));
         let ready: Reply = read_cbor_frame(&mut owner, CONTROL_LIMIT, "test owner")
@@ -453,4 +460,100 @@ async fn encoded_pixels_survive_direct_and_relayed_video() {
         let _ = owner_task.await;
         f.close().await;
     }
+}
+
+async fn owner_input(owner: &mut UnixStream) -> (u64, input::Event) {
+    timeout(Duration::from_secs(3), async {
+        loop {
+            match owner.read_u8().await.unwrap() {
+                1 | 2 => {}
+                3 => {
+                    return (
+                        owner.read_u64().await.unwrap(),
+                        input::read(owner).await.unwrap(),
+                    );
+                }
+                byte => panic!("unexpected owner message {byte}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+#[tokio::test]
+async fn input_follows_authenticated_grant_and_releases_on_disconnect() {
+    for relayed in [false, true] {
+        let f = Fixture::new(relayed).await;
+        let (mut owner, owner_task, _) = f.owner_mode(true).await;
+        let (mut client, client_task, reply) = f.view(None).await;
+        assert!(matches!(
+            reply,
+            Reply::Ready {
+                allow_input: true,
+                ..
+            }
+        ));
+        write_frame(&mut owner, &frame(0)).await.unwrap();
+        read_frame(&mut client).await.unwrap();
+        ack(&mut client, 0).await;
+        let mut epoch = 0;
+        for event in [
+            input::Event::Capture,
+            input::Event::Key {
+                code: 29,
+                down: true,
+            },
+            input::Event::Motion { x: -12, y: 5 },
+            input::Event::Button {
+                button: 0,
+                down: true,
+            },
+        ] {
+            client.write_all(&[2]).await.unwrap();
+            input::write(&mut client, event).await.unwrap();
+            let (got_epoch, got) = owner_input(&mut owner).await;
+            assert_eq!(got, event);
+            assert!(got_epoch > 0);
+            if epoch != 0 {
+                assert_eq!(got_epoch, epoch);
+            }
+            epoch = got_epoch;
+        }
+        drop(client);
+        let _ = client_task.await;
+        let (got_epoch, event) = owner_input(&mut owner).await;
+        assert_eq!(got_epoch, epoch);
+        assert_eq!(event, input::Event::Release);
+        drop(owner);
+        let _ = owner_task.await;
+        f.close().await;
+    }
+}
+#[tokio::test]
+async fn view_only_grants_reject_input() {
+    let f = Fixture::new(false).await;
+    let (owner, owner_task, _) = f.owner().await;
+    let (mut client, client_task, reply) = f.view(None).await;
+    assert!(matches!(
+        reply,
+        Reply::Ready {
+            allow_input: false,
+            ..
+        }
+    ));
+    client.write_all(&[2]).await.unwrap();
+    input::write(&mut client, input::Event::Capture)
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_secs(3), client_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    drop(client);
+    drop(owner);
+    let _ = owner_task.await;
+    f.close().await;
 }

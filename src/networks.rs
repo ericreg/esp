@@ -1200,6 +1200,15 @@ async fn scoped(label: &str, request: LocalControlRequest) -> Result<LocalContro
 }
 
 pub(super) async fn execute(command: Command) -> Result<()> {
+    // The system console owns an explicit configuration outside any user's home.
+    // It must also start under ProtectHome=yes, before a user has logged in.
+    #[cfg(all(feature = "video-codec", target_os = "linux"))]
+    let command = match command {
+        Command::Video {
+            command: command @ crate::video::Command::Serve(_),
+        } => return crate::video::execute(command).await,
+        other => other,
+    };
     GlobalConfig::load(&config_path()?)?;
     match command {
         Command::Init {

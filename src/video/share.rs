@@ -104,6 +104,7 @@ pub async fn run(
             peer,
             display: display.clone(),
             format,
+            allow_input: false,
         },
     )
     .await?;

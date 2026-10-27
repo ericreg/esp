@@ -38,7 +38,7 @@ pub fn discover() -> Result<serde_json::Value> {
     Ok(
         serde_json::json!({"backend":"linux_drm", "driver_loaded":Path::new("/sys/module/esp_video").exists(),
         "capture_device":"/dev/esp-video", "outputs":outputs, "errors":errors,
-        "next_step":"Build/load the ESP display module, then start a share and configure mirroring in display settings."}),
+        "next_step":"For foreground sharing, load the ESP module and configure mirroring. For login/text consoles or headless output, see esp video serve --help and CONSOLE_SERVICE.md."}),
     )
 }
 pub fn print(output: crate::output::Options) -> Result<()> {
@@ -82,7 +82,7 @@ pub fn print(output: crate::output::Options) -> Result<()> {
     println!("\n{}", report["next_step"].as_str().unwrap());
     Ok(())
 }
-fn enumerate() -> Result<(Vec<Output>, Vec<String>)> {
+pub fn enumerate() -> Result<(Vec<Output>, Vec<String>)> {
     let mut outputs = Vec::new();
     let mut errors = Vec::new();
     for entry in fs::read_dir("/sys/class/drm").context("Linux DRM is unavailable")? {
@@ -202,6 +202,10 @@ impl Capture {
             height: source.height.context("source has no active height")?,
         }
         .validate_source()?;
+        Self::connect_size(size)
+    }
+    pub fn connect_size(size: Size) -> Result<Self> {
+        size.validate_source()?;
         let file=OpenOptions::new().read(true).write(true)
             .custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW|libc::O_NONBLOCK)
             .open("/dev/esp-video").context("cannot open /dev/esp-video; build/load the ESP module and grant your user access (see drivers/esp_video/README.md)")?;

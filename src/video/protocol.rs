@@ -70,6 +70,8 @@ pub enum LocalRequest {
         display: String,
         #[n(2)]
         format: Format,
+        #[n(3)]
+        allow_input: bool,
     },
     #[n(2)]
     View {
@@ -93,6 +95,8 @@ pub enum Reply {
         share: String,
         #[n(1)]
         format: Format,
+        #[n(2)]
+        allow_input: bool,
     },
     #[n(1)]
     Error(#[n(0)] String),
@@ -119,6 +123,8 @@ pub struct ServerHello {
     pub share: String,
     #[n(2)]
     pub format: Format,
+    #[n(3)]
+    pub allow_input: bool,
 }
 
 #[derive(Debug, Encode, Decode)]

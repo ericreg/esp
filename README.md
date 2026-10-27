@@ -100,7 +100,7 @@ esp daemon --ports 22,80,8080 --max-connections-per-peer 32
 
 ## Video sharing development
 
-Experimental view-only sharing uses a Linux virtual display driver, software AV1 (rav1e/rav1d),
+Experimental video sharing uses a Linux virtual display driver, software AV1 (rav1e/rav1d),
 ESP's authenticated Iroh transport, and a native client window. The driver and
 userspace implementation are independent of the desktop environment. Host display
 compatibility and the macOS viewer still require interactive validation.
@@ -120,12 +120,20 @@ need NASM. Use `--no-default-features --features video-viewer` for Rust-only cod
 This is an AV1-only breaking change with unchanged protocol identifiers; upgrade
 both endpoints and restart helpers.
 
-The host needs the ESP virtual-display module and an active graphical logind
+Foreground `share` needs the ESP virtual-display module and an active graphical logind
 session. Configure mirroring in normal display settings and confirm the source
 locally; automatic cross-GPU mirror verification is not implemented. No media is
 sent before that confirmation and initial driver capture. The client window is
-resizable, with F11 for fullscreen and no remote input forwarding. Closing the
+resizable, with F11 for fullscreen. Foreground shares remain view-only. Closing the
 host share disconnects its virtual monitor.
+
+For login screens, existing sessions and text consoles, the Rust system service
+`esp video serve` follows the active VT, captures existing physical scanout or
+creates a headless virtual output, and supports keyboard/mouse control. Click the
+viewer to capture input; Ctrl+Alt+G releases it. See
+[console service setup, behavior and current limitations](CONSOLE_SERVICE.md).
+Headless graphical output requires the compositor to enable the virtual monitor;
+the service does not create a desktop session or bypass login.
 
 See [driver setup, build dependencies, and validation](drivers/esp_video/README.md)
 and [the video sharing plan](VIDEO_SHARING_PLAN.md). ESP never loads modules or

@@ -1,13 +1,24 @@
-//! View-only video sharing. Device, media, and GUI dependencies are optional.
+//! Video sharing and machine-console control. Device, media, and GUI dependencies are optional.
+#[cfg(all(feature = "video-codec", target_os = "linux"))]
+mod capture;
 #[cfg(feature = "video-codec")]
 mod codec;
+#[cfg(all(feature = "video-codec", target_os = "linux"))]
+mod console;
 mod display;
 #[cfg(target_os = "linux")]
 mod driver;
+#[cfg(all(feature = "video-codec", target_os = "linux"))]
+mod gpu;
+mod input;
+#[cfg(feature = "video-viewer")]
+mod keymap;
 pub(super) mod protocol;
 pub(super) mod service;
 #[cfg(all(feature = "video-codec", target_os = "linux"))]
 mod share;
+#[cfg(all(feature = "video-codec", target_os = "linux"))]
+mod uinput;
 #[cfg(feature = "video-viewer")]
 mod viewer;
 
@@ -17,6 +28,9 @@ use protocol::{LocalRequest, Reply};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum Command {
+    /// Serve the machine console before login (system service; Linux only).
+    #[cfg(all(feature = "video-codec", target_os = "linux"))]
+    Serve(console::Options),
     /// List Linux DRM outputs and the virtual driver status without changing displays.
     Displays {
         #[command(flatten)]
@@ -42,7 +56,7 @@ pub(super) enum Command {
         #[arg(long, default_value_t=codec::default_threads() as u32, value_parser=clap::value_parser!(u32).range(1..=64))]
         threads: u32,
     },
-    /// Open a resizable view-only window (F11 toggles fullscreen).
+    /// Open a resizable viewer; click to control if permitted, Ctrl+Alt+G to release.
     #[cfg(feature = "video-viewer")]
     View { network: String, host: String },
     /// Report the local share and its viewer/transport state.
@@ -56,6 +70,8 @@ pub(super) enum Command {
 }
 pub(super) async fn execute(command: Command) -> Result<()> {
     match command {
+        #[cfg(all(feature = "video-codec", target_os = "linux"))]
+        Command::Serve(options) => console::run(options).await,
         Command::Displays { output } => {
             let output = output.resolve_from_config()?;
             #[cfg(target_os = "linux")]
